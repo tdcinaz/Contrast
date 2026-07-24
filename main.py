@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QSizePolicy,
@@ -281,9 +282,7 @@ class VideoPanel(QFrame):
         self.current_frame_index = -1
         self.enhance_display = False
         self.target_median = first_frame_median(path)
-        self.enhanced_frames: list[np.ndarray] = []
-
-        self._prepare_enhanced_frames()
+        self.enhanced_frames: list[np.ndarray] | None = None
 
         self.display = VideoDisplay(label, color)
         self.display.roiChanged.connect(self.roiChanged.emit)
@@ -310,20 +309,25 @@ class VideoPanel(QFrame):
         self.setObjectName("videoPanel")
         self.seek(0)
 
-    def _prepare_enhanced_frames(self) -> None:
+    def prepare_enhanced_frames(
+        self,
+        progress_callback: callable[[int, int], bool] | None = None,
+    ) -> bool:
+        if self.enhanced_frames is not None and len(self.enhanced_frames) == self.info.frame_count:
+            return True
+
         capture = cv2.VideoCapture(str(self.path))
         try:
             enhanced_frames: list[np.ndarray] = []
             for frame_index in range(self.info.frame_count):
                 ok, frame = capture.read()
                 if not ok:
-                    break
+                    raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
                 enhanced_frames.append(enhance_frame_for_display(frame, self.target_median))
-                if frame_index % 32 == 0 and QApplication.instance() is not None:
-                    QApplication.processEvents()
-            if len(enhanced_frames) != self.info.frame_count:
-                raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+                if progress_callback is not None and not progress_callback(frame_index + 1, self.info.frame_count):
+                    return False
             self.enhanced_frames = enhanced_frames
+            return True
         finally:
             capture.release()
 
@@ -334,7 +338,8 @@ class VideoPanel(QFrame):
         self.current_frame = frame
         if apply_enhancement is None:
             apply_enhancement = self.enhance_display
-        display_frame = self.enhanced_frames[self.current_frame_index] if apply_enhancement else frame
+        can_enhance = self.enhanced_frames is not None and 0 <= self.current_frame_index < len(self.enhanced_frames)
+        display_frame = self.enhanced_frames[self.current_frame_index] if apply_enhancement and can_enhance else frame
         self.display.set_frame(display_frame)
 
     def read_next(self, playback: bool = False) -> bool:
@@ -370,7 +375,7 @@ class VideoPanel(QFrame):
         self.capture = cv2.VideoCapture(str(path))
         self.current_frame_index = -1
         self.target_median = first_frame_median(path)
-        self._prepare_enhanced_frames()
+        self.enhanced_frames = None
         self.path_label.setText(path.name)
         self.meta_label.setText(self._metadata_text())
         self.display.clear_roi()
@@ -408,6 +413,55 @@ class MetricCard(QFrame):
         self.detail.setText(detail)
 
 
+class LoadingOverlay(QFrame):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("loadingOverlay")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+
+        self.panel = QFrame(self)
+        self.panel.setObjectName("loadingOverlayPanel")
+
+        panel_layout = QVBoxLayout(self.panel)
+        panel_layout.setContentsMargins(18, 16, 18, 16)
+        panel_layout.setSpacing(10)
+
+        self.message_label = QLabel("Preparing enhanced video...")
+        self.message_label.setObjectName("loadingOverlayLabel")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+
+        panel_layout.addWidget(self.message_label)
+        panel_layout.addWidget(self.progress_bar)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch()
+        layout.addWidget(self.panel, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch()
+
+        self.hide()
+
+    def begin(self, message: str, maximum: int) -> None:
+        self.message_label.setText(message)
+        self.progress_bar.setRange(0, max(1, maximum))
+        self.progress_bar.setValue(0)
+        if self.parentWidget() is not None:
+            self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.show()
+        QApplication.processEvents()
+
+    def set_progress(self, value: int) -> None:
+        self.progress_bar.setValue(value)
+        QApplication.processEvents()
+
+    def finish(self) -> None:
+        self.hide()
+
+
 class ContrastWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -437,7 +491,7 @@ class ContrastWindow(QMainWindow):
         self._build_actions()
         self._build_ui()
         self._apply_style()
-        self.set_display_enhancement(self.enhance_display_check.isChecked())
+        self.set_display_enhancement(False)
         self.update_time_label()
         self.statusBar().showMessage("Draw one ROI on each video, then run analysis.")
 
@@ -525,6 +579,8 @@ class ContrastWindow(QMainWindow):
         layout.setSpacing(14)
         layout.addWidget(splitter)
         self.setCentralWidget(central)
+        self.loading_overlay = LoadingOverlay(central)
+        self.loading_overlay.setGeometry(central.rect())
         self.setStatusBar(QStatusBar())
 
     def _build_analysis_panel(self) -> QWidget:
@@ -543,10 +599,11 @@ class ContrastWindow(QMainWindow):
         hint.setObjectName("hintLabel")
         controls_layout.addWidget(hint)
 
-        self.enhance_display_check = QCheckBox("Enhance video display")
-        self.enhance_display_check.setChecked(True)
-        self.enhance_display_check.stateChanged.connect(lambda: self.set_display_enhancement(self.enhance_display_check.isChecked()))
-        controls_layout.addWidget(self.enhance_display_check)
+        self.enhance_button = QPushButton("Enable video enhancement")
+        self.enhance_button.setCheckable(True)
+        self.enhance_button.setChecked(False)
+        self.enhance_button.clicked.connect(self.on_enhance_clicked)
+        controls_layout.addWidget(self.enhance_button)
 
         self.gain_correct_check = QCheckBox("Correct gain drift in analysis")
         self.gain_correct_check.setChecked(True)
@@ -637,6 +694,11 @@ class ContrastWindow(QMainWindow):
             QLabel#metricValue { color: #f8fafc; font-size: 22px; font-weight: 800; }
             QLabel#metricDetail { color: #94a3b8; font-size: 12px; }
             QStatusBar { background: #0b1018; color: #9fb0c6; }
+            QFrame#loadingOverlay { background: rgba(4, 8, 15, 180); }
+            QFrame#loadingOverlayPanel { background: #0f172a; border: 1px solid #334155; border-radius: 10px; min-width: 380px; }
+            QLabel#loadingOverlayLabel { color: #e2e8f0; font-size: 14px; font-weight: 700; }
+            QProgressBar { border: 1px solid #334155; border-radius: 6px; background: #111827; color: #e5edf6; text-align: center; }
+            QProgressBar::chunk { background: #14b8a6; border-radius: 5px; }
             """
         )
 
@@ -665,6 +727,12 @@ class ContrastWindow(QMainWindow):
         self.frame_spin.setRange(0, self.max_frame)
         self.set_frame_index(0)
         self.clear_plots_and_metrics()
+
+        self.enhance_button.blockSignals(True)
+        self.enhance_button.setChecked(False)
+        self.enhance_button.setText("Enable video enhancement")
+        self.enhance_button.blockSignals(False)
+        self.set_display_enhancement(False)
 
     def toggle_playback(self) -> None:
         if self.is_playing:
@@ -699,7 +767,7 @@ class ContrastWindow(QMainWindow):
         self.timer.stop()
         self.play_button.setText("Play")
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        if self.enhance_display_check.isChecked():
+        if any(panel.enhance_display for panel in self.panels):
             for panel in self.panels:
                 panel.seek(self.current_frame_index)
 
@@ -751,6 +819,49 @@ class ContrastWindow(QMainWindow):
         for panel in self.panels:
             panel.set_enhancement(enabled, self.current_frame_index)
         self.statusBar().showMessage("Video enhancement enabled." if enabled else "Video enhancement disabled.")
+
+    def on_enhance_clicked(self, checked: bool) -> None:
+        if checked:
+            if not self.ensure_enhancement_ready():
+                self.enhance_button.blockSignals(True)
+                self.enhance_button.setChecked(False)
+                self.enhance_button.blockSignals(False)
+                self.enhance_button.setText("Enable video enhancement")
+                return
+            self.set_display_enhancement(True)
+            self.enhance_button.setText("Disable video enhancement")
+            return
+
+        self.set_display_enhancement(False)
+        self.enhance_button.setText("Enable video enhancement")
+
+    def ensure_enhancement_ready(self) -> bool:
+        pending_panels = [panel for panel in self.panels if panel.enhanced_frames is None]
+        if not pending_panels:
+            return True
+
+        self.pause()
+        total_frames = sum(panel.info.frame_count for panel in pending_panels)
+        self.loading_overlay.begin("Enhancing video display. Please wait...", total_frames)
+
+        completed = 0
+        try:
+            for panel in pending_panels:
+                def progress_callback(done: int, _total: int) -> bool:
+                    self.loading_overlay.set_progress(completed + done)
+                    return True
+
+                prepared = panel.prepare_enhanced_frames(progress_callback)
+                if not prepared:
+                    return False
+                completed += panel.info.frame_count
+                self.loading_overlay.set_progress(completed)
+            return True
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Enhancement failed", str(exc))
+            return False
+        finally:
+            self.loading_overlay.finish()
 
     def on_analysis_filter_changed(self) -> None:
         if self.results:
@@ -899,6 +1010,11 @@ class ContrastWindow(QMainWindow):
         for panel in self.panels:
             panel.close()
         super().closeEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        if hasattr(self, "loading_overlay") and self.centralWidget() is not None:
+            self.loading_overlay.setGeometry(self.centralWidget().rect())
 
 
 def analyze_video(

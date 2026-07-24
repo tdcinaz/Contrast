@@ -25,9 +25,9 @@ Use the **File** menu to choose different videos if needed.
 5. Adjust the clearance threshold if needed. The metrics update from the already measured curves.
 6. Export a CSV for downstream analysis.
 
-Two quality controls are enabled by default:
+Two quality controls are available:
 
-- **Enhance video display** stabilizes frame brightness for viewing, applies mild denoising, and uses local contrast enhancement. The full enhancement pass is computed once at startup and then reused during playback, paused viewing, and scrubbing.
+- **Enhance video display** starts disabled. Click **Enable video enhancement** to run the enhancement pass with an on-screen loading bar. Once complete, the enhanced frames are reused during playback, paused viewing, and scrubbing.
 - **Correct gain drift in analysis** measures a reference region around the ROI on every frame and normalizes the ROI intensity against that reference before calculating contrast residence.
 
 ## Measurement
