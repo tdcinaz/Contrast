@@ -18,7 +18,7 @@ Use the **File** menu to choose different videos if needed.
 
 ## Workflow
 
-1. Use the playback controls to navigate to a frame where the aneurysm sac is visible.
+1. Use the playback controls to navigate to a frame where the aneurysm sac is visible. Adjust the playback speed slider as needed.
 2. Drag with the mouse on each video to draw an ROI box around the saccular aneurysm.
 3. Click **Analyze ROIs**.
 4. Compare the normalized contrast curves, raw ROI brightness curves, and residence-time cards.
@@ -27,7 +27,7 @@ Use the **File** menu to choose different videos if needed.
 
 Two quality controls are enabled by default:
 
-- **Enhance video display** stabilizes frame brightness for viewing, applies mild denoising, and uses local contrast enhancement.
+- **Enhance video display** stabilizes frame brightness for viewing, applies mild denoising, and uses local contrast enhancement on paused or scrubbed frames. During continuous playback, enhancement is temporarily bypassed to keep playback responsive.
 - **Correct gain drift in analysis** measures a reference region around the ROI on every frame and normalizes the ROI intensity against that reference before calculating contrast residence.
 
 ## Measurement

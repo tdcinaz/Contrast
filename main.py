@@ -278,6 +278,7 @@ class VideoPanel(QFrame):
         self.info = probe_video(path)
         self.capture = cv2.VideoCapture(str(path))
         self.current_frame: np.ndarray | None = None
+        self.current_frame_index = -1
         self.enhance_display = False
         self.target_median = first_frame_median(path)
 
@@ -309,14 +310,34 @@ class VideoPanel(QFrame):
     def _metadata_text(self) -> str:
         return f"{self.info.width}x{self.info.height} | {self.info.fps:.1f} fps | {self.info.duration:.1f} s"
 
+    def _display_frame(self, frame: np.ndarray, apply_enhancement: bool | None = None) -> None:
+        self.current_frame = frame
+        if apply_enhancement is None:
+            apply_enhancement = self.enhance_display
+        display_frame = enhance_frame_for_display(frame, self.target_median) if apply_enhancement else frame
+        self.display.set_frame(display_frame)
+
+    def read_next(self, playback: bool = False) -> bool:
+        if self.current_frame_index >= self.info.frame_count - 1:
+            return False
+        ok, frame = self.capture.read()
+        if ok:
+            self.current_frame_index += 1
+            self._display_frame(frame, apply_enhancement=self.enhance_display and not playback)
+        return ok
+
     def seek(self, frame_index: int) -> bool:
         frame_index = max(0, min(frame_index, self.info.frame_count - 1))
+        if frame_index == self.current_frame_index and self.current_frame is not None:
+            self._display_frame(self.current_frame)
+            return True
+        if frame_index == self.current_frame_index + 1:
+            return self.read_next()
         self.capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         ok, frame = self.capture.read()
         if ok:
-            self.current_frame = frame
-            display_frame = enhance_frame_for_display(frame, self.target_median) if self.enhance_display else frame
-            self.display.set_frame(display_frame)
+            self.current_frame_index = frame_index
+            self._display_frame(frame)
         return ok
 
     def roi(self) -> QRect | None:
@@ -327,6 +348,7 @@ class VideoPanel(QFrame):
         self.path = path
         self.info = probe_video(path)
         self.capture = cv2.VideoCapture(str(path))
+        self.current_frame_index = -1
         self.target_median = first_frame_median(path)
         self.path_label.setText(path.name)
         self.meta_label.setText(self._metadata_text())
@@ -388,7 +410,8 @@ class ContrastWindow(QMainWindow):
 
         self.max_frame = min(panel.info.frame_count for panel in self.panels) - 1
         self.fps = min(panel.info.fps for panel in self.panels)
-        self.play_interval_ms = max(1, round(1000 / self.fps))
+        self.playback_speed = 1.0
+        self.play_interval_ms = self._play_interval_ms()
 
         self._build_actions()
         self._build_ui()
@@ -435,6 +458,19 @@ class ContrastWindow(QMainWindow):
         self.frame_spin.setRange(0, self.max_frame)
         self.frame_spin.valueChanged.connect(self.set_frame_index)
 
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(25, 400)
+        self.speed_slider.setSingleStep(25)
+        self.speed_slider.setPageStep(50)
+        self.speed_slider.setTickInterval(25)
+        self.speed_slider.setValue(100)
+        self.speed_slider.setFixedWidth(140)
+        self.speed_slider.valueChanged.connect(self.set_playback_speed)
+
+        self.speed_label = QLabel()
+        self.speed_label.setObjectName("timeLabel")
+        self.update_speed_label()
+
         self.time_label = QLabel()
         self.time_label.setObjectName("timeLabel")
 
@@ -444,6 +480,9 @@ class ContrastWindow(QMainWindow):
         toolbar.addWidget(self.frame_slider)
         toolbar.addWidget(QLabel("Frame"))
         toolbar.addWidget(self.frame_spin)
+        toolbar.addWidget(QLabel("Speed"))
+        toolbar.addWidget(self.speed_slider)
+        toolbar.addWidget(self.speed_label)
         toolbar.addWidget(self.time_label)
 
         video_row = QWidget()
@@ -600,7 +639,7 @@ class ContrastWindow(QMainWindow):
         self.results.clear()
         self.max_frame = min(item.info.frame_count for item in self.panels) - 1
         self.fps = min(item.info.fps for item in self.panels)
-        self.play_interval_ms = max(1, round(1000 / self.fps))
+        self.play_interval_ms = self._play_interval_ms()
         self.frame_slider.setRange(0, self.max_frame)
         self.frame_spin.setRange(0, self.max_frame)
         self.set_frame_index(0)
@@ -618,17 +657,46 @@ class ContrastWindow(QMainWindow):
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
         self.timer.start(self.play_interval_ms)
 
+    def _play_interval_ms(self) -> int:
+        effective_fps = self.fps * self.playback_speed
+        if effective_fps <= 0:
+            return 1
+        return max(1, round(1000 / effective_fps))
+
+    def set_playback_speed(self, slider_value: int) -> None:
+        self.playback_speed = slider_value / 100.0
+        self.play_interval_ms = self._play_interval_ms()
+        self.update_speed_label()
+        if self.is_playing:
+            self.timer.start(self.play_interval_ms)
+
+    def update_speed_label(self) -> None:
+        self.speed_label.setText(f"{self.playback_speed:.2f}x")
+
     def pause(self) -> None:
         self.is_playing = False
         self.timer.stop()
         self.play_button.setText("Play")
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        if self.enhance_display_check.isChecked():
+            for panel in self.panels:
+                panel.seek(self.current_frame_index)
 
     def advance_frame(self) -> None:
         if self.current_frame_index >= self.max_frame:
             self.pause()
             return
-        self.set_frame_index(self.current_frame_index + 1)
+        next_frame_index = self.current_frame_index + 1
+        if not all(panel.read_next(playback=True) for panel in self.panels):
+            self.pause()
+            return
+        self.current_frame_index = next_frame_index
+        for widget in [self.frame_slider, self.frame_spin]:
+            if widget.value() != next_frame_index:
+                widget.blockSignals(True)
+                widget.setValue(next_frame_index)
+                widget.blockSignals(False)
+        self.update_time_label()
 
     def set_frame_index(self, frame_index: int) -> None:
         frame_index = max(0, min(frame_index, self.max_frame))
