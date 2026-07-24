@@ -281,6 +281,9 @@ class VideoPanel(QFrame):
         self.current_frame_index = -1
         self.enhance_display = False
         self.target_median = first_frame_median(path)
+        self.enhanced_frames: list[np.ndarray] = []
+
+        self._prepare_enhanced_frames()
 
         self.display = VideoDisplay(label, color)
         self.display.roiChanged.connect(self.roiChanged.emit)
@@ -307,6 +310,23 @@ class VideoPanel(QFrame):
         self.setObjectName("videoPanel")
         self.seek(0)
 
+    def _prepare_enhanced_frames(self) -> None:
+        capture = cv2.VideoCapture(str(self.path))
+        try:
+            enhanced_frames: list[np.ndarray] = []
+            for frame_index in range(self.info.frame_count):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                enhanced_frames.append(enhance_frame_for_display(frame, self.target_median))
+                if frame_index % 32 == 0 and QApplication.instance() is not None:
+                    QApplication.processEvents()
+            if len(enhanced_frames) != self.info.frame_count:
+                raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+            self.enhanced_frames = enhanced_frames
+        finally:
+            capture.release()
+
     def _metadata_text(self) -> str:
         return f"{self.info.width}x{self.info.height} | {self.info.fps:.1f} fps | {self.info.duration:.1f} s"
 
@@ -314,7 +334,7 @@ class VideoPanel(QFrame):
         self.current_frame = frame
         if apply_enhancement is None:
             apply_enhancement = self.enhance_display
-        display_frame = enhance_frame_for_display(frame, self.target_median) if apply_enhancement else frame
+        display_frame = self.enhanced_frames[self.current_frame_index] if apply_enhancement else frame
         self.display.set_frame(display_frame)
 
     def read_next(self, playback: bool = False) -> bool:
@@ -323,7 +343,7 @@ class VideoPanel(QFrame):
         ok, frame = self.capture.read()
         if ok:
             self.current_frame_index += 1
-            self._display_frame(frame, apply_enhancement=self.enhance_display and not playback)
+            self._display_frame(frame, apply_enhancement=self.enhance_display)
         return ok
 
     def seek(self, frame_index: int) -> bool:
@@ -350,6 +370,7 @@ class VideoPanel(QFrame):
         self.capture = cv2.VideoCapture(str(path))
         self.current_frame_index = -1
         self.target_median = first_frame_median(path)
+        self._prepare_enhanced_frames()
         self.path_label.setText(path.name)
         self.meta_label.setText(self._metadata_text())
         self.display.clear_roi()

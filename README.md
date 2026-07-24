@@ -27,7 +27,7 @@ Use the **File** menu to choose different videos if needed.
 
 Two quality controls are enabled by default:
 
-- **Enhance video display** stabilizes frame brightness for viewing, applies mild denoising, and uses local contrast enhancement on paused or scrubbed frames. During continuous playback, enhancement is temporarily bypassed to keep playback responsive.
+- **Enhance video display** stabilizes frame brightness for viewing, applies mild denoising, and uses local contrast enhancement. The full enhancement pass is computed once at startup and then reused during playback, paused viewing, and scrubbing.
 - **Correct gain drift in analysis** measures a reference region around the ROI on every frame and normalizes the ROI intensity against that reference before calculating contrast residence.
 
 ## Measurement
