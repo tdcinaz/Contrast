@@ -3,10 +3,10 @@ from __future__ import annotations
 import csv
 import math
 import sys
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from queue import SimpleQueue
+from queue import Empty, SimpleQueue
 from threading import Event, Lock
 from time import perf_counter
 from typing import Callable, Protocol, cast
@@ -141,6 +141,18 @@ class EnhancementParameters:
     clahe_clip_limit: float = 1.0
     clahe_tile_size: int = 6
     smoothing_sigma_x: float = 0.55
+
+
+@dataclass(frozen=True, slots=True)
+class EnhancementRequest:
+    generation: int
+    mode: str
+    model_label: str
+    stages: EnhancementStages
+    parameters: EnhancementParameters
+    noise_sigma: int
+    batch_size: int
+    precision: str
 
 
 @dataclass(slots=True)
@@ -793,11 +805,21 @@ class VideoPanel(QFrame):
         parameters: EnhancementParameters = EnhancementParameters(),
         progress_callback: Callable[[float, float], bool] | None = None,
         stage_progress_callback: Callable[[str, int, int], bool] | None = None,
+        encoded_frame_callback: Callable[[int, np.ndarray], None] | None = None,
+        activate_result: bool = True,
+        cancel_callback: Callable[[], bool] | None = None,
     ) -> bool:
         backend_id = denoiser.backend_id if denoiser is not None else "classical"
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
         if sequence_key in self.encoded_frame_cache:
-            self.enhanced_frames = self.encoded_frame_cache[sequence_key]
+            encoded_frames = self.encoded_frame_cache[sequence_key]
+            if encoded_frame_callback is not None:
+                for index, encoded in enumerate(encoded_frames):
+                    if cancel_callback is not None and cancel_callback():
+                        return False
+                    encoded_frame_callback(index, encoded)
+            if activate_result:
+                self.enhanced_frames = encoded_frames
             self.active_sequence_key = sequence_key
             return True
 
@@ -829,6 +851,9 @@ class VideoPanel(QFrame):
         cancelled = Event()
 
         def report_frame(work_index: int, stage_name: str, done: int) -> bool:
+            if cancel_callback is not None and cancel_callback():
+                cancelled.set()
+                return False
             with progress_lock:
                 completed_frames[work_index] = done
                 overall_done = sum(
@@ -1000,7 +1025,7 @@ class VideoPanel(QFrame):
                         break
                     if cancelled.is_set():
                         continue
-                    _, frame = cast(tuple[int, np.ndarray], item)
+                    frame_index, frame = cast(tuple[int, np.ndarray], item)
                     enhanced = frame if frame.dtype == np.uint8 else np.clip(frame, 0, 255).astype(np.uint8)
                     started_at = perf_counter()
                     encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -1008,6 +1033,8 @@ class VideoPanel(QFrame):
                     if not encoded_ok:
                         raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
                     encoded_frames.append(encoded)
+                    if encoded_frame_callback is not None:
+                        encoded_frame_callback(frame_index, encoded)
                     if not report_frame(encode_work_index, "Encode enhanced frames", len(encoded_frames)):
                         continue
             except Exception:
@@ -1034,7 +1061,8 @@ class VideoPanel(QFrame):
             self.stage_frame_cache[stage_prefix] = output
         self.encoded_frame_cache[sequence_key] = encoded_frames
 
-        self.enhanced_frames = self.encoded_frame_cache[sequence_key]
+        if activate_result:
+            self.enhanced_frames = self.encoded_frame_cache[sequence_key]
         self.active_sequence_key = sequence_key
         return True
 
@@ -1143,21 +1171,19 @@ class MetricCard(QFrame):
         self.detail.setText(detail)
 
 
-class LoadingOverlay(QFrame):
+class EnhancementProgressPanel(QFrame):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("loadingOverlay")
+        self.setObjectName("enhancementProgressPanel")
         self.setFrameShape(QFrame.Shape.NoFrame)
 
-        self.panel = QFrame(self)
-        self.panel.setObjectName("loadingOverlayPanel")
-
-        panel_layout = QVBoxLayout(self.panel)
-        panel_layout.setContentsMargins(18, 16, 18, 16)
-        panel_layout.setSpacing(10)
+        panel_layout = QVBoxLayout(self)
+        panel_layout.setContentsMargins(12, 10, 12, 10)
+        panel_layout.setSpacing(7)
 
         self.message_label = QLabel("Preparing enhanced video...")
-        self.message_label.setObjectName("loadingOverlayLabel")
+        self.message_label.setObjectName("enhancementProgressLabel")
+        self.message_label.setWordWrap(True)
         self.total_label = QLabel("Overall progress")
         self.total_label.setObjectName("subtleLabel")
         self.progress_bar = QProgressBar()
@@ -1165,57 +1191,46 @@ class LoadingOverlay(QFrame):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
 
-        self.stage_label = QLabel("Current stage")
-        self.stage_label.setObjectName("subtleLabel")
-        self.stage_progress_bar = QProgressBar()
-        self.stage_progress_bar.setRange(0, 1)
-        self.stage_progress_bar.setValue(0)
-        self.stage_progress_bar.setTextVisible(True)
+        self.panel_labels = [QLabel("Pre-deployment"), QLabel("Post-deployment")]
+        self.panel_progress_bars = [QProgressBar(), QProgressBar()]
+        for label, progress_bar in zip(self.panel_labels, self.panel_progress_bars):
+            label.setObjectName("subtleLabel")
+            progress_bar.setRange(0, 1000)
+            progress_bar.setValue(0)
+            progress_bar.setTextVisible(True)
 
         panel_layout.addWidget(self.message_label)
         panel_layout.addWidget(self.total_label)
         panel_layout.addWidget(self.progress_bar)
-        panel_layout.addWidget(self.stage_label)
-        panel_layout.addWidget(self.stage_progress_bar)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addStretch()
-        layout.addWidget(self.panel, 0, Qt.AlignmentFlag.AlignCenter)
-        layout.addStretch()
+        for label, progress_bar in zip(self.panel_labels, self.panel_progress_bars):
+            panel_layout.addWidget(label)
+            panel_layout.addWidget(progress_bar)
 
         self.hide()
 
     def _overall_units(self, value: float) -> int:
         return max(0, round(max(0.0, value) * 1000.0))
 
-    def begin(self, message: str, maximum: float, show_stage_progress: bool = False) -> None:
+    def begin(self, message: str) -> None:
         self.message_label.setText(message)
-        self.progress_bar.setRange(0, max(1, self._overall_units(maximum)))
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.setValue(0)
-        self.stage_label.setVisible(show_stage_progress)
-        self.stage_progress_bar.setVisible(show_stage_progress)
-        if show_stage_progress:
-            self.stage_label.setText("Current stage")
-            self.stage_progress_bar.setRange(0, 1)
-            self.stage_progress_bar.setValue(0)
-        if self.parentWidget() is not None:
-            self.setGeometry(self.parentWidget().rect())
-        self.raise_()
+        for index, progress_bar in enumerate(self.panel_progress_bars):
+            self.panel_labels[index].setText("Pre-deployment" if index == 0 else "Post-deployment")
+            progress_bar.setRange(0, 0)
+            progress_bar.setValue(0)
         self.show()
-        QApplication.processEvents()
 
-    def set_progress(self, value: float, maximum: float | None = None) -> None:
-        if maximum is not None:
-            self.progress_bar.setRange(0, max(1, self._overall_units(maximum)))
+    def set_progress(self, value: float, maximum: float) -> None:
+        self.progress_bar.setRange(0, max(1, self._overall_units(maximum)))
         self.progress_bar.setValue(min(self._overall_units(value), self.progress_bar.maximum()))
-        QApplication.processEvents()
 
-    def set_stage_progress(self, stage_message: str, value: int, maximum: int) -> None:
-        self.stage_label.setText(stage_message)
-        self.stage_progress_bar.setRange(0, max(1, maximum))
-        self.stage_progress_bar.setValue(max(0, min(value, max(1, maximum))))
-        QApplication.processEvents()
+    def set_panel_progress(self, panel_index: int, stage_message: str, value: float, maximum: float) -> None:
+        label = "Pre-deployment" if panel_index == 0 else "Post-deployment"
+        self.panel_labels[panel_index].setText(f"{label}: {stage_message}" if stage_message else label)
+        progress_bar = self.panel_progress_bars[panel_index]
+        progress_bar.setRange(0, max(1, self._overall_units(maximum)))
+        progress_bar.setValue(min(self._overall_units(value), progress_bar.maximum()))
 
     def finish(self) -> None:
         self.hide()
@@ -1300,6 +1315,21 @@ class ContrastWindow(QMainWindow):
         self.current_frame_index = 0
         self.results: dict[str, AnalysisResult] = {}
         self.deep_denoisers: dict[str, FrameDenoiser] = {}
+        self._enhancement_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="enhancement-coordinator")
+        self._enhancement_future: Future[bool] | None = None
+        self._enhancement_cancel: Event | None = None
+        self._enhancement_active_request: EnhancementRequest | None = None
+        self._enhancement_pending_request: EnhancementRequest | None = None
+        self._enhancement_generation = 0
+        self._enhancement_frame_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
+        self._enhancement_progress_lock = Lock()
+        self._enhancement_progress_values = [0.0, 0.0]
+        self._enhancement_progress_totals = [1.0, 1.0]
+        self._enhancement_stage_messages = ["Waiting", "Waiting"]
+        self._enhancement_message = "Preparing enhanced videos..."
+        self.enhancement_poll_timer = QTimer(self)
+        self.enhancement_poll_timer.setInterval(30)
+        self.enhancement_poll_timer.timeout.connect(self._poll_enhancement)
 
         self.pre_panel = VideoPanel("Pre-deployment", QColor("#38bdf8"), DEFAULT_VIDEOS["Pre-deployment"])
         self.post_panel = VideoPanel("Post-deployment", QColor("#f97316"), DEFAULT_VIDEOS["Post-deployment"])
@@ -1307,7 +1337,8 @@ class ContrastWindow(QMainWindow):
         for panel in self.panels:
             panel.roiChanged.connect(self.on_roi_changed)
 
-        self.max_frame = min(panel.info.frame_count for panel in self.panels) - 1
+        self.source_max_frame = min(panel.info.frame_count for panel in self.panels) - 1
+        self.max_frame = self.source_max_frame
         self.fps = min(panel.info.fps for panel in self.panels)
         self.playback_speed = 1.0
         self.play_interval_ms = self._play_interval_ms()
@@ -1398,6 +1429,15 @@ class ContrastWindow(QMainWindow):
         playback_layout.addWidget(self.compare_view_check)
 
         controls_panel = self._build_controls_panel()
+        self.enhancement_progress = EnhancementProgressPanel()
+        left_column = QWidget()
+        left_column.setMaximumWidth(430)
+        left_column.setMinimumWidth(390)
+        left_layout = QVBoxLayout(left_column)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+        left_layout.addWidget(controls_panel, 1)
+        left_layout.addWidget(self.enhancement_progress)
         plot_panel = self._build_plot_panel()
 
         right_column = QWidget()
@@ -1409,7 +1449,7 @@ class ContrastWindow(QMainWindow):
         right_layout.addWidget(plot_panel, 2)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(controls_panel)
+        splitter.addWidget(left_column)
         splitter.addWidget(right_column)
         splitter.setSizes([420, 1080])
 
@@ -1419,8 +1459,6 @@ class ContrastWindow(QMainWindow):
         layout.setSpacing(14)
         layout.addWidget(splitter)
         self.setCentralWidget(central)
-        self.loading_overlay = LoadingOverlay(central)
-        self.loading_overlay.setGeometry(central.rect())
         self.setStatusBar(QStatusBar())
 
     def _build_controls_panel(self) -> QWidget:
@@ -1775,9 +1813,8 @@ class ContrastWindow(QMainWindow):
             QLabel#metricValue { color: #f8fafc; font-size: 22px; font-weight: 800; }
             QLabel#metricDetail { color: #94a3b8; font-size: 12px; }
             QStatusBar { background: #0b1018; color: #9fb0c6; }
-            QFrame#loadingOverlay { background: rgba(4, 8, 15, 180); }
-            QFrame#loadingOverlayPanel { background: #0f172a; border: 1px solid #334155; border-radius: 10px; min-width: 380px; }
-            QLabel#loadingOverlayLabel { color: #e2e8f0; font-size: 14px; font-weight: 700; }
+            QFrame#enhancementProgressPanel { background: #0f172a; border: 1px solid #334155; border-radius: 8px; }
+            QLabel#enhancementProgressLabel { color: #e2e8f0; font-size: 13px; font-weight: 700; }
             QProgressBar { border: 1px solid #334155; border-radius: 6px; background: #111827; color: #e5edf6; text-align: center; }
             QProgressBar::chunk { background: #14b8a6; border-radius: 5px; }
             """
@@ -1801,7 +1838,8 @@ class ContrastWindow(QMainWindow):
             return
 
         self.results.clear()
-        self.max_frame = min(item.info.frame_count for item in self.panels) - 1
+        self.source_max_frame = min(item.info.frame_count for item in self.panels) - 1
+        self.max_frame = self.source_max_frame
         self.fps = min(item.info.fps for item in self.panels)
         self.play_interval_ms = self._play_interval_ms()
         self.frame_slider.setRange(0, self.max_frame)
@@ -1853,6 +1891,8 @@ class ContrastWindow(QMainWindow):
 
     def advance_frame(self) -> None:
         if self.current_frame_index >= self.max_frame:
+            if self._enhancement_future is not None:
+                return
             self.pause()
             return
         next_frame_index = self.current_frame_index + 1
@@ -1865,6 +1905,7 @@ class ContrastWindow(QMainWindow):
                 widget.blockSignals(True)
                 widget.setValue(next_frame_index)
                 widget.blockSignals(False)
+        self.step_forward_button.setEnabled(self.current_frame_index < self.max_frame)
         self.update_time_label()
 
     def set_frame_index(self, frame_index: int) -> None:
@@ -1879,6 +1920,24 @@ class ContrastWindow(QMainWindow):
                 widget.blockSignals(True)
                 widget.setValue(frame_index)
                 widget.blockSignals(False)
+        self.step_forward_button.setEnabled(self.current_frame_index < self.max_frame)
+        self.update_time_label()
+
+    def _set_playback_limit(self, frame_index: int) -> None:
+        self.max_frame = max(0, min(frame_index, self.source_max_frame))
+        for widget in [self.frame_slider, self.frame_spin]:
+            widget.blockSignals(True)
+            widget.setRange(0, self.max_frame)
+            widget.blockSignals(False)
+        if self.current_frame_index > self.max_frame:
+            self.current_frame_index = self.max_frame
+            for panel in self.panels:
+                panel.seek(self.current_frame_index)
+            for widget in [self.frame_slider, self.frame_spin]:
+                widget.blockSignals(True)
+                widget.setValue(self.current_frame_index)
+                widget.blockSignals(False)
+        self.step_forward_button.setEnabled(self.current_frame_index < self.max_frame)
         self.update_time_label()
 
     def update_time_label(self) -> None:
@@ -1917,17 +1976,10 @@ class ContrastWindow(QMainWindow):
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
         self.inference_precision_combo.setEnabled(use_deep_model)
-        active_key = self._denoiser_key(active_mode) if use_deep_model else ""
-        for key, denoiser in list(self.deep_denoisers.items()):
-            if key == active_key:
-                continue
-            close = getattr(denoiser, "close", None)
-            if close is not None:
-                close()
-            del self.deep_denoisers[key]
         if stages.any_enabled:
             self.rebuild_enhancement_pipeline()
         else:
+            self._stop_enhancement_preview()
             self.statusBar().showMessage("Enhancement settings updated. Enable one or more stages to preview.")
 
     def enhancement_stages(self) -> EnhancementStages:
@@ -1995,15 +2047,10 @@ class ContrastWindow(QMainWindow):
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
         self.inference_precision_combo.setEnabled(use_deep_model)
-        if not use_deep_model:
-            for key, denoiser in list(self.deep_denoisers.items()):
-                close = getattr(denoiser, "close", None)
-                if close is not None:
-                    close()
-                del self.deep_denoisers[key]
         if stages.any_enabled:
             self.rebuild_enhancement_pipeline()
         else:
+            self._stop_enhancement_preview()
             self.set_display_enhancement(False)
             self.statusBar().showMessage("Showing original videos.")
 
@@ -2020,148 +2067,243 @@ class ContrastWindow(QMainWindow):
         return f"{mode}:{precision}:batch{batch_size}"
 
     def rebuild_enhancement_pipeline(self) -> None:
-        if self.ensure_enhancement_ready():
-            self.set_display_enhancement(True)
-        else:
-            self.set_display_enhancement(False)
-
-    def ensure_enhancement_ready(self) -> bool:
         mode = str(self.enhancement_mode_combo.currentData())
-        stages = self.enhancement_stages()
-        parameters = self.enhancement_parameters()
-        use_deep_model = stages.denoise and mode != "classical"
-        noise_sigma = self.denoise_strength_spin.value()
-        batch_size = self.inference_batch_spin.value()
-        precision = str(self.inference_precision_combo.currentData())
-        denoiser = None
+        self._enhancement_generation += 1
+        request = EnhancementRequest(
+            generation=self._enhancement_generation,
+            mode=mode,
+            model_label=self.enhancement_mode_combo.currentText().split(" (")[0],
+            stages=self.enhancement_stages(),
+            parameters=self.enhancement_parameters(),
+            noise_sigma=self.denoise_strength_spin.value(),
+            batch_size=self.inference_batch_spin.value(),
+            precision=str(self.inference_precision_combo.currentData()),
+        )
+        self._enhancement_pending_request = request
+        if self._enhancement_cancel is not None:
+            self._enhancement_cancel.set()
+            self.enhancement_progress.begin("Updating enhancement settings...")
+        else:
+            self._start_enhancement_request(request)
+
+    def _start_enhancement_request(self, request: EnhancementRequest) -> None:
+        self._enhancement_pending_request = None
+        self._enhancement_active_request = request
+        self._enhancement_cancel = Event()
+        with self._enhancement_progress_lock:
+            self._enhancement_progress_values = [0.0, 0.0]
+            self._enhancement_progress_totals = [1.0, 1.0]
+            self._enhancement_stage_messages = ["Waiting", "Waiting"]
+            self._enhancement_message = "Preparing enhanced videos..."
+        for panel in self.panels:
+            panel.enhanced_frames = []
+            panel.enhance_display = True
+        self._set_playback_limit(0)
+        for panel in self.panels:
+            panel.seek(self.current_frame_index)
+        self.open_pre_action.setEnabled(False)
+        self.open_post_action.setEnabled(False)
+        self.enhancement_progress.begin("Preparing enhanced videos...")
+        self.statusBar().showMessage("Enhancement is running; playback follows the frames ready in both videos.")
+        self._enhancement_future = self._enhancement_executor.submit(
+            self._run_enhancement_request,
+            request,
+            self._enhancement_cancel,
+        )
+        self.enhancement_poll_timer.start()
+
+    def _run_enhancement_request(self, request: EnhancementRequest, cancel_event: Event) -> bool:
+        use_deep_model = request.stages.denoise and request.mode != "classical"
+        denoiser: FrameDenoiser | None = None
+        active_denoiser_key = (
+            f"{request.mode}:{request.precision}:batch{request.batch_size}"
+            if use_deep_model
+            else ""
+        )
+        for key, inactive_denoiser in list(self.deep_denoisers.items()):
+            if key == active_denoiser_key:
+                continue
+            close = getattr(inactive_denoiser, "close", None)
+            if close is not None:
+                close()
+            del self.deep_denoisers[key]
         if use_deep_model:
-            try:
-                denoiser_key = self._denoiser_key(mode)
-                if denoiser_key not in self.deep_denoisers:
-                    if mode.endswith("-ngc"):
-                        self.loading_overlay.begin("Starting the NGC PyTorch worker...", 1)
-                        from container_denoiser import ContainerDenoiser
+            denoiser_key = active_denoiser_key
+            if denoiser_key not in self.deep_denoisers:
+                with self._enhancement_progress_lock:
+                    self._enhancement_message = f"Loading {request.model_label}..."
+                if request.mode.endswith("-ngc"):
+                    from container_denoiser import ContainerDenoiser
 
-                        model_name = mode.removesuffix("-ngc")
-                        weights_name = "ffdnet_gray.pth" if model_name == "ffdnet" else f"{model_name.replace('-', '_')}.pth"
-                        self.deep_denoisers[denoiser_key] = ContainerDenoiser(
-                            model_name,
-                            ROOT / "models" / weights_name,
-                            batch_size,
-                            precision,
-                        )
-                    else:
-                        self.loading_overlay.begin("Loading FFDNet on the NVIDIA GPU...", 1)
-                        from deep_denoiser import FFDNetDenoiser
+                    model_name = request.mode.removesuffix("-ngc")
+                    weights_name = "ffdnet_gray.pth" if model_name == "ffdnet" else f"{model_name.replace('-', '_')}.pth"
+                    self.deep_denoisers[denoiser_key] = ContainerDenoiser(
+                        model_name,
+                        ROOT / "models" / weights_name,
+                        request.batch_size,
+                        request.precision,
+                    )
+                else:
+                    from deep_denoiser import FFDNetDenoiser
 
-                        self.deep_denoisers[denoiser_key] = FFDNetDenoiser(
-                            ROOT / "models" / "ffdnet_gray.pth",
-                            precision,
-                        )
-                denoiser = self.deep_denoisers[denoiser_key]
-            except (ImportError, OSError, RuntimeError) as exc:
-                QMessageBox.critical(self, "Deep enhancement unavailable", str(exc))
-                return False
-            finally:
-                self.loading_overlay.finish()
+                    self.deep_denoisers[denoiser_key] = FFDNetDenoiser(
+                        ROOT / "models" / "ffdnet_gray.pth",
+                        request.precision,
+                    )
+            denoiser = self.deep_denoisers[denoiser_key]
 
+        if cancel_event.is_set():
+            return False
         backend_id = denoiser.backend_id if denoiser is not None else "classical"
-        self.pause()
         panel_work = [
-            panel.estimate_prepare_work(backend_id, noise_sigma, stages, parameters)
+            panel.estimate_prepare_work(backend_id, request.noise_sigma, request.stages, request.parameters)
             for panel in self.panels
         ]
-        total_work = sum(panel_work)
-
-        if total_work <= 0:
-            try:
-                for panel in self.panels:
-                    if not panel.prepare_enhanced_frames(
-                        denoiser,
-                        noise_sigma,
-                        batch_size,
-                        stages,
-                        parameters,
-                        None,
-                    ):
-                        return False
-                return True
-            except RuntimeError as exc:
-                QMessageBox.critical(self, "Enhancement failed", str(exc))
-                return False
-
-        if denoiser is not None:
-            model_label = self.enhancement_mode_combo.currentText().split(" (")[0]
-            message = f"Running {model_label} on {denoiser.device_name}..."
-        else:
-            message = "Running classical video enhancement..."
-        self.loading_overlay.begin(message, total_work, show_stage_progress=True)
+        with self._enhancement_progress_lock:
+            self._enhancement_progress_totals = [max(work, 0.001) for work in panel_work]
+            if denoiser is not None:
+                self._enhancement_message = f"Running {request.model_label} on {denoiser.device_name}..."
+            else:
+                self._enhancement_message = "Running classical video enhancement..."
 
         worker_denoiser = SynchronizedFrameDenoiser(denoiser) if denoiser is not None else None
-        progress_lock = Lock()
-        progress_values = [0.0] * len(self.panels)
-        progress_totals = list(panel_work)
-        stage_values: list[tuple[str, int, int]] = [("", 0, 1) for _ in self.panels]
-        latest_stage_panel = 0
 
         def prepare_panel(panel_index: int) -> bool:
             panel = self.panels[panel_index]
 
             def progress_callback(done: float, panel_total: float) -> bool:
-                with progress_lock:
-                    progress_values[panel_index] = done
-                    progress_totals[panel_index] = panel_total
-                return True
+                with self._enhancement_progress_lock:
+                    self._enhancement_progress_values[panel_index] = done
+                    self._enhancement_progress_totals[panel_index] = panel_total
+                return not cancel_event.is_set()
 
             def stage_progress_callback(stage_message: str, done: int, total: int) -> bool:
-                nonlocal latest_stage_panel
-                with progress_lock:
-                    stage_values[panel_index] = (stage_message, done, total)
-                    latest_stage_panel = panel_index
-                return True
+                with self._enhancement_progress_lock:
+                    self._enhancement_stage_messages[panel_index] = stage_message
+                return not cancel_event.is_set()
+
+            def encoded_frame_callback(frame_index: int, encoded: np.ndarray) -> None:
+                self._enhancement_frame_events.put((request.generation, panel_index, frame_index, encoded))
 
             prepared = panel.prepare_enhanced_frames(
                 worker_denoiser,
-                noise_sigma,
-                batch_size,
-                stages,
-                parameters,
+                request.noise_sigma,
+                request.batch_size,
+                request.stages,
+                request.parameters,
                 progress_callback,
                 stage_progress_callback,
+                encoded_frame_callback,
+                False,
+                cancel_event.is_set,
             )
             if prepared:
-                with progress_lock:
-                    progress_values[panel_index] = max(progress_values[panel_index], progress_totals[panel_index])
+                with self._enhancement_progress_lock:
+                    self._enhancement_progress_values[panel_index] = self._enhancement_progress_totals[panel_index]
             return prepared
 
-        def refresh_parallel_progress() -> None:
-            with progress_lock:
-                overall_done = sum(progress_values)
-                overall_total = max(overall_done, sum(progress_totals))
-                stage_panel = latest_stage_panel
-                stage_message, stage_done, stage_total = stage_values[stage_panel]
-            self.loading_overlay.set_progress(overall_done, overall_total)
-            if stage_message:
-                self.loading_overlay.set_stage_progress(
-                    f"{self.panels[stage_panel].label}: {stage_message}",
-                    stage_done,
-                    stage_total,
-                )
+        prepared = [False] * len(self.panels)
+        with ThreadPoolExecutor(max_workers=len(self.panels), thread_name_prefix="enhancement") as executor:
+            future_indices = {
+                executor.submit(prepare_panel, panel_index): panel_index
+                for panel_index in range(len(self.panels))
+            }
+            for future in as_completed(future_indices):
+                panel_index = future_indices[future]
+                try:
+                    prepared[panel_index] = future.result()
+                except Exception:
+                    cancel_event.set()
+                    raise
+                if not prepared[panel_index]:
+                    cancel_event.set()
+        return all(prepared)
 
+    def _poll_enhancement(self) -> None:
+        changed_panels: set[int] = set()
+        while True:
+            try:
+                generation, panel_index, frame_index, encoded = self._enhancement_frame_events.get_nowait()
+            except Empty:
+                break
+            if generation != self._enhancement_generation:
+                continue
+            frames = self.panels[panel_index].enhanced_frames
+            if frames is None:
+                continue
+            if frame_index == len(frames):
+                frames.append(encoded)
+                changed_panels.add(panel_index)
+
+        if changed_panels:
+            ready_frame = min(len(panel.enhanced_frames or []) for panel in self.panels) - 1
+            self._set_playback_limit(max(0, ready_frame))
+            for panel_index in changed_panels:
+                panel = self.panels[panel_index]
+                if panel.enhanced_frames is not None and self.current_frame_index < len(panel.enhanced_frames):
+                    panel.seek(self.current_frame_index)
+
+        request = self._enhancement_active_request
+        if request is not None and request.generation == self._enhancement_generation:
+            with self._enhancement_progress_lock:
+                values = list(self._enhancement_progress_values)
+                totals = list(self._enhancement_progress_totals)
+                stages = list(self._enhancement_stage_messages)
+                message = self._enhancement_message
+            self.enhancement_progress.message_label.setText(message)
+            self.enhancement_progress.set_progress(sum(values), sum(totals))
+            for panel_index in range(len(self.panels)):
+                self.enhancement_progress.set_panel_progress(panel_index, stages[panel_index], values[panel_index], totals[panel_index])
+
+        future = self._enhancement_future
+        if future is None or not future.done():
+            return
+        completed_request = self._enhancement_active_request
+        self._enhancement_future = None
+        self._enhancement_active_request = None
+        self._enhancement_cancel = None
         try:
-            with ThreadPoolExecutor(max_workers=len(self.panels), thread_name_prefix="enhancement") as executor:
-                futures = [executor.submit(prepare_panel, index) for index in range(len(self.panels))]
-                while not all(future.done() for future in futures):
-                    wait(futures, timeout=0.03)
-                    refresh_parallel_progress()
-                refresh_parallel_progress()
-                prepared = [future.result() for future in futures]
-            return all(prepared)
-        except RuntimeError as exc:
-            QMessageBox.critical(self, "Enhancement failed", str(exc))
-            return False
-        finally:
-            self.loading_overlay.finish()
+            prepared = future.result()
+            error: Exception | None = None
+        except Exception as exc:
+            prepared = False
+            error = exc
+
+        if self._enhancement_pending_request is not None:
+            self._start_enhancement_request(self._enhancement_pending_request)
+            return
+
+        self.open_pre_action.setEnabled(True)
+        self.open_post_action.setEnabled(True)
+        self.enhancement_progress.finish()
+        self.enhancement_poll_timer.stop()
+        if completed_request is None or completed_request.generation != self._enhancement_generation:
+            return
+        if error is not None:
+            self.set_display_enhancement(False)
+            self._set_playback_limit(self.source_max_frame)
+            QMessageBox.critical(self, "Enhancement failed", str(error))
+            return
+        if prepared:
+            self._set_playback_limit(self.source_max_frame)
+            for panel in self.panels:
+                panel.seek(self.current_frame_index)
+            self.statusBar().showMessage("Video enhancement complete.")
+        else:
+            self.set_display_enhancement(False)
+            self._set_playback_limit(self.source_max_frame)
+
+    def _stop_enhancement_preview(self) -> None:
+        self._enhancement_generation += 1
+        self._enhancement_pending_request = None
+        if self._enhancement_cancel is not None:
+            self._enhancement_cancel.set()
+        else:
+            self.open_pre_action.setEnabled(True)
+            self.open_post_action.setEnabled(True)
+            self.enhancement_poll_timer.stop()
+        self.enhancement_progress.finish()
+        self._set_playback_limit(self.source_max_frame)
 
     def on_analysis_filter_changed(self) -> None:
         if self.results:
@@ -2308,6 +2450,10 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage(f"Exported analysis to {path}")
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
+        self.enhancement_poll_timer.stop()
+        if self._enhancement_cancel is not None:
+            self._enhancement_cancel.set()
+        self._enhancement_executor.shutdown(wait=True, cancel_futures=True)
         for panel in self.panels:
             panel.close()
         for denoiser in self.deep_denoisers.values():
@@ -2315,11 +2461,6 @@ class ContrastWindow(QMainWindow):
             if close is not None:
                 close()
         super().closeEvent(event)
-
-    def resizeEvent(self, event) -> None:  # noqa: ANN001
-        super().resizeEvent(event)
-        if hasattr(self, "loading_overlay") and self.centralWidget() is not None:
-            self.loading_overlay.setGeometry(self.centralWidget().rect())
 
 
 def analyze_video(
