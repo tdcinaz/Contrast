@@ -29,12 +29,14 @@ Two quality controls are available:
 
 - **Automatic pillarbox crop** runs when each video is loaded. If black side bars are detected, frames are cropped to the fluoroscope content before ROI drawing, enhancement, and analysis.
 
-- **Enhance video display** starts disabled. Click **Enable video enhancement** to run the enhancement pass with an on-screen loading bar. Once complete, the enhanced frames are reused during playback, paused viewing, and scrubbing.
+- **Enhance video display** starts disabled. Click **Enable video enhancement** to run a stationary-scene enhancement pass with an on-screen loading bar. It stabilizes global gain, suppresses row-wise scanline excursions, applies edge-preserving spatial denoising, and combines adjacent frames with motion-aware weights before local contrast enhancement. The centered temporal filter avoids favoring either the preceding or following frame. Enhanced frames are JPEG-compressed in memory and reused during playback, paused viewing, and scrubbing. Display enhancement does not change the measured ROI values.
 - **Correct gain drift in analysis** measures a reference region around the ROI on every frame and normalizes the ROI intensity against that reference before calculating contrast residence.
 
 ## Measurement
 
-For each ROI, the app computes mean grayscale brightness frame by frame. When gain correction is enabled, the ROI brightness is first normalized against a surrounding reference region to reduce frame-to-frame fluoroscopy gain fluctuation. Because iodinated contrast appears darker in fluoroscopy, the contrast signal is calculated as:
+For each ROI, the app computes mean grayscale brightness frame by frame. When gain correction is enabled, the ROI brightness is first normalized against a surrounding reference region to reduce frame-to-frame fluoroscopy gain fluctuation. The reference and corrected ROI traces are then despiked with a short median filter and smoothed with a symmetric Gaussian filter. This reduces analog noise without adding the timing lag of a causal filter, though it intentionally trades a small amount of temporal precision for cleaner curves.
+
+Because iodinated contrast appears darker in fluoroscopy, the contrast signal is calculated as:
 
 ```text
 baseline ROI brightness - current ROI brightness

@@ -103,6 +103,27 @@ def baseline_sample_count(fps: float, sample_count: int) -> int:
     return max(1, min(round(fps * 2), sample_count // 5 or 1))
 
 
+def smooth_temporal_signal(values: np.ndarray, fps: float) -> np.ndarray:
+    if len(values) < 3:
+        return values.astype(float, copy=True)
+
+    median_window = min(len(values) if len(values) % 2 else len(values) - 1, max(3, round(fps * 0.1) | 1))
+    radius = median_window // 2
+    padded = np.pad(values.astype(float), radius, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, median_window)
+    despiked = np.median(windows, axis=1)
+
+    gaussian_window = min(len(values) if len(values) % 2 else len(values) - 1, max(3, round(fps * 0.4) | 1))
+    sigma = max(0.8, fps * 0.05)
+    return cv2.GaussianBlur(
+        despiked.reshape(-1, 1),
+        (1, gaussian_window),
+        sigmaX=0,
+        sigmaY=sigma,
+        borderType=cv2.BORDER_REPLICATE,
+    ).ravel()
+
+
 def detect_vertical_bar_crop(path: Path, info: VideoInfo) -> QRect:
     # Estimate content bounds from sampled columns to remove pillarbox bars.
     full_frame = QRect(0, 0, info.width, info.height)
@@ -179,28 +200,55 @@ def crop_frame(frame: np.ndarray, crop_rect: QRect) -> np.ndarray:
     return frame[y:y2, x:x2]
 
 
-def first_frame_median_cropped(path: Path, crop_rect: QRect) -> float:
+def estimate_video_median(path: Path, crop_rect: QRect, frame_count: int) -> float:
     capture = cv2.VideoCapture(str(path))
     try:
-        ok, frame = capture.read()
-        if not ok:
-            return 128.0
-        cropped = crop_frame(frame, crop_rect)
-        gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-        return float(np.median(gray))
+        medians: list[float] = []
+        sample_indexes = np.unique(np.linspace(0, max(0, frame_count - 1), num=min(24, max(1, frame_count)), dtype=int))
+        for frame_index in sample_indexes:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, frame = capture.read()
+            if ok:
+                gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
+                medians.append(float(np.median(gray)))
+        return float(np.median(medians)) if medians else 128.0
     finally:
         capture.release()
 
 
-def enhance_frame_for_display(frame: np.ndarray, target_median: float) -> np.ndarray:
+def prepare_frame_for_enhancement(frame: np.ndarray, target_median: float) -> np.ndarray:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     current_median = max(1.0, float(np.median(gray)))
-    gain = float(np.clip(target_median / current_median, 0.55, 1.85))
-    stabilized = np.clip(gray.astype(np.float32) * gain, 0, 255).astype(np.uint8)
-    smoothed = cv2.GaussianBlur(stabilized, (3, 3), 0)
-    clahe = cv2.createCLAHE(clipLimit=1.7, tileGridSize=(8, 8))
-    enhanced = clahe.apply(smoothed)
-    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    gain = float(np.clip(target_median / current_median, 0.70, 1.45))
+    stabilized = np.clip(gray.astype(np.float32) * gain, 0, 255)
+
+    vertical_smooth = cv2.GaussianBlur(stabilized, (1, 9), sigmaX=0, sigmaY=2.0)
+    row_bias = np.median(stabilized - vertical_smooth, axis=1)
+    row_bias -= np.median(row_bias)
+    stabilized -= np.clip(row_bias, -6.0, 6.0)[:, np.newaxis]
+
+    return cv2.bilateralFilter(
+        np.clip(stabilized, 0, 255).astype(np.uint8),
+        d=7,
+        sigmaColor=18,
+        sigmaSpace=4,
+    )
+
+
+def enhance_frame_for_display(previous: np.ndarray, current: np.ndarray, following: np.ndarray) -> np.ndarray:
+    current_float = current.astype(np.float32)
+    previous_float = previous.astype(np.float32)
+    following_float = following.astype(np.float32)
+    previous_weight = np.exp(-np.abs(previous_float - current_float) / 12.0)
+    following_weight = np.exp(-np.abs(following_float - current_float) / 12.0)
+    neighbor_sum = previous_float * previous_weight + following_float * following_weight
+    neighbor_weight = previous_weight + following_weight
+    temporal = (current_float + neighbor_sum) / (1.0 + neighbor_weight)
+    temporal = np.clip(temporal, 0, 255).astype(np.uint8)
+
+    clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(6, 6))
+    contrast_enhanced = clahe.apply(temporal)
+    return cv2.GaussianBlur(contrast_enhanced, (0, 0), sigmaX=0.55)
 
 
 def reference_mean(gray: np.ndarray, roi: QRect) -> float:
@@ -359,7 +407,7 @@ class VideoPanel(QFrame):
         self.current_frame: np.ndarray | None = None
         self.current_frame_index = -1
         self.enhance_display = False
-        self.target_median = first_frame_median_cropped(path, self.crop_rect)
+        self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
         self.enhanced_frames: list[np.ndarray] | None = None
 
         self.display = VideoDisplay(label, color)
@@ -397,13 +445,27 @@ class VideoPanel(QFrame):
         capture = cv2.VideoCapture(str(self.path))
         try:
             enhanced_frames: list[np.ndarray] = []
+            ok, frame = capture.read()
+            if not ok:
+                raise RuntimeError(f"Could not read video for enhancement: {self.path}")
+            current = prepare_frame_for_enhancement(crop_frame(frame, self.crop_rect), self.target_median)
+            previous = current
             for frame_index in range(self.info.frame_count):
-                ok, frame = capture.read()
-                if not ok:
-                    raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
-                enhanced_frames.append(enhance_frame_for_display(crop_frame(frame, self.crop_rect), self.target_median))
+                if frame_index + 1 < self.info.frame_count:
+                    ok, frame = capture.read()
+                    if not ok:
+                        raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+                    following = prepare_frame_for_enhancement(crop_frame(frame, self.crop_rect), self.target_median)
+                else:
+                    following = current
+                enhanced = enhance_frame_for_display(previous, current, following)
+                encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                if not encoded_ok:
+                    raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
+                enhanced_frames.append(encoded)
                 if progress_callback is not None and not progress_callback(frame_index + 1, self.info.frame_count):
                     return False
+                previous, current = current, following
             self.enhanced_frames = enhanced_frames
             return True
         finally:
@@ -421,7 +483,11 @@ class VideoPanel(QFrame):
         if apply_enhancement is None:
             apply_enhancement = self.enhance_display
         can_enhance = self.enhanced_frames is not None and 0 <= self.current_frame_index < len(self.enhanced_frames)
-        display_frame = self.enhanced_frames[self.current_frame_index] if apply_enhancement and can_enhance else frame
+        display_frame = frame
+        if apply_enhancement and can_enhance:
+            enhanced = cv2.imdecode(self.enhanced_frames[self.current_frame_index], cv2.IMREAD_GRAYSCALE)
+            if enhanced is not None:
+                display_frame = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
         self.display.set_frame(display_frame)
 
     def read_next(self, playback: bool = False) -> bool:
@@ -457,7 +523,7 @@ class VideoPanel(QFrame):
         self.crop_rect = detect_vertical_bar_crop(path, self.info)
         self.capture = cv2.VideoCapture(str(path))
         self.current_frame_index = -1
-        self.target_median = first_frame_median_cropped(path, self.crop_rect)
+        self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
         self.enhanced_frames = None
         self.path_label.setText(path.name)
         self.meta_label.setText(self._metadata_text())
@@ -729,7 +795,7 @@ class ContrastWindow(QMainWindow):
         plot_layout.setSpacing(10)
 
         self.normalized_plot = pg.PlotWidget(title="Normalized Contrast Residence")
-        self.raw_plot = pg.PlotWidget(title="ROI Mean Brightness")
+        self.raw_plot = pg.PlotWidget(title="Denoised ROI Brightness")
         for plot in [self.normalized_plot, self.raw_plot]:
             plot.setBackground("#111827")
             plot.showGrid(x=True, y=True, alpha=0.25)
@@ -925,7 +991,7 @@ class ContrastWindow(QMainWindow):
 
         self.pause()
         total_frames = sum(panel.info.frame_count for panel in pending_panels)
-        self.loading_overlay.begin("Enhancing video display. Please wait...", total_frames)
+        self.loading_overlay.begin("Stabilizing and denoising video. Please wait...", total_frames)
 
         completed = 0
         try:
@@ -1143,10 +1209,12 @@ def analyze_video(
     measurement_intensity = roi_intensity
     if gain_corrected and len(roi_intensity):
         baseline_count = baseline_sample_count(info.fps, len(reference_intensity))
-        baseline_reference = float(np.median(reference_intensity[:baseline_count]))
-        reference_safe = np.clip(reference_intensity, 1.0, None)
+        smoothed_reference = smooth_temporal_signal(reference_intensity, info.fps)
+        baseline_reference = float(np.median(smoothed_reference[:baseline_count]))
+        reference_safe = np.clip(smoothed_reference, 1.0, None)
         gain = np.clip(baseline_reference / reference_safe, 0.55, 1.85)
         measurement_intensity = roi_intensity * gain
+    measurement_intensity = smooth_temporal_signal(measurement_intensity, info.fps)
 
     return build_analysis_result(label, path, info.fps, roi, measurement_intensity, reference_intensity, threshold_fraction, gain_corrected)
 
