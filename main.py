@@ -3,8 +3,10 @@ from __future__ import annotations
 import csv
 import math
 import sys
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from time import perf_counter
 from typing import Callable, Protocol
 
@@ -57,6 +59,21 @@ class FrameDenoiser(Protocol):
     def device_name(self) -> str: ...
 
     def denoise_batch(self, images: list[np.ndarray], noise_sigma: float) -> list[np.ndarray]: ...
+
+
+class SynchronizedFrameDenoiser:
+    def __init__(self, denoiser: FrameDenoiser) -> None:
+        self._denoiser = denoiser
+        self._lock = Lock()
+        self.backend_id = denoiser.backend_id
+
+    @property
+    def device_name(self) -> str:
+        return self._denoiser.device_name
+
+    def denoise_batch(self, images: list[np.ndarray], noise_sigma: float) -> list[np.ndarray]:
+        with self._lock:
+            return self._denoiser.denoise_batch(images, noise_sigma)
 
 
 @dataclass(slots=True)
@@ -2061,33 +2078,66 @@ class ContrastWindow(QMainWindow):
             message = "Running classical video enhancement..."
         self.loading_overlay.begin(message, total_work, show_stage_progress=True)
 
-        completed = 0.0
-        try:
-            for panel, planned_work in zip(self.panels, panel_work):
-                def progress_callback(done: float, panel_total: float) -> bool:
-                    remaining_other_panels = total_work - completed - planned_work
-                    overall_total = completed + panel_total + remaining_other_panels
-                    self.loading_overlay.set_progress(completed + done, overall_total)
-                    return True
+        worker_denoiser = SynchronizedFrameDenoiser(denoiser) if denoiser is not None else None
+        progress_lock = Lock()
+        progress_values = [0.0] * len(self.panels)
+        progress_totals = list(panel_work)
+        stage_values: list[tuple[str, int, int]] = [("", 0, 1) for _ in self.panels]
+        latest_stage_panel = 0
 
-                def stage_progress_callback(stage_message: str, done: int, total: int) -> bool:
-                    self.loading_overlay.set_stage_progress(f"{panel.label}: {stage_message}", done, total)
-                    return True
+        def prepare_panel(panel_index: int) -> bool:
+            panel = self.panels[panel_index]
 
-                prepared = panel.prepare_enhanced_frames(
-                    denoiser,
-                    noise_sigma,
-                    batch_size,
-                    stages,
-                    parameters,
-                    progress_callback,
-                    stage_progress_callback,
+            def progress_callback(done: float, panel_total: float) -> bool:
+                with progress_lock:
+                    progress_values[panel_index] = done
+                    progress_totals[panel_index] = panel_total
+                return True
+
+            def stage_progress_callback(stage_message: str, done: int, total: int) -> bool:
+                nonlocal latest_stage_panel
+                with progress_lock:
+                    stage_values[panel_index] = (stage_message, done, total)
+                    latest_stage_panel = panel_index
+                return True
+
+            prepared = panel.prepare_enhanced_frames(
+                worker_denoiser,
+                noise_sigma,
+                batch_size,
+                stages,
+                parameters,
+                progress_callback,
+                stage_progress_callback,
+            )
+            if prepared:
+                with progress_lock:
+                    progress_values[panel_index] = max(progress_values[panel_index], progress_totals[panel_index])
+            return prepared
+
+        def refresh_parallel_progress() -> None:
+            with progress_lock:
+                overall_done = sum(progress_values)
+                overall_total = max(overall_done, sum(progress_totals))
+                stage_panel = latest_stage_panel
+                stage_message, stage_done, stage_total = stage_values[stage_panel]
+            self.loading_overlay.set_progress(overall_done, overall_total)
+            if stage_message:
+                self.loading_overlay.set_stage_progress(
+                    f"{self.panels[stage_panel].label}: {stage_message}",
+                    stage_done,
+                    stage_total,
                 )
-                if not prepared:
-                    return False
-                completed += planned_work
-                self.loading_overlay.set_progress(completed, total_work)
-            return True
+
+        try:
+            with ThreadPoolExecutor(max_workers=len(self.panels), thread_name_prefix="enhancement") as executor:
+                futures = [executor.submit(prepare_panel, index) for index in range(len(self.panels))]
+                while not all(future.done() for future in futures):
+                    wait(futures, timeout=0.03)
+                    refresh_parallel_progress()
+                refresh_parallel_progress()
+                prepared = [future.result() for future in futures]
+            return all(prepared)
         except RuntimeError as exc:
             QMessageBox.critical(self, "Enhancement failed", str(exc))
             return False
