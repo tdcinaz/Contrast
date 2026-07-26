@@ -881,10 +881,6 @@ class ContrastWindow(QMainWindow):
         file_menu.addAction(self.export_action)
 
     def _build_ui(self) -> None:
-        toolbar = QToolBar("Playback")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-
         self.play_button = QPushButton("Play")
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.play_button.clicked.connect(self.toggle_playback)
@@ -919,17 +915,6 @@ class ContrastWindow(QMainWindow):
         self.time_label = QLabel()
         self.time_label.setObjectName("timeLabel")
 
-        toolbar.addWidget(self.play_button)
-        toolbar.addWidget(self.step_back_button)
-        toolbar.addWidget(self.step_forward_button)
-        toolbar.addWidget(self.frame_slider)
-        toolbar.addWidget(QLabel("Frame"))
-        toolbar.addWidget(self.frame_spin)
-        toolbar.addWidget(QLabel("Speed"))
-        toolbar.addWidget(self.speed_slider)
-        toolbar.addWidget(self.speed_label)
-        toolbar.addWidget(self.time_label)
-
         video_row = QWidget()
         video_layout = QHBoxLayout(video_row)
         video_layout.setContentsMargins(0, 0, 0, 0)
@@ -937,11 +922,36 @@ class ContrastWindow(QMainWindow):
         video_layout.addWidget(self.pre_panel)
         video_layout.addWidget(self.post_panel)
 
-        analysis_panel = self._build_analysis_panel()
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(video_row)
-        splitter.addWidget(analysis_panel)
-        splitter.setSizes([560, 320])
+        playback_row = QWidget()
+        playback_layout = QHBoxLayout(playback_row)
+        playback_layout.setContentsMargins(0, 0, 0, 0)
+        playback_layout.setSpacing(8)
+        playback_layout.addWidget(self.play_button)
+        playback_layout.addWidget(self.step_back_button)
+        playback_layout.addWidget(self.step_forward_button)
+        playback_layout.addWidget(self.frame_slider, 1)
+        playback_layout.addWidget(QLabel("Frame"))
+        playback_layout.addWidget(self.frame_spin)
+        playback_layout.addWidget(QLabel("Speed"))
+        playback_layout.addWidget(self.speed_slider)
+        playback_layout.addWidget(self.speed_label)
+        playback_layout.addWidget(self.time_label)
+
+        controls_panel = self._build_controls_panel()
+        plot_panel = self._build_plot_panel()
+
+        right_column = QWidget()
+        right_layout = QVBoxLayout(right_column)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(14)
+        right_layout.addWidget(video_row, 3)
+        right_layout.addWidget(playback_row)
+        right_layout.addWidget(plot_panel, 2)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(controls_panel)
+        splitter.addWidget(right_column)
+        splitter.setSizes([420, 1080])
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -953,12 +963,7 @@ class ContrastWindow(QMainWindow):
         self.loading_overlay.setGeometry(central.rect())
         self.setStatusBar(QStatusBar())
 
-    def _build_analysis_panel(self) -> QWidget:
-        container = QWidget()
-        layout = QHBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
-
+    def _build_controls_panel(self) -> QWidget:
         controls = QTabWidget()
         controls.setMaximumWidth(410)
         controls.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding)
@@ -1062,6 +1067,18 @@ class ContrastWindow(QMainWindow):
         analysis_layout.addWidget(self.post_card)
         analysis_layout.addWidget(self.delta_card)
 
+        controls_scroll = QScrollArea()
+        controls_scroll.setObjectName("controlsScroll")
+        controls_scroll.setWidget(controls)
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        controls_scroll.setMaximumWidth(430)
+        controls_scroll.setMinimumWidth(390)
+        return controls_scroll
+
+    def _build_plot_panel(self) -> QWidget:
         plot_group = QFrame()
         plot_group.setObjectName("plotPanel")
         plot_layout = QGridLayout(plot_group)
@@ -1085,20 +1102,7 @@ class ContrastWindow(QMainWindow):
 
         plot_layout.addWidget(self.normalized_plot, 0, 0)
         plot_layout.addWidget(self.raw_plot, 1, 0)
-
-        controls_scroll = QScrollArea()
-        controls_scroll.setObjectName("controlsScroll")
-        controls_scroll.setWidget(controls)
-        controls_scroll.setWidgetResizable(True)
-        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        controls_scroll.setMaximumWidth(430)
-        controls_scroll.setMinimumWidth(390)
-
-        layout.addWidget(controls_scroll)
-        layout.addWidget(plot_group, 1)
-        return container
+        return plot_group
 
     def _build_stage_drawer_controls(self) -> None:
         enhancement_mode_row = QHBoxLayout()
