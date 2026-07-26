@@ -79,6 +79,14 @@ class EnhancementStages:
     temporal_filter: bool = False
     local_contrast: bool = False
     final_smoothing: bool = False
+    stage_order: tuple[str, ...] = (
+        "gain_stabilization",
+        "scanline_correction",
+        "denoise",
+        "temporal_filter",
+        "local_contrast",
+        "final_smoothing",
+    )
 
     @property
     def any_enabled(self) -> bool:
@@ -92,6 +100,10 @@ class EnhancementStages:
                 self.final_smoothing,
             )
         )
+
+    @property
+    def enabled_stage_order(self) -> tuple[str, ...]:
+        return tuple(stage for stage in self.stage_order if bool(getattr(self, stage, False)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,83 +592,89 @@ class VideoPanel(QFrame):
 
         capture = cv2.VideoCapture(str(self.path))
         try:
-            enhanced_frames: list[np.ndarray] = []
-            previous: np.ndarray | None = None
-            current: np.ndarray | None = None
-            completed = 0
+            stage_frames: list[np.ndarray] = []
+            for frame_index in range(self.info.frame_count):
+                ok, frame = capture.read()
+                if not ok:
+                    raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+                processed = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
+                stage_frames.append(processed)
 
-            def append_enhanced(previous: np.ndarray, current: np.ndarray, following: np.ndarray) -> None:
-                enhanced = current
-                if stages.temporal_filter:
-                    enhanced = motion_aware_temporal_filter(previous, enhanced, following, parameters.temporal_motion_sigma)
-                if stages.local_contrast:
-                    if enhanced.dtype != np.uint8:
-                        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
-                    enhanced = enhance_local_contrast(enhanced, parameters.clahe_clip_limit, parameters.clahe_tile_size)
-                if stages.final_smoothing:
-                    enhanced = smooth_final_frame(enhanced, parameters.smoothing_sigma_x)
+            for stage_key in stages.enabled_stage_order:
+                if stage_key == "gain_stabilization":
+                    target_median = self.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
+                    stage_frames = [
+                        np.clip(stabilize_frame_gain(frame, target_median, parameters.gain_min, parameters.gain_max), 0, 255)
+                        for frame in stage_frames
+                    ]
+                    continue
+
+                if stage_key == "scanline_correction":
+                    stage_frames = [
+                        correct_scanlines(frame, parameters.scanline_bias_clip, parameters.scanline_sigma_y)
+                        for frame in stage_frames
+                    ]
+                    continue
+
+                if stage_key == "denoise":
+                    denoise_input = [np.clip(frame, 0, 255).astype(np.uint8) for frame in stage_frames]
+                    if denoiser is None:
+                        stage_frames = [
+                            spatial_bilateral_filter(
+                                frame,
+                                parameters.bilateral_diameter,
+                                parameters.bilateral_sigma_color,
+                                parameters.bilateral_sigma_space,
+                            )
+                            for frame in denoise_input
+                        ]
+                        continue
+
+                    denoised_frames: list[np.ndarray] = []
+                    for batch_start in range(0, len(denoise_input), batch_size):
+                        batch = denoise_input[batch_start : batch_start + batch_size]
+                        denoised_frames.extend(denoiser.denoise_batch(batch, noise_sigma))
+                    stage_frames = denoised_frames
+                    continue
+
+                if stage_key == "temporal_filter":
+                    temporal_frames: list[np.ndarray] = []
+                    frame_count = len(stage_frames)
+                    for index, current in enumerate(stage_frames):
+                        previous = stage_frames[index - 1] if index > 0 else current
+                        following = stage_frames[index + 1] if index + 1 < frame_count else current
+                        temporal_frames.append(
+                            motion_aware_temporal_filter(previous, current, following, parameters.temporal_motion_sigma)
+                        )
+                    stage_frames = temporal_frames
+                    continue
+
+                if stage_key == "local_contrast":
+                    stage_frames = [
+                        enhance_local_contrast(
+                            np.clip(frame, 0, 255).astype(np.uint8),
+                            parameters.clahe_clip_limit,
+                            parameters.clahe_tile_size,
+                        )
+                        for frame in stage_frames
+                    ]
+                    continue
+
+                if stage_key == "final_smoothing":
+                    stage_frames = [
+                        smooth_final_frame(np.clip(frame, 0, 255).astype(np.uint8), parameters.smoothing_sigma_x)
+                        for frame in stage_frames
+                    ]
+
+            enhanced_frames: list[np.ndarray] = []
+            for index, enhanced in enumerate(stage_frames, start=1):
                 if enhanced.dtype != np.uint8:
                     enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
                 encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
                 if not encoded_ok:
                     raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
                 enhanced_frames.append(encoded)
-
-            def consume(processed: np.ndarray) -> bool:
-                nonlocal previous, current, completed
-                if stages.temporal_filter:
-                    if current is None:
-                        previous = current = processed
-                        return True
-                    assert previous is not None
-                    append_enhanced(previous, current, processed)
-                    previous, current = current, processed
-                else:
-                    append_enhanced(processed, processed, processed)
-                completed += 1
-                return progress_callback is None or progress_callback(completed, self.info.frame_count)
-
-            batch: list[np.ndarray] = []
-            for frame_index in range(self.info.frame_count):
-                ok, frame = capture.read()
-                if not ok:
-                    raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
-                processed = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
-                if stages.gain_stabilization:
-                    target_median = self.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
-                    processed = stabilize_frame_gain(processed, target_median, parameters.gain_min, parameters.gain_max)
-                if stages.scanline_correction:
-                    processed = correct_scanlines(processed, parameters.scanline_bias_clip, parameters.scanline_sigma_y)
-                if stages.denoise:
-                    processed = np.clip(processed, 0, 255).astype(np.uint8)
-                    if denoiser is None:
-                        if not consume(
-                            spatial_bilateral_filter(
-                                processed,
-                                parameters.bilateral_diameter,
-                                parameters.bilateral_sigma_color,
-                                parameters.bilateral_sigma_space,
-                            )
-                        ):
-                            return False
-                        continue
-                    batch.append(processed)
-                    if len(batch) < batch_size and frame_index + 1 < self.info.frame_count:
-                        continue
-                    for denoised in denoiser.denoise_batch(batch, noise_sigma):
-                        if not consume(denoised):
-                            return False
-                    batch.clear()
-                    continue
-                if not consume(processed):
-                    return False
-
-            if stages.temporal_filter:
-                if current is None or previous is None:
-                    raise RuntimeError(f"Could not read video for enhancement: {self.path}")
-                append_enhanced(previous, current, current)
-                completed += 1
-                if progress_callback is not None and not progress_callback(completed, self.info.frame_count):
+                if progress_callback is not None and not progress_callback(index, self.info.frame_count):
                     return False
 
             self.enhanced_frames = enhanced_frames
@@ -818,24 +836,37 @@ class LoadingOverlay(QFrame):
 
 class StageDrawer(QFrame):
     enabledChanged = Signal(int)
+    moveRequested = Signal(int)
 
-    def __init__(self, title: str, stage_index: int, parent: QWidget | None = None) -> None:
+    def __init__(self, stage_key: str, title: str, stage_index: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("stageDrawer")
+        self.stage_key = stage_key
+        self.stage_title = title
 
-        self.enable_check = QCheckBox(f"{stage_index}. {title}")
+        self.enable_check = QCheckBox()
         self.expand_button = QToolButton()
         self.expand_button.setText("Options")
         self.expand_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.expand_button.setArrowType(Qt.ArrowType.RightArrow)
         self.expand_button.setCheckable(True)
         self.expand_button.setChecked(False)
+        self.set_stage_index(stage_index)
+
+        self.move_up_button = QToolButton()
+        self.move_up_button.setArrowType(Qt.ArrowType.UpArrow)
+        self.move_up_button.setToolTip("Move stage up")
+        self.move_down_button = QToolButton()
+        self.move_down_button.setArrowType(Qt.ArrowType.DownArrow)
+        self.move_down_button.setToolTip("Move stage down")
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
         header.addWidget(self.enable_check)
         header.addStretch()
+        header.addWidget(self.move_up_button)
+        header.addWidget(self.move_down_button)
         header.addWidget(self.expand_button)
 
         self.content = QWidget()
@@ -852,10 +883,19 @@ class StageDrawer(QFrame):
 
         self.enable_check.stateChanged.connect(self.enabledChanged.emit)
         self.expand_button.toggled.connect(self._set_expanded)
+        self.move_up_button.clicked.connect(lambda: self.moveRequested.emit(-1))
+        self.move_down_button.clicked.connect(lambda: self.moveRequested.emit(1))
 
     def _set_expanded(self, expanded: bool) -> None:
         self.expand_button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
         self.content.setVisible(expanded)
+
+    def set_stage_index(self, stage_index: int) -> None:
+        self.enable_check.setText(f"{stage_index}. {self.stage_title}")
+
+    def set_move_enabled(self, can_move_up: bool, can_move_down: bool) -> None:
+        self.move_up_button.setEnabled(can_move_up)
+        self.move_down_button.setEnabled(can_move_down)
 
 
 class ContrastWindow(QMainWindow):
@@ -1019,15 +1059,16 @@ class ContrastWindow(QMainWindow):
         hint.setObjectName("hintLabel")
         analysis_layout.addWidget(hint)
 
-        pipeline_label = QLabel("Enhancement pipeline (applied top to bottom)")
+        pipeline_label = QLabel("Enhancement pipeline (applied in this order, top to bottom)")
         pipeline_label.setObjectName("pipelineLabel")
         enhancement_layout.addWidget(pipeline_label)
-        self.gain_stage_drawer = StageDrawer("Gain stabilization", 1)
-        self.scanline_stage_drawer = StageDrawer("Scanline correction", 2)
-        self.denoise_stage_drawer = StageDrawer("Spatial denoising", 3)
-        self.temporal_stage_drawer = StageDrawer("Motion-aware temporal filtering", 4)
-        self.contrast_stage_drawer = StageDrawer("Local contrast (CLAHE)", 5)
-        self.smoothing_stage_drawer = StageDrawer("Final Gaussian smoothing", 6)
+        self.enhancement_layout = enhancement_layout
+        self.gain_stage_drawer = StageDrawer("gain_stabilization", "Gain stabilization", 1)
+        self.scanline_stage_drawer = StageDrawer("scanline_correction", "Scanline correction", 2)
+        self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 3)
+        self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 4)
+        self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 5)
+        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 6)
         self.gain_stage_check = self.gain_stage_drawer.enable_check
         self.scanline_stage_check = self.scanline_stage_drawer.enable_check
         self.denoise_stage_check = self.denoise_stage_drawer.enable_check
@@ -1055,11 +1096,14 @@ class ContrastWindow(QMainWindow):
             check.stateChanged.connect(self.on_pipeline_stages_changed)
         self._build_stage_drawer_controls()
         for drawer in self.pipeline_stage_drawers:
+            drawer.moveRequested.connect(lambda direction, current=drawer: self._move_pipeline_stage(current, direction))
+        for drawer in self.pipeline_stage_drawers:
             enhancement_layout.addWidget(drawer)
 
         self.reset_pipeline_button = QPushButton("Show original videos")
         self.reset_pipeline_button.clicked.connect(self.reset_enhancement_pipeline)
         enhancement_layout.addWidget(self.reset_pipeline_button)
+        self._refresh_pipeline_stage_ui()
         enhancement_layout.addStretch()
         self.enhancement_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         self.denoise_strength_spin.valueChanged.connect(self.on_enhancement_settings_changed)
@@ -1507,7 +1551,32 @@ class ContrastWindow(QMainWindow):
             temporal_filter=self.temporal_stage_check.isChecked(),
             local_contrast=self.contrast_stage_check.isChecked(),
             final_smoothing=self.smoothing_stage_check.isChecked(),
+            stage_order=tuple(drawer.stage_key for drawer in self.pipeline_stage_drawers),
         )
+
+    def _move_pipeline_stage(self, drawer: StageDrawer, direction: int) -> None:
+        current_index = self.pipeline_stage_drawers.index(drawer)
+        target_index = current_index + direction
+        if target_index < 0 or target_index >= len(self.pipeline_stage_drawers):
+            return
+        self.pipeline_stage_drawers[current_index], self.pipeline_stage_drawers[target_index] = (
+            self.pipeline_stage_drawers[target_index],
+            self.pipeline_stage_drawers[current_index],
+        )
+        self.pipeline_stage_checks = [item.enable_check for item in self.pipeline_stage_drawers]
+        self._refresh_pipeline_stage_ui()
+        self.on_enhancement_settings_changed()
+
+    def _refresh_pipeline_stage_ui(self) -> None:
+        for drawer in self.pipeline_stage_drawers:
+            self.enhancement_layout.removeWidget(drawer)
+        insert_index = self.enhancement_layout.indexOf(self.reset_pipeline_button)
+        if insert_index < 0:
+            insert_index = self.enhancement_layout.count()
+        for offset, drawer in enumerate(self.pipeline_stage_drawers):
+            drawer.set_stage_index(offset + 1)
+            drawer.set_move_enabled(offset > 0, offset < len(self.pipeline_stage_drawers) - 1)
+            self.enhancement_layout.insertWidget(insert_index + offset, drawer)
 
     def enhancement_parameters(self) -> EnhancementParameters:
         gain_min = self.gain_min_spin.value()
