@@ -354,6 +354,7 @@ class VideoDisplay(QLabel):
         self.frame_size = (0, 0)
         self._left_pixmap = QPixmap()
         self._right_pixmap = QPixmap()
+        self._comparison_enabled = True
         self._roi: QRect | None = None
         self._drag_origin: QPoint | None = None
         self._display_rect = QRect()
@@ -385,6 +386,10 @@ class VideoDisplay(QLabel):
         # Backward-compatible single-frame entry point.
         self.set_frames(frame, frame)
 
+    def set_comparison_enabled(self, enabled: bool) -> None:
+        self._comparison_enabled = enabled
+        self.update()
+
     def roi(self) -> QRect | None:
         return QRect(self._roi) if self._roi and self._roi.isValid() else None
 
@@ -398,35 +403,50 @@ class VideoDisplay(QLabel):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         if not self._left_pixmap.isNull():
-            gap = 10
-            slot_width = max(1, (self.width() - gap) // 2)
-            left_slot = QRect(0, 0, slot_width, self.height())
-            right_slot = QRect(slot_width + gap, 0, self.width() - (slot_width + gap), self.height())
+            if self._comparison_enabled:
+                gap = 10
+                slot_width = max(1, (self.width() - gap) // 2)
+                left_slot = QRect(0, 0, slot_width, self.height())
+                right_slot = QRect(slot_width + gap, 0, self.width() - (slot_width + gap), self.height())
 
-            left_scaled = self._left_pixmap.scaled(
-                left_slot.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            right_scaled = self._right_pixmap.scaled(
-                right_slot.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+                left_scaled = self._left_pixmap.scaled(
+                    left_slot.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                right_scaled = self._right_pixmap.scaled(
+                    right_slot.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
 
-            left_x = left_slot.left() + (left_slot.width() - left_scaled.width()) // 2
-            left_y = left_slot.top() + (left_slot.height() - left_scaled.height()) // 2
-            right_x = right_slot.left() + (right_slot.width() - right_scaled.width()) // 2
-            right_y = right_slot.top() + (right_slot.height() - right_scaled.height()) // 2
+                left_x = left_slot.left() + (left_slot.width() - left_scaled.width()) // 2
+                left_y = left_slot.top() + (left_slot.height() - left_scaled.height()) // 2
+                right_x = right_slot.left() + (right_slot.width() - right_scaled.width()) // 2
+                right_y = right_slot.top() + (right_slot.height() - right_scaled.height()) // 2
 
-            self._display_rect = QRect(left_x, left_y, left_scaled.width(), left_scaled.height())
-            self._right_display_rect = QRect(right_x, right_y, right_scaled.width(), right_scaled.height())
-            painter.drawPixmap(self._display_rect, left_scaled)
-            painter.drawPixmap(self._right_display_rect, right_scaled)
+                self._display_rect = QRect(left_x, left_y, left_scaled.width(), left_scaled.height())
+                self._right_display_rect = QRect(right_x, right_y, right_scaled.width(), right_scaled.height())
+                painter.drawPixmap(self._display_rect, left_scaled)
+                painter.drawPixmap(self._right_display_rect, right_scaled)
 
-            painter.setPen(QColor("#64748b"))
-            painter.drawText(left_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Original")
-            painter.drawText(right_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Enhanced")
+                painter.setPen(QColor("#64748b"))
+                painter.drawText(left_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Original")
+                painter.drawText(right_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Enhanced")
+            else:
+                full_slot = QRect(0, 0, self.width(), self.height())
+                scaled = self._right_pixmap.scaled(
+                    full_slot.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                draw_x = full_slot.left() + (full_slot.width() - scaled.width()) // 2
+                draw_y = full_slot.top() + (full_slot.height() - scaled.height()) // 2
+                self._display_rect = QRect(draw_x, draw_y, scaled.width(), scaled.height())
+                self._right_display_rect = QRect()
+                painter.drawPixmap(self._display_rect, scaled)
+                painter.setPen(QColor("#64748b"))
+                painter.drawText(full_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Video")
         else:
             self._display_rect = QRect()
             self._right_display_rect = QRect()
@@ -509,11 +529,13 @@ class VideoPanel(QFrame):
         self.current_frame: np.ndarray | None = None
         self.current_frame_index = -1
         self.enhance_display = False
+        self.comparison_display = True
         self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
         self.enhanced_frames: list[np.ndarray] | None = None
         self.enhancement_signature: tuple[str, int, EnhancementStages, EnhancementParameters] | None = None
 
         self.display = VideoDisplay(label, color)
+        self.display.set_comparison_enabled(self.comparison_display)
         self.display.roiChanged.connect(self.roiChanged.emit)
 
         self.title_label = QLabel(label)
@@ -701,10 +723,16 @@ class VideoPanel(QFrame):
         self.path_label.setText(path.name)
         self.meta_label.setText(self._metadata_text())
         self.display.clear_roi()
+        self.display.set_comparison_enabled(self.comparison_display)
         self.seek(0)
 
     def set_enhancement(self, enabled: bool, frame_index: int) -> None:
         self.enhance_display = enabled
+        self.seek(frame_index)
+
+    def set_comparison(self, enabled: bool, frame_index: int) -> None:
+        self.comparison_display = enabled
+        self.display.set_comparison_enabled(enabled)
         self.seek(frame_index)
 
     def clear_enhancement_cache(self) -> None:
@@ -915,6 +943,10 @@ class ContrastWindow(QMainWindow):
         self.time_label = QLabel()
         self.time_label.setObjectName("timeLabel")
 
+        self.compare_view_check = QCheckBox("Side-by-side compare")
+        self.compare_view_check.setChecked(True)
+        self.compare_view_check.toggled.connect(self.on_compare_view_toggled)
+
         video_row = QWidget()
         video_layout = QHBoxLayout(video_row)
         video_layout.setContentsMargins(0, 0, 0, 0)
@@ -936,6 +968,7 @@ class ContrastWindow(QMainWindow):
         playback_layout.addWidget(self.speed_slider)
         playback_layout.addWidget(self.speed_label)
         playback_layout.addWidget(self.time_label)
+        playback_layout.addWidget(self.compare_view_check)
 
         controls_panel = self._build_controls_panel()
         plot_panel = self._build_plot_panel()
@@ -1435,6 +1468,14 @@ class ContrastWindow(QMainWindow):
         for panel in self.panels:
             panel.set_enhancement(enabled, self.current_frame_index)
         self.statusBar().showMessage("Video enhancement enabled." if enabled else "Video enhancement disabled.")
+
+    def on_compare_view_toggled(self, enabled: bool) -> None:
+        for panel in self.panels:
+            panel.set_comparison(enabled, self.current_frame_index)
+        if enabled:
+            self.statusBar().showMessage("Side-by-side original vs enhanced comparison enabled.")
+        else:
+            self.statusBar().showMessage("Single-view mode enabled.")
 
     def on_enhancement_settings_changed(self) -> None:
         active_mode = str(self.enhancement_mode_combo.currentData())
