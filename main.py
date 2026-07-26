@@ -3,13 +3,15 @@ from __future__ import annotations
 import csv
 import math
 import sys
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, SimpleQueue
 from threading import Event, Lock
 from time import perf_counter
-from typing import Callable, Protocol, cast
+from typing import Callable, Generator, Protocol, cast
 
 import cv2
 import numpy as np
@@ -46,12 +48,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from frame_scheduler import AdaptiveFrameExecutor
+
 ROOT = Path(__file__).resolve().parent
 STREAM_END = object()
 DEFAULT_VIDEOS = {
     "Pre-deployment": ROOT / "PPI150_PreDeployment_Contrast.mov",
     "Post-deployment": ROOT / "PPI150_PostDeployment_Contrast.mov",
 }
+
+
+@contextmanager
+def frame_parallel_opencv() -> Generator[None]:
+    previous_thread_count = cv2.getNumThreads()
+    cv2.setNumThreads(1)
+    try:
+        yield
+    finally:
+        cv2.setNumThreads(previous_thread_count)
 
 
 class FrameDenoiser(Protocol):
@@ -808,6 +822,7 @@ class VideoPanel(QFrame):
         encoded_frame_callback: Callable[[int, np.ndarray], None] | None = None,
         activate_result: bool = True,
         cancel_callback: Callable[[], bool] | None = None,
+        frame_executor: AdaptiveFrameExecutor | None = None,
     ) -> bool:
         backend_id = denoiser.backend_id if denoiser is not None else "classical"
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
@@ -822,6 +837,22 @@ class VideoPanel(QFrame):
                 self.enhanced_frames = encoded_frames
             self.active_sequence_key = sequence_key
             return True
+
+        if frame_executor is None:
+            with frame_parallel_opencv(), AdaptiveFrameExecutor() as owned_executor:
+                return self.prepare_enhanced_frames(
+                    denoiser,
+                    noise_sigma,
+                    batch_size,
+                    stages,
+                    parameters,
+                    progress_callback,
+                    stage_progress_callback,
+                    encoded_frame_callback,
+                    activate_result,
+                    cancel_callback,
+                    owned_executor,
+                )
 
         frame_count = self.info.frame_count
         source_missing = self.source_gray_frames is None
@@ -921,11 +952,38 @@ class VideoPanel(QFrame):
             output = stage_outputs[stage_index]
             work_index = stage_work_offset + stage_index
             active_seconds = 0.0
+            pending_frames: deque[tuple[int, Future[tuple[np.ndarray, float]]]] = deque()
 
             def emit(frame_index: int, frame: np.ndarray) -> bool:
                 output.append(frame)
                 output_queue.put((frame_index, frame))
                 return report_frame(work_index, stage_name, len(output))
+
+            def apply_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
+                started_at = perf_counter()
+                transformed = self._apply_frame_stage(stage_key, frame, parameters)
+                return transformed, perf_counter() - started_at
+
+            def apply_temporal(
+                previous: np.ndarray,
+                current: np.ndarray,
+                following: np.ndarray,
+            ) -> tuple[np.ndarray, float]:
+                started_at = perf_counter()
+                transformed = motion_aware_temporal_filter(
+                    previous,
+                    current,
+                    following,
+                    parameters.temporal_motion_sigma,
+                )
+                return transformed, perf_counter() - started_at
+
+            def drain_frame() -> bool:
+                nonlocal active_seconds
+                frame_index, future = pending_frames.popleft()
+                transformed, duration = future.result()
+                active_seconds += duration
+                return cancelled.is_set() or emit(frame_index, transformed)
 
             try:
                 if stage_key == "temporal_filter":
@@ -943,29 +1001,36 @@ class VideoPanel(QFrame):
                             continue
                         current_index, current = current_item
                         following = next_item[1]
-                        started_at = perf_counter()
-                        filtered = motion_aware_temporal_filter(
-                            previous if previous is not None else current,
-                            current,
-                            following,
-                            parameters.temporal_motion_sigma,
+                        pending_frames.append(
+                            (
+                                current_index,
+                                frame_executor.submit(
+                                    apply_temporal,
+                                    previous if previous is not None else current,
+                                    current,
+                                    following,
+                                ),
+                            )
                         )
-                        active_seconds += perf_counter() - started_at
-                        if not emit(current_index, filtered):
-                            continue
+                        if len(pending_frames) >= frame_executor.max_workers:
+                            drain_frame()
                         previous = current
                         current_item = next_item
                     if current_item is not None and not cancelled.is_set():
                         current_index, current = current_item
-                        started_at = perf_counter()
-                        filtered = motion_aware_temporal_filter(
-                            previous if previous is not None else current,
-                            current,
-                            current,
-                            parameters.temporal_motion_sigma,
+                        pending_frames.append(
+                            (
+                                current_index,
+                                frame_executor.submit(
+                                    apply_temporal,
+                                    previous if previous is not None else current,
+                                    current,
+                                    current,
+                                ),
+                            )
                         )
-                        active_seconds += perf_counter() - started_at
-                        emit(current_index, filtered)
+                    while pending_frames:
+                        drain_frame()
                 elif stage_key == "denoise" and denoiser is not None:
                     batch: list[tuple[int, np.ndarray]] = []
 
@@ -974,9 +1039,14 @@ class VideoPanel(QFrame):
                         if not batch or cancelled.is_set():
                             return
                         denoise_input = [np.clip(frame, 0, 255).astype(np.uint8) for _, frame in batch]
-                        started_at = perf_counter()
-                        denoised_batch = denoiser.denoise_batch(denoise_input, noise_sigma)
-                        active_seconds += perf_counter() - started_at
+
+                        def denoise_frames() -> tuple[list[np.ndarray], float]:
+                            started_at = perf_counter()
+                            result = denoiser.denoise_batch(denoise_input, noise_sigma)
+                            return result, perf_counter() - started_at
+
+                        denoised_batch, duration = frame_executor.submit(denoise_frames).result()
+                        active_seconds += duration
                         if len(denoised_batch) != len(batch):
                             raise RuntimeError("Denoiser returned an unexpected number of frames.")
                         for (frame_index, _), denoised in zip(batch, denoised_batch):
@@ -1002,10 +1072,11 @@ class VideoPanel(QFrame):
                         if cancelled.is_set():
                             continue
                         frame_index, frame = cast(tuple[int, np.ndarray], item)
-                        started_at = perf_counter()
-                        transformed = self._apply_frame_stage(stage_key, frame, parameters)
-                        active_seconds += perf_counter() - started_at
-                        emit(frame_index, transformed)
+                        pending_frames.append((frame_index, frame_executor.submit(apply_frame, frame)))
+                        if len(pending_frames) >= frame_executor.max_workers:
+                            drain_frame()
+                    while pending_frames:
+                        drain_frame()
             except Exception:
                 cancelled.set()
                 raise
@@ -1018,6 +1089,29 @@ class VideoPanel(QFrame):
 
         def encode_frames() -> None:
             active_seconds = 0.0
+            pending_frames: deque[tuple[int, Future[tuple[np.ndarray, float]]]] = deque()
+
+            def encode_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
+                enhanced = frame if frame.dtype == np.uint8 else np.clip(frame, 0, 255).astype(np.uint8)
+                started_at = perf_counter()
+                encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                duration = perf_counter() - started_at
+                if not encoded_ok:
+                    raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
+                return encoded, duration
+
+            def drain_frame() -> None:
+                nonlocal active_seconds
+                frame_index, future = pending_frames.popleft()
+                encoded, duration = future.result()
+                active_seconds += duration
+                if cancelled.is_set():
+                    return
+                encoded_frames.append(encoded)
+                if encoded_frame_callback is not None:
+                    encoded_frame_callback(frame_index, encoded)
+                report_frame(encode_work_index, "Encode enhanced frames", len(encoded_frames))
+
             try:
                 while True:
                     item = queues[-1].get()
@@ -1026,17 +1120,11 @@ class VideoPanel(QFrame):
                     if cancelled.is_set():
                         continue
                     frame_index, frame = cast(tuple[int, np.ndarray], item)
-                    enhanced = frame if frame.dtype == np.uint8 else np.clip(frame, 0, 255).astype(np.uint8)
-                    started_at = perf_counter()
-                    encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                    active_seconds += perf_counter() - started_at
-                    if not encoded_ok:
-                        raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
-                    encoded_frames.append(encoded)
-                    if encoded_frame_callback is not None:
-                        encoded_frame_callback(frame_index, encoded)
-                    if not report_frame(encode_work_index, "Encode enhanced frames", len(encoded_frames)):
-                        continue
+                    pending_frames.append((frame_index, frame_executor.submit(encode_frame, frame)))
+                    if len(pending_frames) >= frame_executor.max_workers:
+                        drain_frame()
+                while pending_frames:
+                    drain_frame()
             except Exception:
                 cancelled.set()
                 raise
@@ -2168,7 +2256,7 @@ class ContrastWindow(QMainWindow):
 
         worker_denoiser = SynchronizedFrameDenoiser(denoiser) if denoiser is not None else None
 
-        def prepare_panel(panel_index: int) -> bool:
+        def prepare_panel(panel_index: int, frame_executor: AdaptiveFrameExecutor) -> bool:
             panel = self.panels[panel_index]
 
             def progress_callback(done: float, panel_total: float) -> bool:
@@ -2196,6 +2284,7 @@ class ContrastWindow(QMainWindow):
                 encoded_frame_callback,
                 False,
                 cancel_event.is_set,
+                frame_executor,
             )
             if prepared:
                 with self._enhancement_progress_lock:
@@ -2203,9 +2292,12 @@ class ContrastWindow(QMainWindow):
             return prepared
 
         prepared = [False] * len(self.panels)
-        with ThreadPoolExecutor(max_workers=len(self.panels), thread_name_prefix="enhancement") as executor:
+        with frame_parallel_opencv(), AdaptiveFrameExecutor() as frame_executor, ThreadPoolExecutor(
+            max_workers=len(self.panels),
+            thread_name_prefix="enhancement",
+        ) as executor:
             future_indices = {
-                executor.submit(prepare_panel, panel_index): panel_index
+                executor.submit(prepare_panel, panel_index, frame_executor): panel_index
                 for panel_index in range(len(self.panels))
             }
             for future in as_completed(future_indices):
