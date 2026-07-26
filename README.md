@@ -27,6 +27,8 @@ Use the **File** menu to choose different videos if needed.
 
 Two quality controls are available:
 
+- **Automatic pillarbox crop** runs when each video is loaded. If black side bars are detected, frames are cropped to the fluoroscope content before ROI drawing, enhancement, and analysis.
+
 - **Enhance video display** starts disabled. Click **Enable video enhancement** to run the enhancement pass with an on-screen loading bar. Once complete, the enhanced frames are reused during playback, paused viewing, and scrubbing.
 - **Correct gain drift in analysis** measures a reference region around the ROI on every frame and normalizes the ROI intensity against that reference before calculating contrast residence.
 

@@ -103,13 +103,90 @@ def baseline_sample_count(fps: float, sample_count: int) -> int:
     return max(1, min(round(fps * 2), sample_count // 5 or 1))
 
 
-def first_frame_median(path: Path) -> float:
+def detect_vertical_bar_crop(path: Path, info: VideoInfo) -> QRect:
+    # Estimate content bounds from sampled columns to remove pillarbox bars.
+    full_frame = QRect(0, 0, info.width, info.height)
+    if info.width <= 0 or info.height <= 0:
+        return full_frame
+
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        return full_frame
+
+    try:
+        sample_count = min(24, max(6, info.frame_count if info.frame_count > 0 else 6))
+        frame_indexes = np.unique(np.linspace(0, max(0, info.frame_count - 1), num=sample_count, dtype=int))
+        column_profiles: list[np.ndarray] = []
+        for frame_index in frame_indexes:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            column_profiles.append(np.percentile(gray, 90, axis=0).astype(np.float32))
+
+        if len(column_profiles) < 3:
+            return full_frame
+
+        profile = np.median(np.stack(column_profiles, axis=0), axis=0)
+        kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32)
+        smooth = np.convolve(profile, kernel / np.sum(kernel), mode="same")
+
+        center_start = info.width // 4
+        center_end = (info.width * 3) // 4
+        center_slice = smooth[center_start:center_end]
+        center_level = float(np.median(center_slice)) if center_slice.size else float(np.median(smooth))
+
+        edge_width = max(1, info.width // 12)
+        edge_left = float(np.median(smooth[:edge_width]))
+        edge_right = float(np.median(smooth[-edge_width:]))
+        edge_level = min(edge_left, edge_right)
+
+        threshold = max(3.0, edge_level + (center_level - edge_level) * 0.35)
+        content = smooth > threshold
+        if not np.any(content):
+            return full_frame
+
+        left = int(np.argmax(content))
+        right = int(info.width - 1 - np.argmax(content[::-1]))
+        left = max(0, left - 2)
+        right = min(info.width - 1, right + 2)
+        cropped_width = right - left + 1
+        left_margin = left
+        right_margin = info.width - right - 1
+
+        # Only crop when bars are clearly present on both sides and crop is reasonable.
+        if cropped_width < int(info.width * 0.45):
+            return full_frame
+        if left_margin < 2 or right_margin < 2:
+            return full_frame
+
+        return QRect(left, 0, cropped_width, info.height)
+    finally:
+        capture.release()
+
+
+def crop_frame(frame: np.ndarray, crop_rect: QRect) -> np.ndarray:
+    x = max(0, crop_rect.x())
+    y = max(0, crop_rect.y())
+    width = max(1, crop_rect.width())
+    height = max(1, crop_rect.height())
+    max_height, max_width = frame.shape[:2]
+    x2 = min(max_width, x + width)
+    y2 = min(max_height, y + height)
+    if x >= x2 or y >= y2:
+        return frame
+    return frame[y:y2, x:x2]
+
+
+def first_frame_median_cropped(path: Path, crop_rect: QRect) -> float:
     capture = cv2.VideoCapture(str(path))
     try:
         ok, frame = capture.read()
         if not ok:
             return 128.0
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        cropped = crop_frame(frame, crop_rect)
+        gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
         return float(np.median(gray))
     finally:
         capture.release()
@@ -277,11 +354,12 @@ class VideoPanel(QFrame):
         self.color = color
         self.path = path
         self.info = probe_video(path)
+        self.crop_rect = detect_vertical_bar_crop(path, self.info)
         self.capture = cv2.VideoCapture(str(path))
         self.current_frame: np.ndarray | None = None
         self.current_frame_index = -1
         self.enhance_display = False
-        self.target_median = first_frame_median(path)
+        self.target_median = first_frame_median_cropped(path, self.crop_rect)
         self.enhanced_frames: list[np.ndarray] | None = None
 
         self.display = VideoDisplay(label, color)
@@ -323,7 +401,7 @@ class VideoPanel(QFrame):
                 ok, frame = capture.read()
                 if not ok:
                     raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
-                enhanced_frames.append(enhance_frame_for_display(frame, self.target_median))
+                enhanced_frames.append(enhance_frame_for_display(crop_frame(frame, self.crop_rect), self.target_median))
                 if progress_callback is not None and not progress_callback(frame_index + 1, self.info.frame_count):
                     return False
             self.enhanced_frames = enhanced_frames
@@ -332,6 +410,10 @@ class VideoPanel(QFrame):
             capture.release()
 
     def _metadata_text(self) -> str:
+        crop_width = self.crop_rect.width()
+        crop_height = self.crop_rect.height()
+        if crop_width != self.info.width or crop_height != self.info.height:
+            return f"{crop_width}x{crop_height} (auto-cropped) | {self.info.fps:.1f} fps | {self.info.duration:.1f} s"
         return f"{self.info.width}x{self.info.height} | {self.info.fps:.1f} fps | {self.info.duration:.1f} s"
 
     def _display_frame(self, frame: np.ndarray, apply_enhancement: bool | None = None) -> None:
@@ -348,7 +430,7 @@ class VideoPanel(QFrame):
         ok, frame = self.capture.read()
         if ok:
             self.current_frame_index += 1
-            self._display_frame(frame, apply_enhancement=self.enhance_display)
+            self._display_frame(crop_frame(frame, self.crop_rect), apply_enhancement=self.enhance_display)
         return ok
 
     def seek(self, frame_index: int) -> bool:
@@ -362,7 +444,7 @@ class VideoPanel(QFrame):
         ok, frame = self.capture.read()
         if ok:
             self.current_frame_index = frame_index
-            self._display_frame(frame)
+            self._display_frame(crop_frame(frame, self.crop_rect))
         return ok
 
     def roi(self) -> QRect | None:
@@ -372,9 +454,10 @@ class VideoPanel(QFrame):
         self.capture.release()
         self.path = path
         self.info = probe_video(path)
+        self.crop_rect = detect_vertical_bar_crop(path, self.info)
         self.capture = cv2.VideoCapture(str(path))
         self.current_frame_index = -1
-        self.target_median = first_frame_median(path)
+        self.target_median = first_frame_median_cropped(path, self.crop_rect)
         self.enhanced_frames = None
         self.path_label.setText(path.name)
         self.meta_label.setText(self._metadata_text())
@@ -891,6 +974,7 @@ class ContrastWindow(QMainWindow):
                     panel.label,
                     panel.path,
                     panel.info,
+                    panel.crop_rect,
                     panel.roi(),
                     threshold,
                     self.gain_correct_check.isChecked(),
@@ -1021,6 +1105,7 @@ def analyze_video(
     label: str,
     path: Path,
     info: VideoInfo,
+    crop_rect: QRect,
     roi: QRect,
     threshold_fraction: float,
     gain_corrected: bool,
@@ -1041,7 +1126,7 @@ def analyze_video(
             ok, frame = capture.read()
             if not ok:
                 break
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
             roi_pixels = gray[y : y + height, x : x + width]
             means.append(float(np.mean(roi_pixels)))
             references.append(reference_mean(gray, roi))
