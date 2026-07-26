@@ -332,25 +332,38 @@ class VideoDisplay(QLabel):
         self.title = title
         self.roi_color = color
         self.frame_size = (0, 0)
-        self._pixmap = QPixmap()
+        self._left_pixmap = QPixmap()
+        self._right_pixmap = QPixmap()
         self._roi: QRect | None = None
         self._drag_origin: QPoint | None = None
         self._display_rect = QRect()
+        self._right_display_rect = QRect()
 
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(420, 220)
+        self.setMinimumSize(620, 220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setStyleSheet("background: #0e1116; border: 1px solid #253044; border-radius: 8px;")
 
-    def set_frame(self, frame: np.ndarray) -> None:
+    def _to_pixmap(self, frame: np.ndarray) -> QPixmap:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width, channels = rgb_frame.shape
         bytes_per_line = channels * width
         image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).copy()
-        self.frame_size = (width, height)
-        self._pixmap = QPixmap.fromImage(image)
+        return QPixmap.fromImage(image)
+
+    def set_frames(self, original_frame: np.ndarray, enhanced_frame: np.ndarray | None = None) -> None:
+        self._left_pixmap = self._to_pixmap(original_frame)
+        self.frame_size = (original_frame.shape[1], original_frame.shape[0])
+        if enhanced_frame is None:
+            self._right_pixmap = self._to_pixmap(original_frame)
+        else:
+            self._right_pixmap = self._to_pixmap(enhanced_frame)
         self.update()
+
+    def set_frame(self, frame: np.ndarray) -> None:
+        # Backward-compatible single-frame entry point.
+        self.set_frames(frame, frame)
 
     def roi(self) -> QRect | None:
         return QRect(self._roi) if self._roi and self._roi.isValid() else None
@@ -364,18 +377,39 @@ class VideoDisplay(QLabel):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        if not self._pixmap.isNull():
-            scaled = self._pixmap.scaled(
-                self.size(),
+        if not self._left_pixmap.isNull():
+            gap = 10
+            slot_width = max(1, (self.width() - gap) // 2)
+            left_slot = QRect(0, 0, slot_width, self.height())
+            right_slot = QRect(slot_width + gap, 0, self.width() - (slot_width + gap), self.height())
+
+            left_scaled = self._left_pixmap.scaled(
+                left_slot.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
-            self._display_rect = QRect(x, y, scaled.width(), scaled.height())
-            painter.drawPixmap(self._display_rect, scaled)
+            right_scaled = self._right_pixmap.scaled(
+                right_slot.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+
+            left_x = left_slot.left() + (left_slot.width() - left_scaled.width()) // 2
+            left_y = left_slot.top() + (left_slot.height() - left_scaled.height()) // 2
+            right_x = right_slot.left() + (right_slot.width() - right_scaled.width()) // 2
+            right_y = right_slot.top() + (right_slot.height() - right_scaled.height()) // 2
+
+            self._display_rect = QRect(left_x, left_y, left_scaled.width(), left_scaled.height())
+            self._right_display_rect = QRect(right_x, right_y, right_scaled.width(), right_scaled.height())
+            painter.drawPixmap(self._display_rect, left_scaled)
+            painter.drawPixmap(self._right_display_rect, right_scaled)
+
+            painter.setPen(QColor("#64748b"))
+            painter.drawText(left_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Original")
+            painter.drawText(right_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Enhanced")
         else:
             self._display_rect = QRect()
+            self._right_display_rect = QRect()
             painter.setPen(QColor("#94a3b8"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No frame loaded")
 
@@ -592,12 +626,12 @@ class VideoPanel(QFrame):
         if apply_enhancement is None:
             apply_enhancement = self.enhance_display
         can_enhance = self.enhanced_frames is not None and 0 <= self.current_frame_index < len(self.enhanced_frames)
-        display_frame = frame
+        enhanced_frame = frame
         if apply_enhancement and can_enhance:
             enhanced = cv2.imdecode(self.enhanced_frames[self.current_frame_index], cv2.IMREAD_GRAYSCALE)
             if enhanced is not None:
-                display_frame = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        self.display.set_frame(display_frame)
+                enhanced_frame = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        self.display.set_frames(frame, enhanced_frame)
 
     def read_next(self, playback: bool = False) -> bool:
         if self.current_frame_index >= self.info.frame_count - 1:
