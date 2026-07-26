@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QStyle,
     QTabWidget,
+    QToolButton,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -90,6 +91,23 @@ class EnhancementStages:
                 self.final_smoothing,
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class EnhancementParameters:
+    gain_use_auto_target: bool = True
+    gain_target_median: int = 128
+    gain_min: float = 0.70
+    gain_max: float = 1.45
+    scanline_bias_clip: float = 6.0
+    scanline_sigma_y: float = 2.0
+    bilateral_diameter: int = 7
+    bilateral_sigma_color: float = 18.0
+    bilateral_sigma_space: float = 4.0
+    temporal_motion_sigma: float = 12.0
+    clahe_clip_limit: float = 1.0
+    clahe_tile_size: int = 6
+    smoothing_sigma_x: float = 0.55
 
 
 @dataclass(slots=True)
@@ -250,27 +268,27 @@ def estimate_video_median(path: Path, crop_rect: QRect, frame_count: int) -> flo
         capture.release()
 
 
-def stabilize_frame_gain(gray: np.ndarray, target_median: float) -> np.ndarray:
+def stabilize_frame_gain(gray: np.ndarray, target_median: float, min_gain: float, max_gain: float) -> np.ndarray:
     current_median = max(1.0, float(np.median(gray)))
-    gain = float(np.clip(target_median / current_median, 0.70, 1.45))
+    gain = float(np.clip(target_median / current_median, min_gain, max_gain))
     return np.clip(gray.astype(np.float32) * gain, 0, 255)
 
 
-def correct_scanlines(gray: np.ndarray) -> np.ndarray:
+def correct_scanlines(gray: np.ndarray, bias_clip: float, sigma_y: float) -> np.ndarray:
     corrected = gray.astype(np.float32)
-    vertical_smooth = cv2.GaussianBlur(corrected, (1, 9), sigmaX=0, sigmaY=2.0)
+    vertical_smooth = cv2.GaussianBlur(corrected, (1, 9), sigmaX=0, sigmaY=sigma_y)
     row_bias = np.median(corrected - vertical_smooth, axis=1)
     row_bias -= np.median(row_bias)
-    corrected -= np.clip(row_bias, -6.0, 6.0)[:, np.newaxis]
+    corrected -= np.clip(row_bias, -bias_clip, bias_clip)[:, np.newaxis]
     return np.clip(corrected, 0, 255).astype(np.uint8)
 
 
-def spatial_bilateral_filter(gray: np.ndarray) -> np.ndarray:
+def spatial_bilateral_filter(gray: np.ndarray, diameter: int, sigma_color: float, sigma_space: float) -> np.ndarray:
     return cv2.bilateralFilter(
         gray,
-        d=7,
-        sigmaColor=18,
-        sigmaSpace=4,
+        d=diameter,
+        sigmaColor=sigma_color,
+        sigmaSpace=sigma_space,
     )
 
 
@@ -278,25 +296,26 @@ def motion_aware_temporal_filter(
     previous: np.ndarray,
     current: np.ndarray,
     following: np.ndarray,
+    motion_sigma: float,
 ) -> np.ndarray:
     current_float = current.astype(np.float32)
     previous_float = previous.astype(np.float32)
     following_float = following.astype(np.float32)
-    previous_weight = np.exp(-np.abs(previous_float - current_float) / 12.0)
-    following_weight = np.exp(-np.abs(following_float - current_float) / 12.0)
+    previous_weight = np.exp(-np.abs(previous_float - current_float) / motion_sigma)
+    following_weight = np.exp(-np.abs(following_float - current_float) / motion_sigma)
     neighbor_sum = previous_float * previous_weight + following_float * following_weight
     neighbor_weight = previous_weight + following_weight
     temporal = (current_float + neighbor_sum) / (1.0 + neighbor_weight)
     return np.clip(temporal, 0, 255).astype(np.uint8)
 
 
-def enhance_local_contrast(gray: np.ndarray) -> np.ndarray:
-    clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(6, 6))
+def enhance_local_contrast(gray: np.ndarray, clip_limit: float, tile_size: int) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
     return clahe.apply(gray)
 
 
-def smooth_final_frame(gray: np.ndarray) -> np.ndarray:
-    return cv2.GaussianBlur(gray, (0, 0), sigmaX=0.55)
+def smooth_final_frame(gray: np.ndarray, sigma_x: float) -> np.ndarray:
+    return cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma_x)
 
 
 def reference_mean(gray: np.ndarray, roi: QRect) -> float:
@@ -491,7 +510,7 @@ class VideoPanel(QFrame):
         self.enhance_display = False
         self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
         self.enhanced_frames: list[np.ndarray] | None = None
-        self.enhancement_signature: tuple[str, int, EnhancementStages] | None = None
+        self.enhancement_signature: tuple[str, int, EnhancementStages, EnhancementParameters] | None = None
 
         self.display = VideoDisplay(label, color)
         self.display.roiChanged.connect(self.roiChanged.emit)
@@ -524,10 +543,11 @@ class VideoPanel(QFrame):
         noise_sigma: int = 10,
         batch_size: int = 4,
         stages: EnhancementStages = EnhancementStages(),
+        parameters: EnhancementParameters = EnhancementParameters(),
         progress_callback: Callable[[int, int], bool] | None = None,
     ) -> bool:
         backend_id = denoiser.backend_id if denoiser is not None else "classical"
-        signature = (backend_id, noise_sigma if stages.denoise else 0, stages)
+        signature = (backend_id, noise_sigma if stages.denoise else 0, stages, parameters)
         if (
             self.enhanced_frames is not None
             and len(self.enhanced_frames) == self.info.frame_count
@@ -545,13 +565,13 @@ class VideoPanel(QFrame):
             def append_enhanced(previous: np.ndarray, current: np.ndarray, following: np.ndarray) -> None:
                 enhanced = current
                 if stages.temporal_filter:
-                    enhanced = motion_aware_temporal_filter(previous, enhanced, following)
+                    enhanced = motion_aware_temporal_filter(previous, enhanced, following, parameters.temporal_motion_sigma)
                 if stages.local_contrast:
                     if enhanced.dtype != np.uint8:
                         enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
-                    enhanced = enhance_local_contrast(enhanced)
+                    enhanced = enhance_local_contrast(enhanced, parameters.clahe_clip_limit, parameters.clahe_tile_size)
                 if stages.final_smoothing:
-                    enhanced = smooth_final_frame(enhanced)
+                    enhanced = smooth_final_frame(enhanced, parameters.smoothing_sigma_x)
                 if enhanced.dtype != np.uint8:
                     enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
                 encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -580,13 +600,21 @@ class VideoPanel(QFrame):
                     raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
                 processed = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
                 if stages.gain_stabilization:
-                    processed = stabilize_frame_gain(processed, self.target_median)
+                    target_median = self.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
+                    processed = stabilize_frame_gain(processed, target_median, parameters.gain_min, parameters.gain_max)
                 if stages.scanline_correction:
-                    processed = correct_scanlines(processed)
+                    processed = correct_scanlines(processed, parameters.scanline_bias_clip, parameters.scanline_sigma_y)
                 if stages.denoise:
                     processed = np.clip(processed, 0, 255).astype(np.uint8)
                     if denoiser is None:
-                        if not consume(spatial_bilateral_filter(processed)):
+                        if not consume(
+                            spatial_bilateral_filter(
+                                processed,
+                                parameters.bilateral_diameter,
+                                parameters.bilateral_sigma_color,
+                                parameters.bilateral_sigma_space,
+                            )
+                        ):
                             return False
                         continue
                     batch.append(processed)
@@ -757,6 +785,48 @@ class LoadingOverlay(QFrame):
 
     def finish(self) -> None:
         self.hide()
+
+
+class StageDrawer(QFrame):
+    enabledChanged = Signal(int)
+
+    def __init__(self, title: str, stage_index: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("stageDrawer")
+
+        self.enable_check = QCheckBox(f"{stage_index}. {title}")
+        self.expand_button = QToolButton()
+        self.expand_button.setText("Options")
+        self.expand_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.expand_button.setArrowType(Qt.ArrowType.RightArrow)
+        self.expand_button.setCheckable(True)
+        self.expand_button.setChecked(False)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        header.addWidget(self.enable_check)
+        header.addStretch()
+        header.addWidget(self.expand_button)
+
+        self.content = QWidget()
+        self.content.setVisible(False)
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(12, 4, 8, 8)
+        self.content_layout.setSpacing(6)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+        layout.addLayout(header)
+        layout.addWidget(self.content)
+
+        self.enable_check.stateChanged.connect(self.enabledChanged.emit)
+        self.expand_button.toggled.connect(self._set_expanded)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.expand_button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.content.setVisible(expanded)
 
 
 class ContrastWindow(QMainWindow):
@@ -950,12 +1020,18 @@ class ContrastWindow(QMainWindow):
         pipeline_label = QLabel("Enhancement pipeline (applied top to bottom)")
         pipeline_label.setObjectName("pipelineLabel")
         enhancement_layout.addWidget(pipeline_label)
-        self.gain_stage_check = QCheckBox("1. Gain stabilization")
-        self.scanline_stage_check = QCheckBox("2. Scanline correction")
-        self.denoise_stage_check = QCheckBox("3. Spatial denoising")
-        self.temporal_stage_check = QCheckBox("4. Motion-aware temporal filtering")
-        self.contrast_stage_check = QCheckBox("5. Local contrast (CLAHE)")
-        self.smoothing_stage_check = QCheckBox("6. Final Gaussian smoothing")
+        self.gain_stage_drawer = StageDrawer("Gain stabilization", 1)
+        self.scanline_stage_drawer = StageDrawer("Scanline correction", 2)
+        self.denoise_stage_drawer = StageDrawer("Spatial denoising", 3)
+        self.temporal_stage_drawer = StageDrawer("Motion-aware temporal filtering", 4)
+        self.contrast_stage_drawer = StageDrawer("Local contrast (CLAHE)", 5)
+        self.smoothing_stage_drawer = StageDrawer("Final Gaussian smoothing", 6)
+        self.gain_stage_check = self.gain_stage_drawer.enable_check
+        self.scanline_stage_check = self.scanline_stage_drawer.enable_check
+        self.denoise_stage_check = self.denoise_stage_drawer.enable_check
+        self.temporal_stage_check = self.temporal_stage_drawer.enable_check
+        self.contrast_stage_check = self.contrast_stage_drawer.enable_check
+        self.smoothing_stage_check = self.smoothing_stage_drawer.enable_check
         self.pipeline_stage_checks = [
             self.gain_stage_check,
             self.scanline_stage_check,
@@ -964,10 +1040,20 @@ class ContrastWindow(QMainWindow):
             self.contrast_stage_check,
             self.smoothing_stage_check,
         ]
+        self.pipeline_stage_drawers = [
+            self.gain_stage_drawer,
+            self.scanline_stage_drawer,
+            self.denoise_stage_drawer,
+            self.temporal_stage_drawer,
+            self.contrast_stage_drawer,
+            self.smoothing_stage_drawer,
+        ]
         for check in self.pipeline_stage_checks:
             check.setChecked(False)
             check.stateChanged.connect(self.on_pipeline_stages_changed)
-            enhancement_layout.addWidget(check)
+        self._build_stage_drawer_controls()
+        for drawer in self.pipeline_stage_drawers:
+            enhancement_layout.addWidget(drawer)
 
         self.reset_pipeline_button = QPushButton("Show original videos")
         self.reset_pipeline_button.clicked.connect(self.reset_enhancement_pipeline)
@@ -1040,6 +1126,146 @@ class ContrastWindow(QMainWindow):
         layout.addWidget(plot_group, 1)
         return container
 
+    def _build_stage_drawer_controls(self) -> None:
+        gain_auto_row = QHBoxLayout()
+        self.gain_auto_target_check = QCheckBox("Use per-video auto target median")
+        self.gain_auto_target_check.setChecked(True)
+        gain_auto_row.addWidget(self.gain_auto_target_check)
+        gain_auto_row.addStretch()
+        self.gain_stage_drawer.content_layout.addLayout(gain_auto_row)
+
+        gain_target_row = QHBoxLayout()
+        gain_target_row.addWidget(QLabel("Manual target median"))
+        self.gain_target_spin = QSpinBox()
+        self.gain_target_spin.setRange(1, 255)
+        self.gain_target_spin.setValue(128)
+        self.gain_target_spin.setEnabled(False)
+        gain_target_row.addWidget(self.gain_target_spin)
+        self.gain_stage_drawer.content_layout.addLayout(gain_target_row)
+
+        gain_bounds_row = QHBoxLayout()
+        gain_bounds_row.addWidget(QLabel("Gain clamp"))
+        self.gain_min_spin = QDoubleSpinBox()
+        self.gain_min_spin.setRange(0.10, 2.00)
+        self.gain_min_spin.setSingleStep(0.05)
+        self.gain_min_spin.setDecimals(2)
+        self.gain_min_spin.setValue(0.70)
+        self.gain_min_spin.setPrefix("min ")
+        self.gain_max_spin = QDoubleSpinBox()
+        self.gain_max_spin.setRange(0.10, 2.00)
+        self.gain_max_spin.setSingleStep(0.05)
+        self.gain_max_spin.setDecimals(2)
+        self.gain_max_spin.setValue(1.45)
+        self.gain_max_spin.setPrefix("max ")
+        gain_bounds_row.addWidget(self.gain_min_spin)
+        gain_bounds_row.addWidget(self.gain_max_spin)
+        self.gain_stage_drawer.content_layout.addLayout(gain_bounds_row)
+
+        scanline_clip_row = QHBoxLayout()
+        scanline_clip_row.addWidget(QLabel("Row bias clip"))
+        self.scanline_clip_spin = QDoubleSpinBox()
+        self.scanline_clip_spin.setRange(0.5, 20.0)
+        self.scanline_clip_spin.setSingleStep(0.5)
+        self.scanline_clip_spin.setDecimals(1)
+        self.scanline_clip_spin.setValue(6.0)
+        scanline_clip_row.addWidget(self.scanline_clip_spin)
+        self.scanline_stage_drawer.content_layout.addLayout(scanline_clip_row)
+
+        scanline_sigma_row = QHBoxLayout()
+        scanline_sigma_row.addWidget(QLabel("Vertical blur sigma"))
+        self.scanline_sigma_spin = QDoubleSpinBox()
+        self.scanline_sigma_spin.setRange(0.2, 8.0)
+        self.scanline_sigma_spin.setSingleStep(0.1)
+        self.scanline_sigma_spin.setDecimals(1)
+        self.scanline_sigma_spin.setValue(2.0)
+        scanline_sigma_row.addWidget(self.scanline_sigma_spin)
+        self.scanline_stage_drawer.content_layout.addLayout(scanline_sigma_row)
+
+        denoise_d_row = QHBoxLayout()
+        denoise_d_row.addWidget(QLabel("Classical bilateral diameter"))
+        self.bilateral_diameter_spin = QSpinBox()
+        self.bilateral_diameter_spin.setRange(1, 31)
+        self.bilateral_diameter_spin.setSingleStep(2)
+        self.bilateral_diameter_spin.setValue(7)
+        denoise_d_row.addWidget(self.bilateral_diameter_spin)
+        self.denoise_stage_drawer.content_layout.addLayout(denoise_d_row)
+
+        denoise_sigma_row = QHBoxLayout()
+        denoise_sigma_row.addWidget(QLabel("Classical sigma color"))
+        self.bilateral_sigma_color_spin = QDoubleSpinBox()
+        self.bilateral_sigma_color_spin.setRange(1.0, 120.0)
+        self.bilateral_sigma_color_spin.setSingleStep(1.0)
+        self.bilateral_sigma_color_spin.setDecimals(1)
+        self.bilateral_sigma_color_spin.setValue(18.0)
+        denoise_sigma_row.addWidget(self.bilateral_sigma_color_spin)
+        denoise_sigma_row.addWidget(QLabel("sigma space"))
+        self.bilateral_sigma_space_spin = QDoubleSpinBox()
+        self.bilateral_sigma_space_spin.setRange(1.0, 80.0)
+        self.bilateral_sigma_space_spin.setSingleStep(1.0)
+        self.bilateral_sigma_space_spin.setDecimals(1)
+        self.bilateral_sigma_space_spin.setValue(4.0)
+        denoise_sigma_row.addWidget(self.bilateral_sigma_space_spin)
+        self.denoise_stage_drawer.content_layout.addLayout(denoise_sigma_row)
+
+        temporal_row = QHBoxLayout()
+        temporal_row.addWidget(QLabel("Motion sensitivity sigma"))
+        self.temporal_sigma_spin = QDoubleSpinBox()
+        self.temporal_sigma_spin.setRange(1.0, 60.0)
+        self.temporal_sigma_spin.setSingleStep(0.5)
+        self.temporal_sigma_spin.setDecimals(1)
+        self.temporal_sigma_spin.setValue(12.0)
+        temporal_row.addWidget(self.temporal_sigma_spin)
+        self.temporal_stage_drawer.content_layout.addLayout(temporal_row)
+
+        clahe_clip_row = QHBoxLayout()
+        clahe_clip_row.addWidget(QLabel("CLAHE clip limit"))
+        self.clahe_clip_spin = QDoubleSpinBox()
+        self.clahe_clip_spin.setRange(0.1, 10.0)
+        self.clahe_clip_spin.setSingleStep(0.1)
+        self.clahe_clip_spin.setDecimals(1)
+        self.clahe_clip_spin.setValue(1.0)
+        clahe_clip_row.addWidget(self.clahe_clip_spin)
+        self.contrast_stage_drawer.content_layout.addLayout(clahe_clip_row)
+
+        clahe_tile_row = QHBoxLayout()
+        clahe_tile_row.addWidget(QLabel("CLAHE tile size"))
+        self.clahe_tile_spin = QSpinBox()
+        self.clahe_tile_spin.setRange(2, 24)
+        self.clahe_tile_spin.setValue(6)
+        clahe_tile_row.addWidget(self.clahe_tile_spin)
+        self.contrast_stage_drawer.content_layout.addLayout(clahe_tile_row)
+
+        smoothing_row = QHBoxLayout()
+        smoothing_row.addWidget(QLabel("Gaussian sigma"))
+        self.smoothing_sigma_spin = QDoubleSpinBox()
+        self.smoothing_sigma_spin.setRange(0.1, 4.0)
+        self.smoothing_sigma_spin.setSingleStep(0.05)
+        self.smoothing_sigma_spin.setDecimals(2)
+        self.smoothing_sigma_spin.setValue(0.55)
+        smoothing_row.addWidget(self.smoothing_sigma_spin)
+        self.smoothing_stage_drawer.content_layout.addLayout(smoothing_row)
+
+        self.gain_auto_target_check.toggled.connect(self._on_gain_auto_target_toggled)
+        for spin in [
+            self.gain_target_spin,
+            self.gain_min_spin,
+            self.gain_max_spin,
+            self.scanline_clip_spin,
+            self.scanline_sigma_spin,
+            self.bilateral_diameter_spin,
+            self.bilateral_sigma_color_spin,
+            self.bilateral_sigma_space_spin,
+            self.temporal_sigma_spin,
+            self.clahe_clip_spin,
+            self.clahe_tile_spin,
+            self.smoothing_sigma_spin,
+        ]:
+            spin.valueChanged.connect(self.on_enhancement_settings_changed)
+
+    def _on_gain_auto_target_toggled(self, checked: bool) -> None:
+        self.gain_target_spin.setEnabled(not checked)
+        self.on_enhancement_settings_changed()
+
     def _apply_style(self) -> None:
         pg.setConfigOptions(antialias=True)
         self.setStyleSheet(
@@ -1059,6 +1285,7 @@ class ContrastWindow(QMainWindow):
             QGroupBox { background: #111827; border: 1px solid #253044; border-radius: 8px; margin-top: 12px; padding: 12px; font-weight: 700; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
             QFrame#videoPanel, QFrame#plotPanel { background: #111827; border: 1px solid #253044; border-radius: 8px; }
+            QFrame#stageDrawer { background: #0f172a; border: 1px solid #273449; border-radius: 8px; }
             QLabel#panelTitle { font-size: 16px; font-weight: 700; color: #f8fafc; }
             QLabel#pipelineLabel { color: #e2e8f0; font-weight: 700; padding-top: 4px; }
             QLabel#subtleLabel, QLabel#hintLabel { color: #9fb0c6; }
@@ -1210,10 +1437,10 @@ class ContrastWindow(QMainWindow):
             if close is not None:
                 close()
             del self.deep_denoisers[key]
-        if stages.denoise:
+        if stages.any_enabled:
             self.rebuild_enhancement_pipeline()
         else:
-            self.statusBar().showMessage("Denoising settings will apply when spatial denoising is enabled.")
+            self.statusBar().showMessage("Enhancement settings updated. Enable one or more stages to preview.")
 
     def enhancement_stages(self) -> EnhancementStages:
         return EnhancementStages(
@@ -1223,6 +1450,27 @@ class ContrastWindow(QMainWindow):
             temporal_filter=self.temporal_stage_check.isChecked(),
             local_contrast=self.contrast_stage_check.isChecked(),
             final_smoothing=self.smoothing_stage_check.isChecked(),
+        )
+
+    def enhancement_parameters(self) -> EnhancementParameters:
+        gain_min = self.gain_min_spin.value()
+        gain_max = self.gain_max_spin.value()
+        if gain_min > gain_max:
+            gain_min, gain_max = gain_max, gain_min
+        return EnhancementParameters(
+            gain_use_auto_target=self.gain_auto_target_check.isChecked(),
+            gain_target_median=self.gain_target_spin.value(),
+            gain_min=gain_min,
+            gain_max=gain_max,
+            scanline_bias_clip=self.scanline_clip_spin.value(),
+            scanline_sigma_y=self.scanline_sigma_spin.value(),
+            bilateral_diameter=self.bilateral_diameter_spin.value(),
+            bilateral_sigma_color=self.bilateral_sigma_color_spin.value(),
+            bilateral_sigma_space=self.bilateral_sigma_space_spin.value(),
+            temporal_motion_sigma=self.temporal_sigma_spin.value(),
+            clahe_clip_limit=self.clahe_clip_spin.value(),
+            clahe_tile_size=self.clahe_tile_spin.value(),
+            smoothing_sigma_x=self.smoothing_sigma_spin.value(),
         )
 
     def on_pipeline_stages_changed(self) -> None:
@@ -1271,6 +1519,7 @@ class ContrastWindow(QMainWindow):
     def ensure_enhancement_ready(self) -> bool:
         mode = str(self.enhancement_mode_combo.currentData())
         stages = self.enhancement_stages()
+        parameters = self.enhancement_parameters()
         use_deep_model = stages.denoise and mode != "classical"
         noise_sigma = self.denoise_strength_spin.value()
         batch_size = self.inference_batch_spin.value()
@@ -1308,7 +1557,7 @@ class ContrastWindow(QMainWindow):
                 self.loading_overlay.finish()
 
         backend_id = denoiser.backend_id if denoiser is not None else "classical"
-        expected_signature = (backend_id, noise_sigma if stages.denoise else 0, stages)
+        expected_signature = (backend_id, noise_sigma if stages.denoise else 0, stages, parameters)
         pending_panels = [
             panel
             for panel in self.panels
@@ -1338,6 +1587,7 @@ class ContrastWindow(QMainWindow):
                     noise_sigma,
                     batch_size,
                     stages,
+                    parameters,
                     progress_callback,
                 )
                 if not prepared:
