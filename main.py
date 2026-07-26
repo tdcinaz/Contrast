@@ -5,6 +5,7 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
 import cv2
 import numpy as np
@@ -14,6 +15,7 @@ from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -36,6 +38,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+if TYPE_CHECKING:
+    from deep_denoiser import FFDNetDenoiser
 
 
 ROOT = Path(__file__).resolve().parent
@@ -216,7 +221,11 @@ def estimate_video_median(path: Path, crop_rect: QRect, frame_count: int) -> flo
         capture.release()
 
 
-def prepare_frame_for_enhancement(frame: np.ndarray, target_median: float) -> np.ndarray:
+def prepare_frame_for_enhancement(
+    frame: np.ndarray,
+    target_median: float,
+    spatial_denoise: bool = True,
+) -> np.ndarray:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     current_median = max(1.0, float(np.median(gray)))
     gain = float(np.clip(target_median / current_median, 0.70, 1.45))
@@ -227,8 +236,11 @@ def prepare_frame_for_enhancement(frame: np.ndarray, target_median: float) -> np
     row_bias -= np.median(row_bias)
     stabilized -= np.clip(row_bias, -6.0, 6.0)[:, np.newaxis]
 
+    stabilized_uint8 = np.clip(stabilized, 0, 255).astype(np.uint8)
+    if not spatial_denoise:
+        return stabilized_uint8
     return cv2.bilateralFilter(
-        np.clip(stabilized, 0, 255).astype(np.uint8),
+        stabilized_uint8,
         d=7,
         sigmaColor=18,
         sigmaSpace=4,
@@ -409,6 +421,7 @@ class VideoPanel(QFrame):
         self.enhance_display = False
         self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
         self.enhanced_frames: list[np.ndarray] | None = None
+        self.enhancement_signature: tuple[str, int] | None = None
 
         self.display = VideoDisplay(label, color)
         self.display.roiChanged.connect(self.roiChanged.emit)
@@ -437,36 +450,84 @@ class VideoPanel(QFrame):
 
     def prepare_enhanced_frames(
         self,
-        progress_callback: callable[[int, int], bool] | None = None,
+        denoiser: FFDNetDenoiser | None = None,
+        noise_sigma: int = 10,
+        progress_callback: Callable[[int, int], bool] | None = None,
     ) -> bool:
-        if self.enhanced_frames is not None and len(self.enhanced_frames) == self.info.frame_count:
+        signature = ("ffdnet", noise_sigma) if denoiser is not None else ("classical", 0)
+        if (
+            self.enhanced_frames is not None
+            and len(self.enhanced_frames) == self.info.frame_count
+            and self.enhancement_signature == signature
+        ):
             return True
 
         capture = cv2.VideoCapture(str(self.path))
         try:
             enhanced_frames: list[np.ndarray] = []
-            ok, frame = capture.read()
-            if not ok:
-                raise RuntimeError(f"Could not read video for enhancement: {self.path}")
-            current = prepare_frame_for_enhancement(crop_frame(frame, self.crop_rect), self.target_median)
-            previous = current
-            for frame_index in range(self.info.frame_count):
-                if frame_index + 1 < self.info.frame_count:
-                    ok, frame = capture.read()
-                    if not ok:
-                        raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
-                    following = prepare_frame_for_enhancement(crop_frame(frame, self.crop_rect), self.target_median)
-                else:
-                    following = current
+
+            def append_enhanced(previous: np.ndarray, current: np.ndarray, following: np.ndarray) -> None:
                 enhanced = enhance_frame_for_display(previous, current, following)
                 encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
                 if not encoded_ok:
                     raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
                 enhanced_frames.append(encoded)
-                if progress_callback is not None and not progress_callback(frame_index + 1, self.info.frame_count):
+
+            if denoiser is None:
+                ok, frame = capture.read()
+                if not ok:
+                    raise RuntimeError(f"Could not read video for enhancement: {self.path}")
+                current = prepare_frame_for_enhancement(crop_frame(frame, self.crop_rect), self.target_median)
+                previous = current
+                for frame_index in range(self.info.frame_count):
+                    if frame_index + 1 < self.info.frame_count:
+                        ok, frame = capture.read()
+                        if not ok:
+                            raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+                        following = prepare_frame_for_enhancement(crop_frame(frame, self.crop_rect), self.target_median)
+                    else:
+                        following = current
+                    append_enhanced(previous, current, following)
+                    if progress_callback is not None and not progress_callback(frame_index + 1, self.info.frame_count):
+                        return False
+                    previous, current = current, following
+            else:
+                batch: list[np.ndarray] = []
+                previous = current = None
+                completed = 0
+                for frame_index in range(self.info.frame_count):
+                    ok, frame = capture.read()
+                    if not ok:
+                        raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+                    batch.append(
+                        prepare_frame_for_enhancement(
+                            crop_frame(frame, self.crop_rect),
+                            self.target_median,
+                            spatial_denoise=False,
+                        )
+                    )
+                    if len(batch) < 4 and frame_index + 1 < self.info.frame_count:
+                        continue
+                    for denoised in denoiser.denoise_batch(batch, noise_sigma):
+                        if current is None:
+                            previous = current = denoised
+                            continue
+                        assert previous is not None
+                        append_enhanced(previous, current, denoised)
+                        completed += 1
+                        if progress_callback is not None and not progress_callback(completed, self.info.frame_count):
+                            return False
+                        previous, current = current, denoised
+                    batch.clear()
+                if current is None or previous is None:
+                    raise RuntimeError(f"Could not read video for enhancement: {self.path}")
+                append_enhanced(previous, current, current)
+                completed += 1
+                if progress_callback is not None and not progress_callback(completed, self.info.frame_count):
                     return False
-                previous, current = current, following
+
             self.enhanced_frames = enhanced_frames
+            self.enhancement_signature = signature
             return True
         finally:
             capture.release()
@@ -525,6 +586,7 @@ class VideoPanel(QFrame):
         self.current_frame_index = -1
         self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
         self.enhanced_frames = None
+        self.enhancement_signature = None
         self.path_label.setText(path.name)
         self.meta_label.setText(self._metadata_text())
         self.display.clear_roi()
@@ -533,6 +595,10 @@ class VideoPanel(QFrame):
     def set_enhancement(self, enabled: bool, frame_index: int) -> None:
         self.enhance_display = enabled
         self.seek(frame_index)
+
+    def clear_enhancement_cache(self) -> None:
+        self.enhanced_frames = None
+        self.enhancement_signature = None
 
     def close(self) -> None:
         self.capture.release()
@@ -625,6 +691,7 @@ class ContrastWindow(QMainWindow):
         self.is_playing = False
         self.current_frame_index = 0
         self.results: dict[str, AnalysisResult] = {}
+        self.deep_denoiser: FFDNetDenoiser | None = None
 
         self.pre_panel = VideoPanel("Pre-deployment", QColor("#38bdf8"), DEFAULT_VIDEOS["Pre-deployment"])
         self.post_panel = VideoPanel("Post-deployment", QColor("#f97316"), DEFAULT_VIDEOS["Post-deployment"])
@@ -748,11 +815,30 @@ class ContrastWindow(QMainWindow):
         hint.setObjectName("hintLabel")
         controls_layout.addWidget(hint)
 
+        enhancement_mode_row = QHBoxLayout()
+        enhancement_mode_row.addWidget(QLabel("Enhancement model"))
+        self.enhancement_mode_combo = QComboBox()
+        self.enhancement_mode_combo.addItem("Deep FFDNet (GPU)", "ffdnet")
+        self.enhancement_mode_combo.addItem("Classical", "classical")
+        enhancement_mode_row.addWidget(self.enhancement_mode_combo, 1)
+        controls_layout.addLayout(enhancement_mode_row)
+
+        denoise_strength_row = QHBoxLayout()
+        denoise_strength_row.addWidget(QLabel("Deep denoise strength"))
+        self.denoise_strength_spin = QSpinBox()
+        self.denoise_strength_spin.setRange(5, 25)
+        self.denoise_strength_spin.setValue(10)
+        self.denoise_strength_spin.setSuffix(" / 255")
+        denoise_strength_row.addWidget(self.denoise_strength_spin)
+        controls_layout.addLayout(denoise_strength_row)
+
         self.enhance_button = QPushButton("Enable video enhancement")
         self.enhance_button.setCheckable(True)
         self.enhance_button.setChecked(False)
         self.enhance_button.clicked.connect(self.on_enhance_clicked)
         controls_layout.addWidget(self.enhance_button)
+        self.enhancement_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
+        self.denoise_strength_spin.valueChanged.connect(self.on_enhancement_settings_changed)
 
         self.gain_correct_check = QCheckBox("Correct gain drift in analysis")
         self.gain_correct_check.setChecked(True)
@@ -831,7 +917,7 @@ class ContrastWindow(QMainWindow):
             QPushButton#primaryButton:hover { background: #0d9488; }
             QSlider::groove:horizontal { height: 6px; background: #273449; border-radius: 3px; }
             QSlider::handle:horizontal { background: #67e8f9; width: 16px; margin: -5px 0; border-radius: 8px; }
-            QSpinBox, QDoubleSpinBox { background: #111827; border: 1px solid #334155; border-radius: 6px; padding: 5px; color: #e5edf6; }
+            QSpinBox, QDoubleSpinBox, QComboBox { background: #111827; border: 1px solid #334155; border-radius: 6px; padding: 5px; color: #e5edf6; }
             QGroupBox { background: #111827; border: 1px solid #253044; border-radius: 8px; margin-top: 12px; padding: 12px; font-weight: 700; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
             QFrame#videoPanel, QFrame#plotPanel { background: #111827; border: 1px solid #253044; border-radius: 8px; }
@@ -969,6 +1055,19 @@ class ContrastWindow(QMainWindow):
             panel.set_enhancement(enabled, self.current_frame_index)
         self.statusBar().showMessage("Video enhancement enabled." if enabled else "Video enhancement disabled.")
 
+    def on_enhancement_settings_changed(self) -> None:
+        use_deep_model = self.enhancement_mode_combo.currentData() == "ffdnet"
+        self.denoise_strength_spin.setEnabled(use_deep_model)
+        for panel in self.panels:
+            panel.clear_enhancement_cache()
+        if self.enhance_button.isChecked():
+            self.enhance_button.blockSignals(True)
+            self.enhance_button.setChecked(False)
+            self.enhance_button.blockSignals(False)
+            self.enhance_button.setText("Enable video enhancement")
+            self.set_display_enhancement(False)
+        self.statusBar().showMessage("Enhancement settings changed. Enable enhancement to rebuild the video cache.")
+
     def on_enhance_clicked(self, checked: bool) -> None:
         if checked:
             if not self.ensure_enhancement_ready():
@@ -985,13 +1084,39 @@ class ContrastWindow(QMainWindow):
         self.enhance_button.setText("Enable video enhancement")
 
     def ensure_enhancement_ready(self) -> bool:
-        pending_panels = [panel for panel in self.panels if panel.enhanced_frames is None]
+        use_deep_model = self.enhancement_mode_combo.currentData() == "ffdnet"
+        noise_sigma = self.denoise_strength_spin.value()
+        denoiser = None
+        if use_deep_model:
+            try:
+                if self.deep_denoiser is None:
+                    self.loading_overlay.begin("Loading FFDNet on the NVIDIA GPU...", 1)
+                    from deep_denoiser import FFDNetDenoiser
+
+                    self.deep_denoiser = FFDNetDenoiser(ROOT / "models" / "ffdnet_gray.pth")
+                denoiser = self.deep_denoiser
+            except (ImportError, OSError, RuntimeError) as exc:
+                QMessageBox.critical(self, "Deep enhancement unavailable", str(exc))
+                return False
+            finally:
+                self.loading_overlay.finish()
+
+        expected_signature = ("ffdnet", noise_sigma) if denoiser is not None else ("classical", 0)
+        pending_panels = [
+            panel
+            for panel in self.panels
+            if panel.enhanced_frames is None or panel.enhancement_signature != expected_signature
+        ]
         if not pending_panels:
             return True
 
         self.pause()
         total_frames = sum(panel.info.frame_count for panel in pending_panels)
-        self.loading_overlay.begin("Stabilizing and denoising video. Please wait...", total_frames)
+        if denoiser is not None:
+            message = f"Running FFDNet on {denoiser.device_name}..."
+        else:
+            message = "Running classical video enhancement..."
+        self.loading_overlay.begin(message, total_frames)
 
         completed = 0
         try:
@@ -1000,7 +1125,7 @@ class ContrastWindow(QMainWindow):
                     self.loading_overlay.set_progress(completed + done)
                     return True
 
-                prepared = panel.prepare_enhanced_frames(progress_callback)
+                prepared = panel.prepare_enhanced_frames(denoiser, noise_sigma, progress_callback)
                 if not prepared:
                     return False
                 completed += panel.info.frame_count

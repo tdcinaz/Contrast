@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Downloaded model weights
+models/
+
 # Video
 *.mp4
 *.mov
