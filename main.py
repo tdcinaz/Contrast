@@ -5,6 +5,7 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Callable, Protocol
 
 import cv2
@@ -548,6 +549,7 @@ class VideoPanel(QFrame):
         self.stage_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.encoded_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.active_sequence_key: tuple[tuple[str, tuple[object, ...]], ...] | None = None
+        self.stage_duration_per_frame: dict[tuple[str, tuple[object, ...]], float] = {}
 
         self.display = VideoDisplay(label, color)
         self.display.set_comparison_enabled(self.comparison_display)
@@ -638,28 +640,108 @@ class VideoPanel(QFrame):
             for stage_key in stages.enabled_stage_order
         )
 
+    def _source_stage_token(self) -> tuple[str, tuple[object, ...]]:
+        return ("source_decode", tuple())
+
+    def _encode_stage_token(self) -> tuple[str, tuple[object, ...]]:
+        return ("encode_enhanced", tuple())
+
+    def _default_stage_seconds_per_frame(self, stage_token: tuple[str, tuple[object, ...]]) -> float:
+        stage_key = stage_token[0]
+        if stage_key == "source_decode":
+            return 0.0025
+        if stage_key == "gain_stabilization":
+            return 0.0012
+        if stage_key == "scanline_correction":
+            return 0.0025
+        if stage_key == "denoise":
+            backend_id = str(stage_token[1][0]) if stage_token[1] else "classical"
+            return 0.0065 if backend_id != "classical" else 0.0035
+        if stage_key == "temporal_filter":
+            return 0.0022
+        if stage_key == "local_contrast":
+            return 0.0028
+        if stage_key == "final_smoothing":
+            return 0.0010
+        if stage_key == "encode_enhanced":
+            return 0.0018
+        return 0.0020
+
+    def _conservative_stage_seconds_per_frame(self, stage_token: tuple[str, tuple[object, ...]]) -> float:
+        stage_key = stage_token[0]
+        if stage_key == "source_decode":
+            return 0.0035
+        if stage_key == "gain_stabilization":
+            return 0.0018
+        if stage_key == "scanline_correction":
+            return 0.0035
+        if stage_key == "denoise":
+            backend_id = str(stage_token[1][0]) if stage_token[1] else "classical"
+            return 0.0090 if backend_id != "classical" else 0.0050
+        if stage_key == "temporal_filter":
+            return 0.0030
+        if stage_key == "local_contrast":
+            return 0.0038
+        if stage_key == "final_smoothing":
+            return 0.0015
+        if stage_key == "encode_enhanced":
+            return 0.0025
+        return 0.0030
+
+    def _estimated_stage_duration(self, stage_token: tuple[str, tuple[object, ...]], frame_count: int) -> float:
+        seconds_per_frame = self.stage_duration_per_frame.get(stage_token)
+        if seconds_per_frame is None:
+            seconds_per_frame = max(
+                self._default_stage_seconds_per_frame(stage_token),
+                self._conservative_stage_seconds_per_frame(stage_token),
+            )
+        return seconds_per_frame * max(1, frame_count)
+
+    def _record_stage_duration(self, stage_token: tuple[str, tuple[object, ...]], duration_seconds: float, frame_count: int) -> None:
+        measured = duration_seconds / max(1, frame_count)
+        previous = self.stage_duration_per_frame.get(stage_token)
+        if previous is None:
+            self.stage_duration_per_frame[stage_token] = measured
+            return
+        self.stage_duration_per_frame[stage_token] = previous * 0.4 + measured * 0.6
+
     def estimate_prepare_work(
         self,
         backend_id: str,
         noise_sigma: int,
         stages: EnhancementStages,
         parameters: EnhancementParameters,
-    ) -> int:
+    ) -> float:
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
         frame_count = self.info.frame_count
-        work_units = 0
+        work_units = 0.0
         if self.source_gray_frames is None:
-            work_units += frame_count
+            work_units += self._estimated_stage_duration(self._source_stage_token(), frame_count)
         prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
         for token in sequence_key:
             prefix = prefix + (token,)
             if prefix not in self.stage_frame_cache:
-                work_units += frame_count
+                work_units += self._estimated_stage_duration(token, frame_count)
         if sequence_key not in self.encoded_frame_cache:
-            work_units += frame_count
+            work_units += self._estimated_stage_duration(self._encode_stage_token(), frame_count)
         return work_units
 
-    def _load_source_gray_frames(self, on_frame_done: Callable[[], bool] | None = None) -> list[np.ndarray] | None:
+    def _stage_display_name(self, stage_key: str) -> str:
+        names = {
+            "gain_stabilization": "Gain stabilization",
+            "scanline_correction": "Scanline correction",
+            "denoise": "Spatial denoising",
+            "temporal_filter": "Motion-aware temporal filtering",
+            "local_contrast": "Local contrast (CLAHE)",
+            "final_smoothing": "Final Gaussian smoothing",
+        }
+        return names.get(stage_key, stage_key.replace("_", " ").title())
+
+    def _load_source_gray_frames(
+        self,
+        on_frame_done: Callable[[], bool] | None = None,
+        stage_progress_callback: Callable[[str, int, int], bool] | None = None,
+    ) -> list[np.ndarray] | None:
         if self.source_gray_frames is not None:
             self.stage_frame_cache.setdefault(tuple(), self.source_gray_frames)
             return self.source_gray_frames
@@ -669,11 +751,15 @@ class VideoPanel(QFrame):
             raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
         try:
             loaded: list[np.ndarray] = []
-            for _ in range(self.info.frame_count):
+            stage_name = "Decode source frames"
+            stage_total = self.info.frame_count
+            for index in range(self.info.frame_count):
                 ok, frame = capture.read()
                 if not ok:
                     raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
                 loaded.append(cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY))
+                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
+                    return None
                 if on_frame_done is not None and not on_frame_done():
                     return None
             self.source_gray_frames = loaded
@@ -691,20 +777,28 @@ class VideoPanel(QFrame):
         batch_size: int,
         parameters: EnhancementParameters,
         on_frame_done: Callable[[], bool] | None = None,
+        stage_progress_callback: Callable[[str, int, int], bool] | None = None,
     ) -> list[np.ndarray] | None:
+        stage_name = self._stage_display_name(stage_key)
+        stage_total = len(source_frames)
+
         if stage_key == "gain_stabilization":
             target_median = self.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
             output: list[np.ndarray] = []
-            for frame in source_frames:
+            for index, frame in enumerate(source_frames):
                 output.append(np.clip(stabilize_frame_gain(frame, target_median, parameters.gain_min, parameters.gain_max), 0, 255))
+                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
+                    return None
                 if on_frame_done is not None and not on_frame_done():
                     return None
             return output
 
         if stage_key == "scanline_correction":
             output = []
-            for frame in source_frames:
+            for index, frame in enumerate(source_frames):
                 output.append(correct_scanlines(frame, parameters.scanline_bias_clip, parameters.scanline_sigma_y))
+                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
+                    return None
                 if on_frame_done is not None and not on_frame_done():
                     return None
             return output
@@ -713,7 +807,7 @@ class VideoPanel(QFrame):
             denoise_input = [np.clip(frame, 0, 255).astype(np.uint8) for frame in source_frames]
             if denoiser is None:
                 output = []
-                for frame in denoise_input:
+                for index, frame in enumerate(denoise_input):
                     output.append(
                         spatial_bilateral_filter(
                             frame,
@@ -722,19 +816,24 @@ class VideoPanel(QFrame):
                             parameters.bilateral_sigma_space,
                         )
                     )
+                    if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
+                        return None
                     if on_frame_done is not None and not on_frame_done():
                         return None
                 return output
 
             output = []
+            processed = 0
             for batch_start in range(0, len(denoise_input), batch_size):
                 batch = denoise_input[batch_start : batch_start + batch_size]
                 denoised_batch = denoiser.denoise_batch(batch, noise_sigma)
                 output.extend(denoised_batch)
-                if on_frame_done is not None:
-                    for _ in denoised_batch:
-                        if not on_frame_done():
-                            return None
+                for _ in denoised_batch:
+                    processed += 1
+                    if stage_progress_callback is not None and not stage_progress_callback(stage_name, processed, stage_total):
+                        return None
+                    if on_frame_done is not None and not on_frame_done():
+                        return None
             return output
 
         if stage_key == "temporal_filter":
@@ -744,13 +843,15 @@ class VideoPanel(QFrame):
                 previous = source_frames[index - 1] if index > 0 else current
                 following = source_frames[index + 1] if index + 1 < frame_count else current
                 output.append(motion_aware_temporal_filter(previous, current, following, parameters.temporal_motion_sigma))
+                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
+                    return None
                 if on_frame_done is not None and not on_frame_done():
                     return None
             return output
 
         if stage_key == "local_contrast":
             output = []
-            for frame in source_frames:
+            for index, frame in enumerate(source_frames):
                 output.append(
                     enhance_local_contrast(
                         np.clip(frame, 0, 255).astype(np.uint8),
@@ -758,14 +859,18 @@ class VideoPanel(QFrame):
                         parameters.clahe_tile_size,
                     )
                 )
+                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
+                    return None
                 if on_frame_done is not None and not on_frame_done():
                     return None
             return output
 
         if stage_key == "final_smoothing":
             output = []
-            for frame in source_frames:
+            for index, frame in enumerate(source_frames):
                 output.append(smooth_final_frame(np.clip(frame, 0, 255).astype(np.uint8), parameters.smoothing_sigma_x))
+                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
+                    return None
                 if on_frame_done is not None and not on_frame_done():
                     return None
             return output
@@ -779,7 +884,8 @@ class VideoPanel(QFrame):
         batch_size: int = 4,
         stages: EnhancementStages = EnhancementStages(),
         parameters: EnhancementParameters = EnhancementParameters(),
-        progress_callback: Callable[[int, int], bool] | None = None,
+        progress_callback: Callable[[float, float], bool] | None = None,
+        stage_progress_callback: Callable[[str, int, int], bool] | None = None,
     ) -> bool:
         backend_id = denoiser.backend_id if denoiser is not None else "classical"
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
@@ -788,24 +894,70 @@ class VideoPanel(QFrame):
             self.active_sequence_key = sequence_key
             return True
 
-        total_work = self.estimate_prepare_work(backend_id, noise_sigma, stages, parameters)
-        completed_work = 0
+        frame_count = self.info.frame_count
+        pending_tokens: list[tuple[str, tuple[object, ...]]] = []
+        if self.source_gray_frames is None:
+            pending_tokens.append(self._source_stage_token())
+        prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        for token in sequence_key:
+            prefix = prefix + (token,)
+            if prefix not in self.stage_frame_cache:
+                pending_tokens.append(token)
+        if sequence_key not in self.encoded_frame_cache:
+            pending_tokens.append(self._encode_stage_token())
 
-        def on_frame_done() -> bool:
-            nonlocal completed_work
-            completed_work += 1
+        estimated_remaining = sum(self._estimated_stage_duration(token, frame_count) for token in pending_tokens)
+        completed_seconds = 0.0
+        current_stage_estimate = 0.0
+        current_stage_started_at = 0.0
+
+        def report_overall_progress() -> bool:
             if progress_callback is None:
                 return True
-            return progress_callback(completed_work, max(1, total_work))
+            elapsed = 0.0
+            if current_stage_started_at > 0.0:
+                elapsed = perf_counter() - current_stage_started_at
+            displayed_current = min(elapsed, current_stage_estimate) if current_stage_estimate > 0.0 else elapsed
+            done_value = completed_seconds + displayed_current
+            total_value = max(done_value, completed_seconds + max(current_stage_estimate, elapsed) + estimated_remaining)
+            return progress_callback(done_value, max(total_value, 0.001))
 
-        source_frames = self._load_source_gray_frames(on_frame_done if self.source_gray_frames is None else None)
+        def begin_stage(stage_token: tuple[str, tuple[object, ...]]) -> None:
+            nonlocal current_stage_estimate, current_stage_started_at, estimated_remaining
+            current_stage_estimate = self._estimated_stage_duration(stage_token, frame_count)
+            current_stage_started_at = perf_counter()
+            estimated_remaining -= current_stage_estimate
+
+        def finish_stage(stage_token: tuple[str, tuple[object, ...]]) -> None:
+            nonlocal completed_seconds, current_stage_estimate, current_stage_started_at
+            actual_duration = perf_counter() - current_stage_started_at if current_stage_started_at > 0.0 else 0.0
+            self._record_stage_duration(stage_token, actual_duration, frame_count)
+            completed_seconds += actual_duration
+            current_stage_estimate = 0.0
+            current_stage_started_at = 0.0
+
+        def on_frame_done() -> bool:
+            return report_overall_progress()
+
+        if self.source_gray_frames is None:
+            source_token = self._source_stage_token()
+            begin_stage(source_token)
+        source_frames = self._load_source_gray_frames(
+            on_frame_done if self.source_gray_frames is None else None,
+            stage_progress_callback if self.source_gray_frames is None else None,
+        )
         if source_frames is None:
             return False
+        if self.source_gray_frames is not None and current_stage_started_at > 0.0:
+            finish_stage(self._source_stage_token())
+            if not report_overall_progress():
+                return False
 
         prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
         for token in sequence_key:
             next_prefix = prefix + (token,)
             if next_prefix not in self.stage_frame_cache:
+                begin_stage(token)
                 stage_output = self._apply_stage(
                     token[0],
                     self.stage_frame_cache[prefix],
@@ -814,15 +966,22 @@ class VideoPanel(QFrame):
                     batch_size,
                     parameters,
                     on_frame_done,
+                    stage_progress_callback,
                 )
                 if stage_output is None:
                     return False
                 self.stage_frame_cache[next_prefix] = stage_output
+                finish_stage(token)
+                if not report_overall_progress():
+                    return False
             prefix = next_prefix
 
         if sequence_key not in self.encoded_frame_cache:
+            encode_token = self._encode_stage_token()
+            begin_stage(encode_token)
             encoded_frames: list[np.ndarray] = []
-            for frame in self.stage_frame_cache[sequence_key]:
+            stage_total = len(self.stage_frame_cache[sequence_key])
+            for index, frame in enumerate(self.stage_frame_cache[sequence_key]):
                 enhanced = frame
                 if enhanced.dtype != np.uint8:
                     enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
@@ -830,9 +989,14 @@ class VideoPanel(QFrame):
                 if not encoded_ok:
                     raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
                 encoded_frames.append(encoded)
+                if stage_progress_callback is not None and not stage_progress_callback("Encode enhanced frames", index + 1, stage_total):
+                    return False
                 if not on_frame_done():
                     return False
             self.encoded_frame_cache[sequence_key] = encoded_frames
+            finish_stage(encode_token)
+            if not report_overall_progress():
+                return False
 
         self.enhanced_frames = self.encoded_frame_cache[sequence_key]
         self.active_sequence_key = sequence_key
@@ -913,6 +1077,7 @@ class VideoPanel(QFrame):
         self.stage_frame_cache.clear()
         self.encoded_frame_cache.clear()
         self.active_sequence_key = None
+        self.stage_duration_per_frame.clear()
 
     def close(self) -> None:
         self.capture.release()
@@ -957,13 +1122,25 @@ class LoadingOverlay(QFrame):
 
         self.message_label = QLabel("Preparing enhanced video...")
         self.message_label.setObjectName("loadingOverlayLabel")
+        self.total_label = QLabel("Overall progress")
+        self.total_label.setObjectName("subtleLabel")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
 
+        self.stage_label = QLabel("Current stage")
+        self.stage_label.setObjectName("subtleLabel")
+        self.stage_progress_bar = QProgressBar()
+        self.stage_progress_bar.setRange(0, 1)
+        self.stage_progress_bar.setValue(0)
+        self.stage_progress_bar.setTextVisible(True)
+
         panel_layout.addWidget(self.message_label)
+        panel_layout.addWidget(self.total_label)
         panel_layout.addWidget(self.progress_bar)
+        panel_layout.addWidget(self.stage_label)
+        panel_layout.addWidget(self.stage_progress_bar)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -973,18 +1150,35 @@ class LoadingOverlay(QFrame):
 
         self.hide()
 
-    def begin(self, message: str, maximum: int) -> None:
+    def _overall_units(self, value: float) -> int:
+        return max(0, round(max(0.0, value) * 1000.0))
+
+    def begin(self, message: str, maximum: float, show_stage_progress: bool = False) -> None:
         self.message_label.setText(message)
-        self.progress_bar.setRange(0, max(1, maximum))
+        self.progress_bar.setRange(0, max(1, self._overall_units(maximum)))
         self.progress_bar.setValue(0)
+        self.stage_label.setVisible(show_stage_progress)
+        self.stage_progress_bar.setVisible(show_stage_progress)
+        if show_stage_progress:
+            self.stage_label.setText("Current stage")
+            self.stage_progress_bar.setRange(0, 1)
+            self.stage_progress_bar.setValue(0)
         if self.parentWidget() is not None:
             self.setGeometry(self.parentWidget().rect())
         self.raise_()
         self.show()
         QApplication.processEvents()
 
-    def set_progress(self, value: int) -> None:
-        self.progress_bar.setValue(value)
+    def set_progress(self, value: float, maximum: float | None = None) -> None:
+        if maximum is not None:
+            self.progress_bar.setRange(0, max(1, self._overall_units(maximum)))
+        self.progress_bar.setValue(min(self._overall_units(value), self.progress_bar.maximum()))
+        QApplication.processEvents()
+
+    def set_stage_progress(self, stage_message: str, value: int, maximum: int) -> None:
+        self.stage_label.setText(stage_message)
+        self.stage_progress_bar.setRange(0, max(1, maximum))
+        self.stage_progress_bar.setValue(max(0, min(value, max(1, maximum))))
         QApplication.processEvents()
 
     def finish(self) -> None:
@@ -1865,13 +2059,19 @@ class ContrastWindow(QMainWindow):
             message = f"Running {model_label} on {denoiser.device_name}..."
         else:
             message = "Running classical video enhancement..."
-        self.loading_overlay.begin(message, total_work)
+        self.loading_overlay.begin(message, total_work, show_stage_progress=True)
 
-        completed = 0
+        completed = 0.0
         try:
             for panel, planned_work in zip(self.panels, panel_work):
-                def progress_callback(done: int, _total: int) -> bool:
-                    self.loading_overlay.set_progress(completed + done)
+                def progress_callback(done: float, panel_total: float) -> bool:
+                    remaining_other_panels = total_work - completed - planned_work
+                    overall_total = completed + panel_total + remaining_other_panels
+                    self.loading_overlay.set_progress(completed + done, overall_total)
+                    return True
+
+                def stage_progress_callback(stage_message: str, done: int, total: int) -> bool:
+                    self.loading_overlay.set_stage_progress(f"{panel.label}: {stage_message}", done, total)
                     return True
 
                 prepared = panel.prepare_enhanced_frames(
@@ -1881,11 +2081,12 @@ class ContrastWindow(QMainWindow):
                     stages,
                     parameters,
                     progress_callback,
+                    stage_progress_callback,
                 )
                 if not prepared:
                     return False
                 completed += planned_work
-                self.loading_overlay.set_progress(completed)
+                self.loading_overlay.set_progress(completed, total_work)
             return True
         except RuntimeError as exc:
             QMessageBox.critical(self, "Enhancement failed", str(exc))
