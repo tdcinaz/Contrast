@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QStyle,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -66,6 +67,29 @@ class VideoInfo:
     @property
     def duration(self) -> float:
         return self.frame_count / self.fps if self.fps else 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class EnhancementStages:
+    gain_stabilization: bool = False
+    scanline_correction: bool = False
+    denoise: bool = False
+    temporal_filter: bool = False
+    local_contrast: bool = False
+    final_smoothing: bool = False
+
+    @property
+    def any_enabled(self) -> bool:
+        return any(
+            (
+                self.gain_stabilization,
+                self.scanline_correction,
+                self.denoise,
+                self.temporal_filter,
+                self.local_contrast,
+                self.final_smoothing,
+            )
+        )
 
 
 @dataclass(slots=True)
@@ -226,33 +250,35 @@ def estimate_video_median(path: Path, crop_rect: QRect, frame_count: int) -> flo
         capture.release()
 
 
-def prepare_frame_for_enhancement(
-    frame: np.ndarray,
-    target_median: float,
-    spatial_denoise: bool = True,
-) -> np.ndarray:
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+def stabilize_frame_gain(gray: np.ndarray, target_median: float) -> np.ndarray:
     current_median = max(1.0, float(np.median(gray)))
     gain = float(np.clip(target_median / current_median, 0.70, 1.45))
-    stabilized = np.clip(gray.astype(np.float32) * gain, 0, 255)
+    return np.clip(gray.astype(np.float32) * gain, 0, 255)
 
-    vertical_smooth = cv2.GaussianBlur(stabilized, (1, 9), sigmaX=0, sigmaY=2.0)
-    row_bias = np.median(stabilized - vertical_smooth, axis=1)
+
+def correct_scanlines(gray: np.ndarray) -> np.ndarray:
+    corrected = gray.astype(np.float32)
+    vertical_smooth = cv2.GaussianBlur(corrected, (1, 9), sigmaX=0, sigmaY=2.0)
+    row_bias = np.median(corrected - vertical_smooth, axis=1)
     row_bias -= np.median(row_bias)
-    stabilized -= np.clip(row_bias, -6.0, 6.0)[:, np.newaxis]
+    corrected -= np.clip(row_bias, -6.0, 6.0)[:, np.newaxis]
+    return np.clip(corrected, 0, 255).astype(np.uint8)
 
-    stabilized_uint8 = np.clip(stabilized, 0, 255).astype(np.uint8)
-    if not spatial_denoise:
-        return stabilized_uint8
+
+def spatial_bilateral_filter(gray: np.ndarray) -> np.ndarray:
     return cv2.bilateralFilter(
-        stabilized_uint8,
+        gray,
         d=7,
         sigmaColor=18,
         sigmaSpace=4,
     )
 
 
-def enhance_frame_for_display(previous: np.ndarray, current: np.ndarray, following: np.ndarray) -> np.ndarray:
+def motion_aware_temporal_filter(
+    previous: np.ndarray,
+    current: np.ndarray,
+    following: np.ndarray,
+) -> np.ndarray:
     current_float = current.astype(np.float32)
     previous_float = previous.astype(np.float32)
     following_float = following.astype(np.float32)
@@ -261,11 +287,16 @@ def enhance_frame_for_display(previous: np.ndarray, current: np.ndarray, followi
     neighbor_sum = previous_float * previous_weight + following_float * following_weight
     neighbor_weight = previous_weight + following_weight
     temporal = (current_float + neighbor_sum) / (1.0 + neighbor_weight)
-    temporal = np.clip(temporal, 0, 255).astype(np.uint8)
+    return np.clip(temporal, 0, 255).astype(np.uint8)
 
+
+def enhance_local_contrast(gray: np.ndarray) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(6, 6))
-    contrast_enhanced = clahe.apply(temporal)
-    return cv2.GaussianBlur(contrast_enhanced, (0, 0), sigmaX=0.55)
+    return clahe.apply(gray)
+
+
+def smooth_final_frame(gray: np.ndarray) -> np.ndarray:
+    return cv2.GaussianBlur(gray, (0, 0), sigmaX=0.55)
 
 
 def reference_mean(gray: np.ndarray, roi: QRect) -> float:
@@ -307,7 +338,7 @@ class VideoDisplay(QLabel):
         self._display_rect = QRect()
 
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(420, 260)
+        self.setMinimumSize(420, 220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setStyleSheet("background: #0e1116; border: 1px solid #253044; border-radius: 8px;")
@@ -426,7 +457,7 @@ class VideoPanel(QFrame):
         self.enhance_display = False
         self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
         self.enhanced_frames: list[np.ndarray] | None = None
-        self.enhancement_signature: tuple[str, int] | None = None
+        self.enhancement_signature: tuple[str, int, EnhancementStages] | None = None
 
         self.display = VideoDisplay(label, color)
         self.display.roiChanged.connect(self.roiChanged.emit)
@@ -457,9 +488,12 @@ class VideoPanel(QFrame):
         self,
         denoiser: FrameDenoiser | None = None,
         noise_sigma: int = 10,
+        batch_size: int = 4,
+        stages: EnhancementStages = EnhancementStages(),
         progress_callback: Callable[[int, int], bool] | None = None,
     ) -> bool:
-        signature = (denoiser.backend_id, noise_sigma) if denoiser is not None else ("classical", 0)
+        backend_id = denoiser.backend_id if denoiser is not None else "classical"
+        signature = (backend_id, noise_sigma if stages.denoise else 0, stages)
         if (
             self.enhanced_frames is not None
             and len(self.enhanced_frames) == self.info.frame_count
@@ -470,60 +504,69 @@ class VideoPanel(QFrame):
         capture = cv2.VideoCapture(str(self.path))
         try:
             enhanced_frames: list[np.ndarray] = []
+            previous: np.ndarray | None = None
+            current: np.ndarray | None = None
+            completed = 0
 
             def append_enhanced(previous: np.ndarray, current: np.ndarray, following: np.ndarray) -> None:
-                enhanced = enhance_frame_for_display(previous, current, following)
+                enhanced = current
+                if stages.temporal_filter:
+                    enhanced = motion_aware_temporal_filter(previous, enhanced, following)
+                if stages.local_contrast:
+                    if enhanced.dtype != np.uint8:
+                        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+                    enhanced = enhance_local_contrast(enhanced)
+                if stages.final_smoothing:
+                    enhanced = smooth_final_frame(enhanced)
+                if enhanced.dtype != np.uint8:
+                    enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
                 encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
                 if not encoded_ok:
                     raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
                 enhanced_frames.append(encoded)
 
-            if denoiser is None:
+            def consume(processed: np.ndarray) -> bool:
+                nonlocal previous, current, completed
+                if stages.temporal_filter:
+                    if current is None:
+                        previous = current = processed
+                        return True
+                    assert previous is not None
+                    append_enhanced(previous, current, processed)
+                    previous, current = current, processed
+                else:
+                    append_enhanced(processed, processed, processed)
+                completed += 1
+                return progress_callback is None or progress_callback(completed, self.info.frame_count)
+
+            batch: list[np.ndarray] = []
+            for frame_index in range(self.info.frame_count):
                 ok, frame = capture.read()
                 if not ok:
-                    raise RuntimeError(f"Could not read video for enhancement: {self.path}")
-                current = prepare_frame_for_enhancement(crop_frame(frame, self.crop_rect), self.target_median)
-                previous = current
-                for frame_index in range(self.info.frame_count):
-                    if frame_index + 1 < self.info.frame_count:
-                        ok, frame = capture.read()
-                        if not ok:
-                            raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
-                        following = prepare_frame_for_enhancement(crop_frame(frame, self.crop_rect), self.target_median)
-                    else:
-                        following = current
-                    append_enhanced(previous, current, following)
-                    if progress_callback is not None and not progress_callback(frame_index + 1, self.info.frame_count):
-                        return False
-                    previous, current = current, following
-            else:
-                batch: list[np.ndarray] = []
-                previous = current = None
-                completed = 0
-                for frame_index in range(self.info.frame_count):
-                    ok, frame = capture.read()
-                    if not ok:
-                        raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
-                    batch.append(
-                        prepare_frame_for_enhancement(
-                            crop_frame(frame, self.crop_rect),
-                            self.target_median,
-                            spatial_denoise=False,
-                        )
-                    )
-                    if len(batch) < 4 and frame_index + 1 < self.info.frame_count:
+                    raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+                processed = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
+                if stages.gain_stabilization:
+                    processed = stabilize_frame_gain(processed, self.target_median)
+                if stages.scanline_correction:
+                    processed = correct_scanlines(processed)
+                if stages.denoise:
+                    processed = np.clip(processed, 0, 255).astype(np.uint8)
+                    if denoiser is None:
+                        if not consume(spatial_bilateral_filter(processed)):
+                            return False
+                        continue
+                    batch.append(processed)
+                    if len(batch) < batch_size and frame_index + 1 < self.info.frame_count:
                         continue
                     for denoised in denoiser.denoise_batch(batch, noise_sigma):
-                        if current is None:
-                            previous = current = denoised
-                            continue
-                        assert previous is not None
-                        append_enhanced(previous, current, denoised)
-                        completed += 1
-                        if progress_callback is not None and not progress_callback(completed, self.info.frame_count):
+                        if not consume(denoised):
                             return False
-                        previous, current = current, denoised
                     batch.clear()
+                    continue
+                if not consume(processed):
+                    return False
+
+            if stages.temporal_filter:
                 if current is None or previous is None:
                     raise RuntimeError(f"Could not read video for enhancement: {self.path}")
                 append_enhanced(previous, current, current)
@@ -712,6 +755,7 @@ class ContrastWindow(QMainWindow):
         self._build_actions()
         self._build_ui()
         self._apply_style()
+        self.on_enhancement_settings_changed()
         self.set_display_enhancement(False)
         self.update_time_label()
         self.statusBar().showMessage("Draw one ROI on each video, then run analysis.")
@@ -810,46 +854,100 @@ class ContrastWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
 
-        controls = QGroupBox("ROI analysis")
-        controls.setMaximumWidth(360)
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setSpacing(12)
+        controls = QTabWidget()
+        controls.setMaximumWidth(410)
+
+        enhancement_tab = QWidget()
+        enhancement_layout = QVBoxLayout(enhancement_tab)
+        enhancement_layout.setContentsMargins(12, 12, 12, 12)
+        enhancement_layout.setSpacing(10)
+
+        analysis_tab = QWidget()
+        analysis_layout = QVBoxLayout(analysis_tab)
+        analysis_layout.setContentsMargins(12, 12, 12, 12)
+        analysis_layout.setSpacing(10)
+
+        controls.addTab(enhancement_tab, "Enhancement")
+        controls.addTab(analysis_tab, "ROI analysis")
 
         hint = QLabel("Draw a box over the aneurysm sac in each video. The signal is computed as baseline brightness minus ROI brightness, so darker contrast produces a positive curve.")
         hint.setWordWrap(True)
         hint.setObjectName("hintLabel")
-        controls_layout.addWidget(hint)
+        analysis_layout.addWidget(hint)
 
         enhancement_mode_row = QHBoxLayout()
         enhancement_mode_row.addWidget(QLabel("Enhancement model"))
         self.enhancement_mode_combo = QComboBox()
         self.enhancement_mode_combo.addItem("NGC FFDNet (Docker)", "ffdnet-ngc")
+        self.enhancement_mode_combo.addItem("NGC DnCNN 15 (mild)", "dncnn-15-ngc")
+        self.enhancement_mode_combo.addItem("NGC DnCNN 25 (balanced)", "dncnn-25-ngc")
+        self.enhancement_mode_combo.addItem("NGC DnCNN 50 (strong)", "dncnn-50-ngc")
         self.enhancement_mode_combo.addItem("Native FFDNet (GPU)", "ffdnet-native")
         self.enhancement_mode_combo.addItem("Classical", "classical")
         enhancement_mode_row.addWidget(self.enhancement_mode_combo, 1)
-        controls_layout.addLayout(enhancement_mode_row)
+        enhancement_layout.addLayout(enhancement_mode_row)
 
         denoise_strength_row = QHBoxLayout()
-        denoise_strength_row.addWidget(QLabel("Deep denoise strength"))
+        self.denoise_strength_label = QLabel("FFDNet noise sigma")
+        denoise_strength_row.addWidget(self.denoise_strength_label)
         self.denoise_strength_spin = QSpinBox()
-        self.denoise_strength_spin.setRange(5, 25)
+        self.denoise_strength_spin.setRange(0, 50)
         self.denoise_strength_spin.setValue(10)
         self.denoise_strength_spin.setSuffix(" / 255")
+        self.denoise_strength_spin.setToolTip("FFDNet's assumed input noise standard deviation")
         denoise_strength_row.addWidget(self.denoise_strength_spin)
-        controls_layout.addLayout(denoise_strength_row)
+        enhancement_layout.addLayout(denoise_strength_row)
 
-        self.enhance_button = QPushButton("Enable video enhancement")
-        self.enhance_button.setCheckable(True)
-        self.enhance_button.setChecked(False)
-        self.enhance_button.clicked.connect(self.on_enhance_clicked)
-        controls_layout.addWidget(self.enhance_button)
+        inference_row = QHBoxLayout()
+        inference_row.addWidget(QLabel("Batch frames"))
+        self.inference_batch_spin = QSpinBox()
+        self.inference_batch_spin.setRange(1, 16)
+        self.inference_batch_spin.setValue(4)
+        self.inference_batch_spin.setToolTip("More frames improve GPU throughput but use more GPU and shared memory")
+        inference_row.addWidget(self.inference_batch_spin)
+        inference_row.addWidget(QLabel("Precision"))
+        self.inference_precision_combo = QComboBox()
+        self.inference_precision_combo.addItem("FP16", "fp16")
+        self.inference_precision_combo.addItem("FP32", "fp32")
+        self.inference_precision_combo.setToolTip("FP16 is faster; FP32 is useful for numerical comparisons")
+        inference_row.addWidget(self.inference_precision_combo)
+        enhancement_layout.addLayout(inference_row)
+
+        pipeline_label = QLabel("Enhancement pipeline (applied top to bottom)")
+        pipeline_label.setObjectName("pipelineLabel")
+        enhancement_layout.addWidget(pipeline_label)
+        self.gain_stage_check = QCheckBox("1. Gain stabilization")
+        self.scanline_stage_check = QCheckBox("2. Scanline correction")
+        self.denoise_stage_check = QCheckBox("3. Spatial denoising")
+        self.temporal_stage_check = QCheckBox("4. Motion-aware temporal filtering")
+        self.contrast_stage_check = QCheckBox("5. Local contrast (CLAHE)")
+        self.smoothing_stage_check = QCheckBox("6. Final Gaussian smoothing")
+        self.pipeline_stage_checks = [
+            self.gain_stage_check,
+            self.scanline_stage_check,
+            self.denoise_stage_check,
+            self.temporal_stage_check,
+            self.contrast_stage_check,
+            self.smoothing_stage_check,
+        ]
+        for check in self.pipeline_stage_checks:
+            check.setChecked(False)
+            check.stateChanged.connect(self.on_pipeline_stages_changed)
+            enhancement_layout.addWidget(check)
+
+        self.reset_pipeline_button = QPushButton("Show original videos")
+        self.reset_pipeline_button.clicked.connect(self.reset_enhancement_pipeline)
+        enhancement_layout.addWidget(self.reset_pipeline_button)
+        enhancement_layout.addStretch()
         self.enhancement_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         self.denoise_strength_spin.valueChanged.connect(self.on_enhancement_settings_changed)
+        self.inference_batch_spin.valueChanged.connect(self.on_enhancement_settings_changed)
+        self.inference_precision_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
 
         self.gain_correct_check = QCheckBox("Correct gain drift in analysis")
         self.gain_correct_check.setChecked(True)
         self.gain_correct_check.stateChanged.connect(lambda: self.on_analysis_filter_changed())
-        controls_layout.addWidget(self.gain_correct_check)
+        analysis_layout.addWidget(self.gain_correct_check)
 
         threshold_row = QHBoxLayout()
         threshold_row.addWidget(QLabel("Clearance threshold"))
@@ -860,25 +958,25 @@ class ContrastWindow(QMainWindow):
         self.threshold_spin.setDecimals(2)
         self.threshold_spin.valueChanged.connect(self.refresh_analysis_from_existing)
         threshold_row.addWidget(self.threshold_spin)
-        controls_layout.addLayout(threshold_row)
+        analysis_layout.addLayout(threshold_row)
 
         self.analyze_button = QPushButton("Analyze ROIs")
         self.analyze_button.setObjectName("primaryButton")
         self.analyze_button.clicked.connect(self.run_analysis)
-        controls_layout.addWidget(self.analyze_button)
+        analysis_layout.addWidget(self.analyze_button)
 
         self.export_button = QPushButton("Export CSV")
         self.export_button.clicked.connect(self.export_csv)
         self.export_button.setEnabled(False)
-        controls_layout.addWidget(self.export_button)
-        controls_layout.addStretch()
+        analysis_layout.addWidget(self.export_button)
+        analysis_layout.addStretch()
 
         self.pre_card = MetricCard("Pre residence")
         self.post_card = MetricCard("Post residence")
         self.delta_card = MetricCard("Difference")
-        controls_layout.addWidget(self.pre_card)
-        controls_layout.addWidget(self.post_card)
-        controls_layout.addWidget(self.delta_card)
+        analysis_layout.addWidget(self.pre_card)
+        analysis_layout.addWidget(self.post_card)
+        analysis_layout.addWidget(self.delta_card)
 
         plot_group = QFrame()
         plot_group.setObjectName("plotPanel")
@@ -928,6 +1026,7 @@ class ContrastWindow(QMainWindow):
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
             QFrame#videoPanel, QFrame#plotPanel { background: #111827; border: 1px solid #253044; border-radius: 8px; }
             QLabel#panelTitle { font-size: 16px; font-weight: 700; color: #f8fafc; }
+            QLabel#pipelineLabel { color: #e2e8f0; font-weight: 700; padding-top: 4px; }
             QLabel#subtleLabel, QLabel#hintLabel { color: #9fb0c6; }
             QLabel#timeLabel { color: #cbd5e1; padding-left: 12px; }
             QFrame#metricCard { background: #0f172a; border: 1px solid #273449; border-radius: 8px; }
@@ -969,11 +1068,10 @@ class ContrastWindow(QMainWindow):
         self.set_frame_index(0)
         self.clear_plots_and_metrics()
 
-        self.enhance_button.blockSignals(True)
-        self.enhance_button.setChecked(False)
-        self.enhance_button.setText("Enable video enhancement")
-        self.enhance_button.blockSignals(False)
-        self.set_display_enhancement(False)
+        if self.enhancement_stages().any_enabled:
+            self.rebuild_enhancement_pipeline()
+        else:
+            self.set_display_enhancement(False)
 
     def toggle_playback(self) -> None:
         if self.is_playing:
@@ -1062,67 +1160,121 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage("Video enhancement enabled." if enabled else "Video enhancement disabled.")
 
     def on_enhancement_settings_changed(self) -> None:
-        active_mode = self.enhancement_mode_combo.currentData()
-        use_deep_model = active_mode != "classical"
-        self.denoise_strength_spin.setEnabled(use_deep_model)
-        for mode, denoiser in list(self.deep_denoisers.items()):
-            if mode == active_mode:
+        active_mode = str(self.enhancement_mode_combo.currentData())
+        stages = self.enhancement_stages()
+        use_deep_model = stages.denoise and active_mode != "classical"
+        uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
+        self.denoise_strength_label.setEnabled(uses_ffdnet)
+        self.denoise_strength_spin.setEnabled(uses_ffdnet)
+        self.inference_batch_spin.setEnabled(use_deep_model)
+        self.inference_precision_combo.setEnabled(use_deep_model)
+        active_key = self._denoiser_key(active_mode) if use_deep_model else ""
+        for key, denoiser in list(self.deep_denoisers.items()):
+            if key == active_key:
                 continue
             close = getattr(denoiser, "close", None)
             if close is not None:
                 close()
-            del self.deep_denoisers[mode]
+            del self.deep_denoisers[key]
+        if stages.denoise:
+            self.rebuild_enhancement_pipeline()
+        else:
+            self.statusBar().showMessage("Denoising settings will apply when spatial denoising is enabled.")
+
+    def enhancement_stages(self) -> EnhancementStages:
+        return EnhancementStages(
+            gain_stabilization=self.gain_stage_check.isChecked(),
+            scanline_correction=self.scanline_stage_check.isChecked(),
+            denoise=self.denoise_stage_check.isChecked(),
+            temporal_filter=self.temporal_stage_check.isChecked(),
+            local_contrast=self.contrast_stage_check.isChecked(),
+            final_smoothing=self.smoothing_stage_check.isChecked(),
+        )
+
+    def on_pipeline_stages_changed(self) -> None:
+        stages = self.enhancement_stages()
+        active_mode = str(self.enhancement_mode_combo.currentData())
+        use_deep_model = stages.denoise and active_mode != "classical"
+        uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
+        self.denoise_strength_label.setEnabled(uses_ffdnet)
+        self.denoise_strength_spin.setEnabled(uses_ffdnet)
+        self.inference_batch_spin.setEnabled(use_deep_model)
+        self.inference_precision_combo.setEnabled(use_deep_model)
+        if not use_deep_model:
+            for key, denoiser in list(self.deep_denoisers.items()):
+                close = getattr(denoiser, "close", None)
+                if close is not None:
+                    close()
+                del self.deep_denoisers[key]
+        if stages.any_enabled:
+            self.rebuild_enhancement_pipeline()
+        else:
+            for panel in self.panels:
+                panel.clear_enhancement_cache()
+            self.set_display_enhancement(False)
+            self.statusBar().showMessage("Showing original videos.")
+
+    def reset_enhancement_pipeline(self) -> None:
+        for check in self.pipeline_stage_checks:
+            check.blockSignals(True)
+            check.setChecked(False)
+            check.blockSignals(False)
+        self.on_pipeline_stages_changed()
+
+    def _denoiser_key(self, mode: str) -> str:
+        precision = str(self.inference_precision_combo.currentData())
+        batch_size = self.inference_batch_spin.value()
+        return f"{mode}:{precision}:batch{batch_size}"
+
+    def rebuild_enhancement_pipeline(self) -> None:
         for panel in self.panels:
             panel.clear_enhancement_cache()
-        if self.enhance_button.isChecked():
-            self.enhance_button.blockSignals(True)
-            self.enhance_button.setChecked(False)
-            self.enhance_button.blockSignals(False)
-            self.enhance_button.setText("Enable video enhancement")
-            self.set_display_enhancement(False)
-        self.statusBar().showMessage("Enhancement settings changed. Enable enhancement to rebuild the video cache.")
-
-    def on_enhance_clicked(self, checked: bool) -> None:
-        if checked:
-            if not self.ensure_enhancement_ready():
-                self.enhance_button.blockSignals(True)
-                self.enhance_button.setChecked(False)
-                self.enhance_button.blockSignals(False)
-                self.enhance_button.setText("Enable video enhancement")
-                return
+        if self.ensure_enhancement_ready():
             self.set_display_enhancement(True)
-            self.enhance_button.setText("Disable video enhancement")
-            return
-
-        self.set_display_enhancement(False)
-        self.enhance_button.setText("Enable video enhancement")
+        else:
+            self.set_display_enhancement(False)
 
     def ensure_enhancement_ready(self) -> bool:
         mode = str(self.enhancement_mode_combo.currentData())
-        use_deep_model = mode != "classical"
+        stages = self.enhancement_stages()
+        use_deep_model = stages.denoise and mode != "classical"
         noise_sigma = self.denoise_strength_spin.value()
+        batch_size = self.inference_batch_spin.value()
+        precision = str(self.inference_precision_combo.currentData())
         denoiser = None
         if use_deep_model:
             try:
-                if mode not in self.deep_denoisers:
-                    if mode == "ffdnet-ngc":
+                denoiser_key = self._denoiser_key(mode)
+                if denoiser_key not in self.deep_denoisers:
+                    if mode.endswith("-ngc"):
                         self.loading_overlay.begin("Starting the NGC PyTorch worker...", 1)
-                        from container_denoiser import ContainerFFDNetDenoiser
+                        from container_denoiser import ContainerDenoiser
 
-                        self.deep_denoisers[mode] = ContainerFFDNetDenoiser(ROOT / "models" / "ffdnet_gray.pth")
+                        model_name = mode.removesuffix("-ngc")
+                        weights_name = "ffdnet_gray.pth" if model_name == "ffdnet" else f"{model_name.replace('-', '_')}.pth"
+                        self.deep_denoisers[denoiser_key] = ContainerDenoiser(
+                            model_name,
+                            ROOT / "models" / weights_name,
+                            batch_size,
+                            precision,
+                        )
                     else:
                         self.loading_overlay.begin("Loading FFDNet on the NVIDIA GPU...", 1)
                         from deep_denoiser import FFDNetDenoiser
 
-                        self.deep_denoisers[mode] = FFDNetDenoiser(ROOT / "models" / "ffdnet_gray.pth")
-                denoiser = self.deep_denoisers[mode]
+                        self.deep_denoisers[denoiser_key] = FFDNetDenoiser(
+                            ROOT / "models" / "ffdnet_gray.pth",
+                            precision,
+                        )
+                denoiser = self.deep_denoisers[denoiser_key]
             except (ImportError, OSError, RuntimeError) as exc:
                 QMessageBox.critical(self, "Deep enhancement unavailable", str(exc))
                 return False
             finally:
                 self.loading_overlay.finish()
 
-        expected_signature = (denoiser.backend_id, noise_sigma) if denoiser is not None else ("classical", 0)
+        backend_id = denoiser.backend_id if denoiser is not None else "classical"
+        expected_signature = (backend_id, noise_sigma if stages.denoise else 0, stages)
         pending_panels = [
             panel
             for panel in self.panels
@@ -1134,7 +1286,8 @@ class ContrastWindow(QMainWindow):
         self.pause()
         total_frames = sum(panel.info.frame_count for panel in pending_panels)
         if denoiser is not None:
-            message = f"Running FFDNet on {denoiser.device_name}..."
+            model_label = self.enhancement_mode_combo.currentText().split(" (")[0]
+            message = f"Running {model_label} on {denoiser.device_name}..."
         else:
             message = "Running classical video enhancement..."
         self.loading_overlay.begin(message, total_frames)
@@ -1146,7 +1299,13 @@ class ContrastWindow(QMainWindow):
                     self.loading_overlay.set_progress(completed + done)
                     return True
 
-                prepared = panel.prepare_enhanced_frames(denoiser, noise_sigma, progress_callback)
+                prepared = panel.prepare_enhanced_frames(
+                    denoiser,
+                    noise_sigma,
+                    batch_size,
+                    stages,
+                    progress_callback,
+                )
                 if not prepared:
                     return False
                 completed += panel.info.frame_count

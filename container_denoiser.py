@@ -17,32 +17,60 @@ import numpy as np
 NGC_IMAGE = "nvcr.io/nvidia/pytorch:26.06-py3"
 FFDNET_WEIGHTS_URL = "https://github.com/cszn/KAIR/releases/download/v1.0/ffdnet_gray.pth"
 FFDNET_WEIGHTS_SHA256 = "3c592bc022b4ec609e5e3b03776267c6297eba2714fd3c5f5dae62c12f7ac9c3"
+MODEL_WEIGHTS = {
+    "ffdnet": (FFDNET_WEIGHTS_URL, FFDNET_WEIGHTS_SHA256),
+    "dncnn-15": (
+        "https://github.com/cszn/KAIR/releases/download/v1.0/dncnn_15.pth",
+        "d1f48a581f42bd932de630a13e0b776ace33f6a24efa5572c112028f632a963f",
+    ),
+    "dncnn-25": (
+        "https://github.com/cszn/KAIR/releases/download/v1.0/dncnn_25.pth",
+        "0451a70de9b672ae037270498fbb1c17a1c1c4403785df586ff65df5b858e5b0",
+    ),
+    "dncnn-50": (
+        "https://github.com/cszn/KAIR/releases/download/v1.0/dncnn_50.pth",
+        "83c11202a88e7b238d08107060c909cb3e692f8177d3470d26d3f1a7b3475a83",
+    ),
+}
 
 
-def ensure_ffdnet_weights(destination: Path) -> None:
-    if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() == FFDNET_WEIGHTS_SHA256:
+def ensure_model_weights(model_name: str, destination: Path) -> None:
+    try:
+        url, expected_sha256 = MODEL_WEIGHTS[model_name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported NGC model: {model_name}") from exc
+    if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() == expected_sha256:
         return
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".download")
     try:
-        urllib.request.urlretrieve(FFDNET_WEIGHTS_URL, temporary)
+        urllib.request.urlretrieve(url, temporary)
         digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
-        if digest != FFDNET_WEIGHTS_SHA256:
-            raise RuntimeError(f"FFDNet checkpoint checksum mismatch: {digest}")
+        if digest != expected_sha256:
+            raise RuntimeError(f"Model checkpoint checksum mismatch: {digest}")
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-class ContainerFFDNetDenoiser:
-    backend_id = "ffdnet-ngc-26.06"
-
-    def __init__(self, weights_path: Path, image: str = NGC_IMAGE) -> None:
+class ContainerDenoiser:
+    def __init__(
+        self,
+        model_name: str,
+        weights_path: Path,
+        batch_size: int = 4,
+        precision: str = "fp16",
+        image: str = NGC_IMAGE,
+    ) -> None:
         if shutil.which("docker") is None:
             raise RuntimeError("Docker is required for NGC enhancement but was not found.")
+        if batch_size < 1 or batch_size > 16:
+            raise ValueError("NGC batch size must be between 1 and 16.")
+        if precision not in {"fp16", "fp32"}:
+            raise ValueError(f"Unsupported inference precision: {precision}")
         weights_path = weights_path.resolve()
-        ensure_ffdnet_weights(weights_path)
+        ensure_model_weights(model_name, weights_path)
 
         image_check = subprocess.run(
             ["docker", "image", "inspect", image],
@@ -77,8 +105,12 @@ class ContainerFFDNetDenoiser:
             image,
             "-u",
             "ngc_denoiser_worker.py",
+            "--model",
+            model_name,
             "--weights",
             f"/workspace/contrast/{weights_path.relative_to(project_root)}",
+            "--precision",
+            precision,
         ]
         self._process = subprocess.Popen(
             command,
@@ -93,6 +125,9 @@ class ContainerFFDNetDenoiser:
         self._input: np.memmap | None = None
         self._output: np.memmap | None = None
         self._shape: tuple[int, int] | None = None
+        self.batch_size = batch_size
+        self.backend_id = f"{model_name}-ngc-26.06-{precision}-batch{batch_size}"
+        self.model_name = model_name
 
         try:
             ready = self._read_response(timeout=90.0)
@@ -145,7 +180,7 @@ class ContainerFFDNetDenoiser:
         shared_directory = Path("/dev/shm")
         if not os.access(shared_directory, os.W_OK):
             shared_directory = Path(tempfile.gettempdir())
-        byte_count = 4 * shape[0] * shape[1]
+        byte_count = self.batch_size * shape[0] * shape[1]
         input_fd, input_name = tempfile.mkstemp(prefix="contrast-ngc-in-", dir=shared_directory)
         output_fd, output_name = tempfile.mkstemp(prefix="contrast-ngc-out-", dir=shared_directory)
         os.ftruncate(input_fd, byte_count)
@@ -154,8 +189,18 @@ class ContainerFFDNetDenoiser:
         os.close(output_fd)
         self._input_path = Path(input_name)
         self._output_path = Path(output_name)
-        self._input = np.memmap(self._input_path, mode="r+", dtype=np.uint8, shape=(4, *shape))
-        self._output = np.memmap(self._output_path, mode="r+", dtype=np.uint8, shape=(4, *shape))
+        self._input = np.memmap(
+            self._input_path,
+            mode="r+",
+            dtype=np.uint8,
+            shape=(self.batch_size, *shape),
+        )
+        self._output = np.memmap(
+            self._output_path,
+            mode="r+",
+            dtype=np.uint8,
+            shape=(self.batch_size, *shape),
+        )
         self._shape = shape
         self._request(
             {
@@ -163,6 +208,7 @@ class ContainerFFDNetDenoiser:
                 "input": str(self._input_path),
                 "output": str(self._output_path),
                 "shape": list(shape),
+                "capacity": self.batch_size,
             }
         )
 
@@ -172,11 +218,11 @@ class ContainerFFDNetDenoiser:
     def denoise_batch(self, images: list[np.ndarray], noise_sigma: float) -> list[np.ndarray]:
         if not images:
             return []
-        if len(images) > 4:
-            raise ValueError("NGC FFDNet accepts at most four frames per batch.")
+        if len(images) > self.batch_size:
+            raise ValueError(f"NGC backend accepts at most {self.batch_size} frames per batch.")
         shape = images[0].shape
         if any(image.shape != shape or image.dtype != np.uint8 for image in images):
-            raise ValueError("NGC FFDNet requires equally sized uint8 grayscale frames.")
+            raise ValueError("NGC models require equally sized uint8 grayscale frames.")
         self._ensure_buffers(shape)
         assert self._input is not None and self._output is not None
         self._input[: len(images)] = images
@@ -218,3 +264,8 @@ class ContainerFFDNetDenoiser:
             self.close()
         except Exception:
             pass
+
+
+class ContainerFFDNetDenoiser(ContainerDenoiser):
+    def __init__(self, weights_path: Path, image: str = NGC_IMAGE) -> None:
+        super().__init__("ffdnet", weights_path, image=image)

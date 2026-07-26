@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from deep_denoiser import FFDNetDenoiser
+from deep_denoiser import DnCNNDenoiser, FFDNetDenoiser
 
 
 def respond(payload: dict[str, object]) -> None:
@@ -17,10 +17,16 @@ def respond(payload: dict[str, object]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", choices=("ffdnet", "dncnn-15", "dncnn-25", "dncnn-50"), required=True)
     parser.add_argument("--weights", type=Path, required=True)
+    parser.add_argument("--precision", choices=("fp16", "fp32"), default="fp16")
     arguments = parser.parse_args()
 
-    denoiser = FFDNetDenoiser(arguments.weights)
+    if arguments.model == "ffdnet":
+        denoiser = FFDNetDenoiser(arguments.weights, arguments.precision)
+    else:
+        noise_level = int(arguments.model.rsplit("-", 1)[1])
+        denoiser = DnCNNDenoiser(arguments.weights, noise_level, arguments.precision)
     input_frames: np.memmap | None = None
     output_frames: np.memmap | None = None
     respond({"status": "ready", "device": denoiser.device_name})
@@ -31,8 +37,9 @@ def main() -> None:
             command = request.get("command")
             if command == "setup":
                 shape = tuple(int(value) for value in request["shape"])
-                input_frames = np.memmap(request["input"], mode="r", dtype=np.uint8, shape=(4, *shape))
-                output_frames = np.memmap(request["output"], mode="r+", dtype=np.uint8, shape=(4, *shape))
+                capacity = int(request["capacity"])
+                input_frames = np.memmap(request["input"], mode="r", dtype=np.uint8, shape=(capacity, *shape))
+                output_frames = np.memmap(request["output"], mode="r+", dtype=np.uint8, shape=(capacity, *shape))
                 respond({"status": "ok"})
             elif command == "denoise":
                 if input_frames is None or output_frames is None:
