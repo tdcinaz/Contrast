@@ -6,9 +6,10 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from queue import SimpleQueue
+from threading import Event, Lock
 from time import perf_counter
-from typing import Callable, Protocol
+from typing import Callable, Protocol, cast
 
 import cv2
 import numpy as np
@@ -46,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 ROOT = Path(__file__).resolve().parent
+STREAM_END = object()
 DEFAULT_VIDEOS = {
     "Pre-deployment": ROOT / "PPI150_PreDeployment_Contrast.mov",
     "Post-deployment": ROOT / "PPI150_PostDeployment_Contrast.mov",
@@ -754,145 +756,33 @@ class VideoPanel(QFrame):
         }
         return names.get(stage_key, stage_key.replace("_", " ").title())
 
-    def _load_source_gray_frames(
-        self,
-        on_frame_done: Callable[[], bool] | None = None,
-        stage_progress_callback: Callable[[str, int, int], bool] | None = None,
-    ) -> list[np.ndarray] | None:
-        if self.source_gray_frames is not None:
-            self.stage_frame_cache.setdefault(tuple(), self.source_gray_frames)
-            return self.source_gray_frames
-
-        capture = cv2.VideoCapture(str(self.path))
-        if not capture.isOpened():
-            raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
-        try:
-            loaded: list[np.ndarray] = []
-            stage_name = "Decode source frames"
-            stage_total = self.info.frame_count
-            for index in range(self.info.frame_count):
-                ok, frame = capture.read()
-                if not ok:
-                    raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
-                loaded.append(cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY))
-                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
-                    return None
-                if on_frame_done is not None and not on_frame_done():
-                    return None
-            self.source_gray_frames = loaded
-            self.stage_frame_cache[tuple()] = loaded
-            return loaded
-        finally:
-            capture.release()
-
-    def _apply_stage(
+    def _apply_frame_stage(
         self,
         stage_key: str,
-        source_frames: list[np.ndarray],
-        denoiser: FrameDenoiser | None,
-        noise_sigma: int,
-        batch_size: int,
+        frame: np.ndarray,
         parameters: EnhancementParameters,
-        on_frame_done: Callable[[], bool] | None = None,
-        stage_progress_callback: Callable[[str, int, int], bool] | None = None,
-    ) -> list[np.ndarray] | None:
-        stage_name = self._stage_display_name(stage_key)
-        stage_total = len(source_frames)
-
+    ) -> np.ndarray:
         if stage_key == "gain_stabilization":
             target_median = self.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
-            output: list[np.ndarray] = []
-            for index, frame in enumerate(source_frames):
-                output.append(np.clip(stabilize_frame_gain(frame, target_median, parameters.gain_min, parameters.gain_max), 0, 255))
-                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
-                    return None
-                if on_frame_done is not None and not on_frame_done():
-                    return None
-            return output
-
+            return np.clip(stabilize_frame_gain(frame, target_median, parameters.gain_min, parameters.gain_max), 0, 255)
         if stage_key == "scanline_correction":
-            output = []
-            for index, frame in enumerate(source_frames):
-                output.append(correct_scanlines(frame, parameters.scanline_bias_clip, parameters.scanline_sigma_y))
-                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
-                    return None
-                if on_frame_done is not None and not on_frame_done():
-                    return None
-            return output
-
+            return correct_scanlines(frame, parameters.scanline_bias_clip, parameters.scanline_sigma_y)
         if stage_key == "denoise":
-            denoise_input = [np.clip(frame, 0, 255).astype(np.uint8) for frame in source_frames]
-            if denoiser is None:
-                output = []
-                for index, frame in enumerate(denoise_input):
-                    output.append(
-                        spatial_bilateral_filter(
-                            frame,
-                            parameters.bilateral_diameter,
-                            parameters.bilateral_sigma_color,
-                            parameters.bilateral_sigma_space,
-                        )
-                    )
-                    if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
-                        return None
-                    if on_frame_done is not None and not on_frame_done():
-                        return None
-                return output
-
-            output = []
-            processed = 0
-            for batch_start in range(0, len(denoise_input), batch_size):
-                batch = denoise_input[batch_start : batch_start + batch_size]
-                denoised_batch = denoiser.denoise_batch(batch, noise_sigma)
-                output.extend(denoised_batch)
-                for _ in denoised_batch:
-                    processed += 1
-                    if stage_progress_callback is not None and not stage_progress_callback(stage_name, processed, stage_total):
-                        return None
-                    if on_frame_done is not None and not on_frame_done():
-                        return None
-            return output
-
-        if stage_key == "temporal_filter":
-            output = []
-            frame_count = len(source_frames)
-            for index, current in enumerate(source_frames):
-                previous = source_frames[index - 1] if index > 0 else current
-                following = source_frames[index + 1] if index + 1 < frame_count else current
-                output.append(motion_aware_temporal_filter(previous, current, following, parameters.temporal_motion_sigma))
-                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
-                    return None
-                if on_frame_done is not None and not on_frame_done():
-                    return None
-            return output
-
+            return spatial_bilateral_filter(
+                np.clip(frame, 0, 255).astype(np.uint8),
+                parameters.bilateral_diameter,
+                parameters.bilateral_sigma_color,
+                parameters.bilateral_sigma_space,
+            )
         if stage_key == "local_contrast":
-            output = []
-            for index, frame in enumerate(source_frames):
-                output.append(
-                    enhance_local_contrast(
-                        np.clip(frame, 0, 255).astype(np.uint8),
-                        parameters.clahe_clip_limit,
-                        parameters.clahe_tile_size,
-                    )
-                )
-                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
-                    return None
-                if on_frame_done is not None and not on_frame_done():
-                    return None
-            return output
-
+            return enhance_local_contrast(
+                np.clip(frame, 0, 255).astype(np.uint8),
+                parameters.clahe_clip_limit,
+                parameters.clahe_tile_size,
+            )
         if stage_key == "final_smoothing":
-            output = []
-            for index, frame in enumerate(source_frames):
-                output.append(smooth_final_frame(np.clip(frame, 0, 255).astype(np.uint8), parameters.smoothing_sigma_x))
-                if stage_progress_callback is not None and not stage_progress_callback(stage_name, index + 1, stage_total):
-                    return None
-                if on_frame_done is not None and not on_frame_done():
-                    return None
-            return output
-
-        return list(source_frames)
+            return smooth_final_frame(np.clip(frame, 0, 255).astype(np.uint8), parameters.smoothing_sigma_x)
+        return frame
 
     def prepare_enhanced_frames(
         self,
@@ -912,108 +802,237 @@ class VideoPanel(QFrame):
             return True
 
         frame_count = self.info.frame_count
-        pending_tokens: list[tuple[str, tuple[object, ...]]] = []
-        if self.source_gray_frames is None:
-            pending_tokens.append(self._source_stage_token())
+        source_missing = self.source_gray_frames is None
+        start_prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        missing_stages: list[
+            tuple[tuple[str, tuple[object, ...]], tuple[tuple[str, tuple[object, ...]], ...]]
+        ] = []
         prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
-        for token in sequence_key:
-            prefix = prefix + (token,)
-            if prefix not in self.stage_frame_cache:
-                pending_tokens.append(token)
-        if sequence_key not in self.encoded_frame_cache:
-            pending_tokens.append(self._encode_stage_token())
-
-        estimated_remaining = sum(self._estimated_stage_duration(token, frame_count) for token in pending_tokens)
-        completed_seconds = 0.0
-        current_stage_estimate = 0.0
-        current_stage_started_at = 0.0
-
-        def report_overall_progress() -> bool:
-            if progress_callback is None:
-                return True
-            elapsed = 0.0
-            if current_stage_started_at > 0.0:
-                elapsed = perf_counter() - current_stage_started_at
-            displayed_current = min(elapsed, current_stage_estimate) if current_stage_estimate > 0.0 else elapsed
-            done_value = completed_seconds + displayed_current
-            total_value = max(done_value, completed_seconds + max(current_stage_estimate, elapsed) + estimated_remaining)
-            return progress_callback(done_value, max(total_value, 0.001))
-
-        def begin_stage(stage_token: tuple[str, tuple[object, ...]]) -> None:
-            nonlocal current_stage_estimate, current_stage_started_at, estimated_remaining
-            current_stage_estimate = self._estimated_stage_duration(stage_token, frame_count)
-            current_stage_started_at = perf_counter()
-            estimated_remaining -= current_stage_estimate
-
-        def finish_stage(stage_token: tuple[str, tuple[object, ...]]) -> None:
-            nonlocal completed_seconds, current_stage_estimate, current_stage_started_at
-            actual_duration = perf_counter() - current_stage_started_at if current_stage_started_at > 0.0 else 0.0
-            self._record_stage_duration(stage_token, actual_duration, frame_count)
-            completed_seconds += actual_duration
-            current_stage_estimate = 0.0
-            current_stage_started_at = 0.0
-
-        def on_frame_done() -> bool:
-            return report_overall_progress()
-
-        if self.source_gray_frames is None:
-            source_token = self._source_stage_token()
-            begin_stage(source_token)
-        source_frames = self._load_source_gray_frames(
-            on_frame_done if self.source_gray_frames is None else None,
-            stage_progress_callback if self.source_gray_frames is None else None,
-        )
-        if source_frames is None:
-            return False
-        if self.source_gray_frames is not None and current_stage_started_at > 0.0:
-            finish_stage(self._source_stage_token())
-            if not report_overall_progress():
-                return False
-
-        prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        cache_gap_found = source_missing
         for token in sequence_key:
             next_prefix = prefix + (token,)
-            if next_prefix not in self.stage_frame_cache:
-                begin_stage(token)
-                stage_output = self._apply_stage(
-                    token[0],
-                    self.stage_frame_cache[prefix],
-                    denoiser,
-                    noise_sigma,
-                    batch_size,
-                    parameters,
-                    on_frame_done,
-                    stage_progress_callback,
-                )
-                if stage_output is None:
-                    return False
-                self.stage_frame_cache[next_prefix] = stage_output
-                finish_stage(token)
-                if not report_overall_progress():
-                    return False
+            if not cache_gap_found and next_prefix in self.stage_frame_cache:
+                start_prefix = next_prefix
+            else:
+                cache_gap_found = True
+                missing_stages.append((token, next_prefix))
             prefix = next_prefix
 
-        if sequence_key not in self.encoded_frame_cache:
-            encode_token = self._encode_stage_token()
-            begin_stage(encode_token)
-            encoded_frames: list[np.ndarray] = []
-            stage_total = len(self.stage_frame_cache[sequence_key])
-            for index, frame in enumerate(self.stage_frame_cache[sequence_key]):
-                enhanced = frame
-                if enhanced.dtype != np.uint8:
-                    enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
-                encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                if not encoded_ok:
-                    raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
-                encoded_frames.append(encoded)
-                if stage_progress_callback is not None and not stage_progress_callback("Encode enhanced frames", index + 1, stage_total):
-                    return False
-                if not on_frame_done():
-                    return False
-            self.encoded_frame_cache[sequence_key] = encoded_frames
-            finish_stage(encode_token)
-            if not report_overall_progress():
+        work_tokens = ([self._source_stage_token()] if source_missing else []) + [
+            token for token, _ in missing_stages
+        ] + [self._encode_stage_token()]
+        estimates = [self._estimated_stage_duration(token, frame_count) for token in work_tokens]
+        completed_frames = [0] * len(work_tokens)
+        total_estimate = max(sum(estimates), 0.001)
+        progress_lock = Lock()
+        callback_lock = Lock()
+        cancelled = Event()
+
+        def report_frame(work_index: int, stage_name: str, done: int) -> bool:
+            with progress_lock:
+                completed_frames[work_index] = done
+                overall_done = sum(
+                    estimate * min(count, frame_count) / max(1, frame_count)
+                    for estimate, count in zip(estimates, completed_frames)
+                )
+            with callback_lock:
+                stage_ok = stage_progress_callback is None or stage_progress_callback(stage_name, done, frame_count)
+                progress_ok = progress_callback is None or progress_callback(overall_done, total_estimate)
+            if not stage_ok or not progress_ok:
+                cancelled.set()
                 return False
+            return True
+
+        queues = [SimpleQueue[object]() for _ in range(len(missing_stages) + 1)]
+        source_output: list[np.ndarray] = []
+        stage_outputs: list[list[np.ndarray]] = [[] for _ in missing_stages]
+        encoded_frames: list[np.ndarray] = []
+
+        def produce_frames() -> None:
+            if not source_missing:
+                for index, frame in enumerate(self.stage_frame_cache[start_prefix]):
+                    if cancelled.is_set():
+                        break
+                    queues[0].put((index, frame))
+                queues[0].put(STREAM_END)
+                return
+
+            capture = cv2.VideoCapture(str(self.path))
+            if not capture.isOpened():
+                queues[0].put(STREAM_END)
+                raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+            active_seconds = 0.0
+            try:
+                for index in range(frame_count):
+                    if cancelled.is_set():
+                        break
+                    started_at = perf_counter()
+                    ok, frame = capture.read()
+                    if not ok:
+                        raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+                    gray = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
+                    active_seconds += perf_counter() - started_at
+                    source_output.append(gray)
+                    queues[0].put((index, gray))
+                    if not report_frame(0, "Decode source frames", index + 1):
+                        break
+            except Exception:
+                cancelled.set()
+                raise
+            finally:
+                capture.release()
+                queues[0].put(STREAM_END)
+                if not cancelled.is_set():
+                    self._record_stage_duration(self._source_stage_token(), active_seconds, frame_count)
+
+        stage_work_offset = 1 if source_missing else 0
+
+        def run_stage(stage_index: int) -> None:
+            token, _ = missing_stages[stage_index]
+            stage_key = token[0]
+            stage_name = self._stage_display_name(stage_key)
+            input_queue = queues[stage_index]
+            output_queue = queues[stage_index + 1]
+            output = stage_outputs[stage_index]
+            work_index = stage_work_offset + stage_index
+            active_seconds = 0.0
+
+            def emit(frame_index: int, frame: np.ndarray) -> bool:
+                output.append(frame)
+                output_queue.put((frame_index, frame))
+                return report_frame(work_index, stage_name, len(output))
+
+            try:
+                if stage_key == "temporal_filter":
+                    previous: np.ndarray | None = None
+                    current_item: tuple[int, np.ndarray] | None = None
+                    while True:
+                        item = input_queue.get()
+                        if item is STREAM_END:
+                            break
+                        if cancelled.is_set():
+                            continue
+                        next_item = cast(tuple[int, np.ndarray], item)
+                        if current_item is None:
+                            current_item = next_item
+                            continue
+                        current_index, current = current_item
+                        following = next_item[1]
+                        started_at = perf_counter()
+                        filtered = motion_aware_temporal_filter(
+                            previous if previous is not None else current,
+                            current,
+                            following,
+                            parameters.temporal_motion_sigma,
+                        )
+                        active_seconds += perf_counter() - started_at
+                        if not emit(current_index, filtered):
+                            continue
+                        previous = current
+                        current_item = next_item
+                    if current_item is not None and not cancelled.is_set():
+                        current_index, current = current_item
+                        started_at = perf_counter()
+                        filtered = motion_aware_temporal_filter(
+                            previous if previous is not None else current,
+                            current,
+                            current,
+                            parameters.temporal_motion_sigma,
+                        )
+                        active_seconds += perf_counter() - started_at
+                        emit(current_index, filtered)
+                elif stage_key == "denoise" and denoiser is not None:
+                    batch: list[tuple[int, np.ndarray]] = []
+
+                    def flush_batch() -> None:
+                        nonlocal active_seconds
+                        if not batch or cancelled.is_set():
+                            return
+                        denoise_input = [np.clip(frame, 0, 255).astype(np.uint8) for _, frame in batch]
+                        started_at = perf_counter()
+                        denoised_batch = denoiser.denoise_batch(denoise_input, noise_sigma)
+                        active_seconds += perf_counter() - started_at
+                        if len(denoised_batch) != len(batch):
+                            raise RuntimeError("Denoiser returned an unexpected number of frames.")
+                        for (frame_index, _), denoised in zip(batch, denoised_batch):
+                            if not emit(frame_index, denoised):
+                                break
+                        batch.clear()
+
+                    while True:
+                        item = input_queue.get()
+                        if item is STREAM_END:
+                            flush_batch()
+                            break
+                        if cancelled.is_set():
+                            continue
+                        batch.append(cast(tuple[int, np.ndarray], item))
+                        if len(batch) >= batch_size:
+                            flush_batch()
+                else:
+                    while True:
+                        item = input_queue.get()
+                        if item is STREAM_END:
+                            break
+                        if cancelled.is_set():
+                            continue
+                        frame_index, frame = cast(tuple[int, np.ndarray], item)
+                        started_at = perf_counter()
+                        transformed = self._apply_frame_stage(stage_key, frame, parameters)
+                        active_seconds += perf_counter() - started_at
+                        emit(frame_index, transformed)
+            except Exception:
+                cancelled.set()
+                raise
+            finally:
+                output_queue.put(STREAM_END)
+                if not cancelled.is_set():
+                    self._record_stage_duration(token, active_seconds, frame_count)
+
+        encode_work_index = len(work_tokens) - 1
+
+        def encode_frames() -> None:
+            active_seconds = 0.0
+            try:
+                while True:
+                    item = queues[-1].get()
+                    if item is STREAM_END:
+                        break
+                    if cancelled.is_set():
+                        continue
+                    _, frame = cast(tuple[int, np.ndarray], item)
+                    enhanced = frame if frame.dtype == np.uint8 else np.clip(frame, 0, 255).astype(np.uint8)
+                    started_at = perf_counter()
+                    encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    active_seconds += perf_counter() - started_at
+                    if not encoded_ok:
+                        raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
+                    encoded_frames.append(encoded)
+                    if not report_frame(encode_work_index, "Encode enhanced frames", len(encoded_frames)):
+                        continue
+            except Exception:
+                cancelled.set()
+                raise
+            finally:
+                if not cancelled.is_set():
+                    self._record_stage_duration(self._encode_stage_token(), active_seconds, frame_count)
+
+        worker_count = len(missing_stages) + 2
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="enhancement-stage") as executor:
+            futures = [executor.submit(produce_frames)]
+            futures.extend(executor.submit(run_stage, index) for index in range(len(missing_stages)))
+            futures.append(executor.submit(encode_frames))
+            for future in futures:
+                future.result()
+
+        if cancelled.is_set():
+            return False
+        if source_missing:
+            self.source_gray_frames = source_output
+            self.stage_frame_cache[tuple()] = source_output
+        for (_, stage_prefix), output in zip(missing_stages, stage_outputs):
+            self.stage_frame_cache[stage_prefix] = output
+        self.encoded_frame_cache[sequence_key] = encoded_frames
 
         self.enhanced_frames = self.encoded_frame_cache[sequence_key]
         self.active_sequence_key = sequence_key
