@@ -544,7 +544,10 @@ class VideoPanel(QFrame):
         self.comparison_display = True
         self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
         self.enhanced_frames: list[np.ndarray] | None = None
-        self.enhancement_signature: tuple[str, int, EnhancementStages, EnhancementParameters] | None = None
+        self.source_gray_frames: list[np.ndarray] | None = None
+        self.stage_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
+        self.encoded_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
+        self.active_sequence_key: tuple[tuple[str, tuple[object, ...]], ...] | None = None
 
         self.display = VideoDisplay(label, color)
         self.display.set_comparison_enabled(self.comparison_display)
@@ -572,6 +575,203 @@ class VideoPanel(QFrame):
         self.setObjectName("videoPanel")
         self.seek(0)
 
+    def _stage_token(
+        self,
+        stage_key: str,
+        backend_id: str,
+        noise_sigma: int,
+        parameters: EnhancementParameters,
+    ) -> tuple[str, tuple[object, ...]]:
+        if stage_key == "gain_stabilization":
+            target_median = self.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
+            return (
+                stage_key,
+                (
+                    round(float(target_median), 4),
+                    round(float(parameters.gain_min), 4),
+                    round(float(parameters.gain_max), 4),
+                ),
+            )
+        if stage_key == "scanline_correction":
+            return (
+                stage_key,
+                (
+                    round(float(parameters.scanline_bias_clip), 4),
+                    round(float(parameters.scanline_sigma_y), 4),
+                ),
+            )
+        if stage_key == "denoise":
+            if backend_id == "classical":
+                return (
+                    stage_key,
+                    (
+                        backend_id,
+                        int(parameters.bilateral_diameter),
+                        round(float(parameters.bilateral_sigma_color), 4),
+                        round(float(parameters.bilateral_sigma_space), 4),
+                    ),
+                )
+            return (stage_key, (backend_id, int(noise_sigma)))
+        if stage_key == "temporal_filter":
+            return (stage_key, (round(float(parameters.temporal_motion_sigma), 4),))
+        if stage_key == "local_contrast":
+            return (
+                stage_key,
+                (
+                    round(float(parameters.clahe_clip_limit), 4),
+                    int(parameters.clahe_tile_size),
+                ),
+            )
+        if stage_key == "final_smoothing":
+            return (stage_key, (round(float(parameters.smoothing_sigma_x), 4),))
+        return (stage_key, tuple())
+
+    def _sequence_key(
+        self,
+        stages: EnhancementStages,
+        backend_id: str,
+        noise_sigma: int,
+        parameters: EnhancementParameters,
+    ) -> tuple[tuple[str, tuple[object, ...]], ...]:
+        return tuple(
+            self._stage_token(stage_key, backend_id, noise_sigma, parameters)
+            for stage_key in stages.enabled_stage_order
+        )
+
+    def estimate_prepare_work(
+        self,
+        backend_id: str,
+        noise_sigma: int,
+        stages: EnhancementStages,
+        parameters: EnhancementParameters,
+    ) -> int:
+        sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
+        frame_count = self.info.frame_count
+        work_units = 0
+        if self.source_gray_frames is None:
+            work_units += frame_count
+        prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        for token in sequence_key:
+            prefix = prefix + (token,)
+            if prefix not in self.stage_frame_cache:
+                work_units += frame_count
+        if sequence_key not in self.encoded_frame_cache:
+            work_units += frame_count
+        return work_units
+
+    def _load_source_gray_frames(self, on_frame_done: Callable[[], bool] | None = None) -> list[np.ndarray] | None:
+        if self.source_gray_frames is not None:
+            self.stage_frame_cache.setdefault(tuple(), self.source_gray_frames)
+            return self.source_gray_frames
+
+        capture = cv2.VideoCapture(str(self.path))
+        if not capture.isOpened():
+            raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+        try:
+            loaded: list[np.ndarray] = []
+            for _ in range(self.info.frame_count):
+                ok, frame = capture.read()
+                if not ok:
+                    raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+                loaded.append(cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY))
+                if on_frame_done is not None and not on_frame_done():
+                    return None
+            self.source_gray_frames = loaded
+            self.stage_frame_cache[tuple()] = loaded
+            return loaded
+        finally:
+            capture.release()
+
+    def _apply_stage(
+        self,
+        stage_key: str,
+        source_frames: list[np.ndarray],
+        denoiser: FrameDenoiser | None,
+        noise_sigma: int,
+        batch_size: int,
+        parameters: EnhancementParameters,
+        on_frame_done: Callable[[], bool] | None = None,
+    ) -> list[np.ndarray] | None:
+        if stage_key == "gain_stabilization":
+            target_median = self.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
+            output: list[np.ndarray] = []
+            for frame in source_frames:
+                output.append(np.clip(stabilize_frame_gain(frame, target_median, parameters.gain_min, parameters.gain_max), 0, 255))
+                if on_frame_done is not None and not on_frame_done():
+                    return None
+            return output
+
+        if stage_key == "scanline_correction":
+            output = []
+            for frame in source_frames:
+                output.append(correct_scanlines(frame, parameters.scanline_bias_clip, parameters.scanline_sigma_y))
+                if on_frame_done is not None and not on_frame_done():
+                    return None
+            return output
+
+        if stage_key == "denoise":
+            denoise_input = [np.clip(frame, 0, 255).astype(np.uint8) for frame in source_frames]
+            if denoiser is None:
+                output = []
+                for frame in denoise_input:
+                    output.append(
+                        spatial_bilateral_filter(
+                            frame,
+                            parameters.bilateral_diameter,
+                            parameters.bilateral_sigma_color,
+                            parameters.bilateral_sigma_space,
+                        )
+                    )
+                    if on_frame_done is not None and not on_frame_done():
+                        return None
+                return output
+
+            output = []
+            for batch_start in range(0, len(denoise_input), batch_size):
+                batch = denoise_input[batch_start : batch_start + batch_size]
+                denoised_batch = denoiser.denoise_batch(batch, noise_sigma)
+                output.extend(denoised_batch)
+                if on_frame_done is not None:
+                    for _ in denoised_batch:
+                        if not on_frame_done():
+                            return None
+            return output
+
+        if stage_key == "temporal_filter":
+            output = []
+            frame_count = len(source_frames)
+            for index, current in enumerate(source_frames):
+                previous = source_frames[index - 1] if index > 0 else current
+                following = source_frames[index + 1] if index + 1 < frame_count else current
+                output.append(motion_aware_temporal_filter(previous, current, following, parameters.temporal_motion_sigma))
+                if on_frame_done is not None and not on_frame_done():
+                    return None
+            return output
+
+        if stage_key == "local_contrast":
+            output = []
+            for frame in source_frames:
+                output.append(
+                    enhance_local_contrast(
+                        np.clip(frame, 0, 255).astype(np.uint8),
+                        parameters.clahe_clip_limit,
+                        parameters.clahe_tile_size,
+                    )
+                )
+                if on_frame_done is not None and not on_frame_done():
+                    return None
+            return output
+
+        if stage_key == "final_smoothing":
+            output = []
+            for frame in source_frames:
+                output.append(smooth_final_frame(np.clip(frame, 0, 255).astype(np.uint8), parameters.smoothing_sigma_x))
+                if on_frame_done is not None and not on_frame_done():
+                    return None
+            return output
+
+        return list(source_frames)
+
     def prepare_enhanced_frames(
         self,
         denoiser: FrameDenoiser | None = None,
@@ -582,106 +782,61 @@ class VideoPanel(QFrame):
         progress_callback: Callable[[int, int], bool] | None = None,
     ) -> bool:
         backend_id = denoiser.backend_id if denoiser is not None else "classical"
-        signature = (backend_id, noise_sigma if stages.denoise else 0, stages, parameters)
-        if (
-            self.enhanced_frames is not None
-            and len(self.enhanced_frames) == self.info.frame_count
-            and self.enhancement_signature == signature
-        ):
+        sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
+        if sequence_key in self.encoded_frame_cache:
+            self.enhanced_frames = self.encoded_frame_cache[sequence_key]
+            self.active_sequence_key = sequence_key
             return True
 
-        capture = cv2.VideoCapture(str(self.path))
-        try:
-            stage_frames: list[np.ndarray] = []
-            for frame_index in range(self.info.frame_count):
-                ok, frame = capture.read()
-                if not ok:
-                    raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
-                processed = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
-                stage_frames.append(processed)
+        total_work = self.estimate_prepare_work(backend_id, noise_sigma, stages, parameters)
+        completed_work = 0
 
-            for stage_key in stages.enabled_stage_order:
-                if stage_key == "gain_stabilization":
-                    target_median = self.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
-                    stage_frames = [
-                        np.clip(stabilize_frame_gain(frame, target_median, parameters.gain_min, parameters.gain_max), 0, 255)
-                        for frame in stage_frames
-                    ]
-                    continue
+        def on_frame_done() -> bool:
+            nonlocal completed_work
+            completed_work += 1
+            if progress_callback is None:
+                return True
+            return progress_callback(completed_work, max(1, total_work))
 
-                if stage_key == "scanline_correction":
-                    stage_frames = [
-                        correct_scanlines(frame, parameters.scanline_bias_clip, parameters.scanline_sigma_y)
-                        for frame in stage_frames
-                    ]
-                    continue
+        source_frames = self._load_source_gray_frames(on_frame_done if self.source_gray_frames is None else None)
+        if source_frames is None:
+            return False
 
-                if stage_key == "denoise":
-                    denoise_input = [np.clip(frame, 0, 255).astype(np.uint8) for frame in stage_frames]
-                    if denoiser is None:
-                        stage_frames = [
-                            spatial_bilateral_filter(
-                                frame,
-                                parameters.bilateral_diameter,
-                                parameters.bilateral_sigma_color,
-                                parameters.bilateral_sigma_space,
-                            )
-                            for frame in denoise_input
-                        ]
-                        continue
+        prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        for token in sequence_key:
+            next_prefix = prefix + (token,)
+            if next_prefix not in self.stage_frame_cache:
+                stage_output = self._apply_stage(
+                    token[0],
+                    self.stage_frame_cache[prefix],
+                    denoiser,
+                    noise_sigma,
+                    batch_size,
+                    parameters,
+                    on_frame_done,
+                )
+                if stage_output is None:
+                    return False
+                self.stage_frame_cache[next_prefix] = stage_output
+            prefix = next_prefix
 
-                    denoised_frames: list[np.ndarray] = []
-                    for batch_start in range(0, len(denoise_input), batch_size):
-                        batch = denoise_input[batch_start : batch_start + batch_size]
-                        denoised_frames.extend(denoiser.denoise_batch(batch, noise_sigma))
-                    stage_frames = denoised_frames
-                    continue
-
-                if stage_key == "temporal_filter":
-                    temporal_frames: list[np.ndarray] = []
-                    frame_count = len(stage_frames)
-                    for index, current in enumerate(stage_frames):
-                        previous = stage_frames[index - 1] if index > 0 else current
-                        following = stage_frames[index + 1] if index + 1 < frame_count else current
-                        temporal_frames.append(
-                            motion_aware_temporal_filter(previous, current, following, parameters.temporal_motion_sigma)
-                        )
-                    stage_frames = temporal_frames
-                    continue
-
-                if stage_key == "local_contrast":
-                    stage_frames = [
-                        enhance_local_contrast(
-                            np.clip(frame, 0, 255).astype(np.uint8),
-                            parameters.clahe_clip_limit,
-                            parameters.clahe_tile_size,
-                        )
-                        for frame in stage_frames
-                    ]
-                    continue
-
-                if stage_key == "final_smoothing":
-                    stage_frames = [
-                        smooth_final_frame(np.clip(frame, 0, 255).astype(np.uint8), parameters.smoothing_sigma_x)
-                        for frame in stage_frames
-                    ]
-
-            enhanced_frames: list[np.ndarray] = []
-            for index, enhanced in enumerate(stage_frames, start=1):
+        if sequence_key not in self.encoded_frame_cache:
+            encoded_frames: list[np.ndarray] = []
+            for frame in self.stage_frame_cache[sequence_key]:
+                enhanced = frame
                 if enhanced.dtype != np.uint8:
                     enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
                 encoded_ok, encoded = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 92])
                 if not encoded_ok:
                     raise RuntimeError(f"Could not cache enhanced video frame: {self.path}")
-                enhanced_frames.append(encoded)
-                if progress_callback is not None and not progress_callback(index, self.info.frame_count):
+                encoded_frames.append(encoded)
+                if not on_frame_done():
                     return False
+            self.encoded_frame_cache[sequence_key] = encoded_frames
 
-            self.enhanced_frames = enhanced_frames
-            self.enhancement_signature = signature
-            return True
-        finally:
-            capture.release()
+        self.enhanced_frames = self.encoded_frame_cache[sequence_key]
+        self.active_sequence_key = sequence_key
+        return True
 
     def _metadata_text(self) -> str:
         crop_width = self.crop_rect.width()
@@ -736,8 +891,7 @@ class VideoPanel(QFrame):
         self.capture = cv2.VideoCapture(str(path))
         self.current_frame_index = -1
         self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
-        self.enhanced_frames = None
-        self.enhancement_signature = None
+        self.clear_enhancement_cache()
         self.path_label.setText(path.name)
         self.meta_label.setText(self._metadata_text())
         self.display.clear_roi()
@@ -755,7 +909,10 @@ class VideoPanel(QFrame):
 
     def clear_enhancement_cache(self) -> None:
         self.enhanced_frames = None
-        self.enhancement_signature = None
+        self.source_gray_frames = None
+        self.stage_frame_cache.clear()
+        self.encoded_frame_cache.clear()
+        self.active_sequence_key = None
 
     def close(self) -> None:
         self.capture.release()
@@ -1617,8 +1774,6 @@ class ContrastWindow(QMainWindow):
         if stages.any_enabled:
             self.rebuild_enhancement_pipeline()
         else:
-            for panel in self.panels:
-                panel.clear_enhancement_cache()
             self.set_display_enhancement(False)
             self.statusBar().showMessage("Showing original videos.")
 
@@ -1635,8 +1790,6 @@ class ContrastWindow(QMainWindow):
         return f"{mode}:{precision}:batch{batch_size}"
 
     def rebuild_enhancement_pipeline(self) -> None:
-        for panel in self.panels:
-            panel.clear_enhancement_cache()
         if self.ensure_enhancement_ready():
             self.set_display_enhancement(True)
         else:
@@ -1683,27 +1836,40 @@ class ContrastWindow(QMainWindow):
                 self.loading_overlay.finish()
 
         backend_id = denoiser.backend_id if denoiser is not None else "classical"
-        expected_signature = (backend_id, noise_sigma if stages.denoise else 0, stages, parameters)
-        pending_panels = [
-            panel
-            for panel in self.panels
-            if panel.enhanced_frames is None or panel.enhancement_signature != expected_signature
-        ]
-        if not pending_panels:
-            return True
-
         self.pause()
-        total_frames = sum(panel.info.frame_count for panel in pending_panels)
+        panel_work = [
+            panel.estimate_prepare_work(backend_id, noise_sigma, stages, parameters)
+            for panel in self.panels
+        ]
+        total_work = sum(panel_work)
+
+        if total_work <= 0:
+            try:
+                for panel in self.panels:
+                    if not panel.prepare_enhanced_frames(
+                        denoiser,
+                        noise_sigma,
+                        batch_size,
+                        stages,
+                        parameters,
+                        None,
+                    ):
+                        return False
+                return True
+            except RuntimeError as exc:
+                QMessageBox.critical(self, "Enhancement failed", str(exc))
+                return False
+
         if denoiser is not None:
             model_label = self.enhancement_mode_combo.currentText().split(" (")[0]
             message = f"Running {model_label} on {denoiser.device_name}..."
         else:
             message = "Running classical video enhancement..."
-        self.loading_overlay.begin(message, total_frames)
+        self.loading_overlay.begin(message, total_work)
 
         completed = 0
         try:
-            for panel in pending_panels:
+            for panel, planned_work in zip(self.panels, panel_work):
                 def progress_callback(done: int, _total: int) -> bool:
                     self.loading_overlay.set_progress(completed + done)
                     return True
@@ -1718,7 +1884,7 @@ class ContrastWindow(QMainWindow):
                 )
                 if not prepared:
                     return False
-                completed += panel.info.frame_count
+                completed += planned_work
                 self.loading_overlay.set_progress(completed)
             return True
         except RuntimeError as exc:
