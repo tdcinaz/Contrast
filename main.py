@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -960,6 +961,7 @@ class ContrastWindow(QMainWindow):
 
         controls = QTabWidget()
         controls.setMaximumWidth(410)
+        controls.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding)
 
         enhancement_tab = QWidget()
         enhancement_layout = QVBoxLayout(enhancement_tab)
@@ -1084,7 +1086,17 @@ class ContrastWindow(QMainWindow):
         plot_layout.addWidget(self.normalized_plot, 0, 0)
         plot_layout.addWidget(self.raw_plot, 1, 0)
 
-        layout.addWidget(controls)
+        controls_scroll = QScrollArea()
+        controls_scroll.setObjectName("controlsScroll")
+        controls_scroll.setWidget(controls)
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        controls_scroll.setMaximumWidth(430)
+        controls_scroll.setMinimumWidth(390)
+
+        layout.addWidget(controls_scroll)
         layout.addWidget(plot_group, 1)
         return container
 
