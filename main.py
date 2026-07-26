@@ -5,7 +5,7 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import Callable, Protocol
 
 import cv2
 import numpy as np
@@ -39,15 +39,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-if TYPE_CHECKING:
-    from deep_denoiser import FFDNetDenoiser
-
-
 ROOT = Path(__file__).resolve().parent
 DEFAULT_VIDEOS = {
     "Pre-deployment": ROOT / "PPI150_PreDeployment_Contrast.mov",
     "Post-deployment": ROOT / "PPI150_PostDeployment_Contrast.mov",
 }
+
+
+class FrameDenoiser(Protocol):
+    backend_id: str
+
+    @property
+    def device_name(self) -> str: ...
+
+    def denoise_batch(self, images: list[np.ndarray], noise_sigma: float) -> list[np.ndarray]: ...
 
 
 @dataclass(slots=True)
@@ -450,11 +455,11 @@ class VideoPanel(QFrame):
 
     def prepare_enhanced_frames(
         self,
-        denoiser: FFDNetDenoiser | None = None,
+        denoiser: FrameDenoiser | None = None,
         noise_sigma: int = 10,
         progress_callback: Callable[[int, int], bool] | None = None,
     ) -> bool:
-        signature = ("ffdnet", noise_sigma) if denoiser is not None else ("classical", 0)
+        signature = (denoiser.backend_id, noise_sigma) if denoiser is not None else ("classical", 0)
         if (
             self.enhanced_frames is not None
             and len(self.enhanced_frames) == self.info.frame_count
@@ -691,7 +696,7 @@ class ContrastWindow(QMainWindow):
         self.is_playing = False
         self.current_frame_index = 0
         self.results: dict[str, AnalysisResult] = {}
-        self.deep_denoiser: FFDNetDenoiser | None = None
+        self.deep_denoisers: dict[str, FrameDenoiser] = {}
 
         self.pre_panel = VideoPanel("Pre-deployment", QColor("#38bdf8"), DEFAULT_VIDEOS["Pre-deployment"])
         self.post_panel = VideoPanel("Post-deployment", QColor("#f97316"), DEFAULT_VIDEOS["Post-deployment"])
@@ -818,7 +823,8 @@ class ContrastWindow(QMainWindow):
         enhancement_mode_row = QHBoxLayout()
         enhancement_mode_row.addWidget(QLabel("Enhancement model"))
         self.enhancement_mode_combo = QComboBox()
-        self.enhancement_mode_combo.addItem("Deep FFDNet (GPU)", "ffdnet")
+        self.enhancement_mode_combo.addItem("NGC FFDNet (Docker)", "ffdnet-ngc")
+        self.enhancement_mode_combo.addItem("Native FFDNet (GPU)", "ffdnet-native")
         self.enhancement_mode_combo.addItem("Classical", "classical")
         enhancement_mode_row.addWidget(self.enhancement_mode_combo, 1)
         controls_layout.addLayout(enhancement_mode_row)
@@ -1056,8 +1062,16 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage("Video enhancement enabled." if enabled else "Video enhancement disabled.")
 
     def on_enhancement_settings_changed(self) -> None:
-        use_deep_model = self.enhancement_mode_combo.currentData() == "ffdnet"
+        active_mode = self.enhancement_mode_combo.currentData()
+        use_deep_model = active_mode != "classical"
         self.denoise_strength_spin.setEnabled(use_deep_model)
+        for mode, denoiser in list(self.deep_denoisers.items()):
+            if mode == active_mode:
+                continue
+            close = getattr(denoiser, "close", None)
+            if close is not None:
+                close()
+            del self.deep_denoisers[mode]
         for panel in self.panels:
             panel.clear_enhancement_cache()
         if self.enhance_button.isChecked():
@@ -1084,24 +1098,31 @@ class ContrastWindow(QMainWindow):
         self.enhance_button.setText("Enable video enhancement")
 
     def ensure_enhancement_ready(self) -> bool:
-        use_deep_model = self.enhancement_mode_combo.currentData() == "ffdnet"
+        mode = str(self.enhancement_mode_combo.currentData())
+        use_deep_model = mode != "classical"
         noise_sigma = self.denoise_strength_spin.value()
         denoiser = None
         if use_deep_model:
             try:
-                if self.deep_denoiser is None:
-                    self.loading_overlay.begin("Loading FFDNet on the NVIDIA GPU...", 1)
-                    from deep_denoiser import FFDNetDenoiser
+                if mode not in self.deep_denoisers:
+                    if mode == "ffdnet-ngc":
+                        self.loading_overlay.begin("Starting the NGC PyTorch worker...", 1)
+                        from container_denoiser import ContainerFFDNetDenoiser
 
-                    self.deep_denoiser = FFDNetDenoiser(ROOT / "models" / "ffdnet_gray.pth")
-                denoiser = self.deep_denoiser
+                        self.deep_denoisers[mode] = ContainerFFDNetDenoiser(ROOT / "models" / "ffdnet_gray.pth")
+                    else:
+                        self.loading_overlay.begin("Loading FFDNet on the NVIDIA GPU...", 1)
+                        from deep_denoiser import FFDNetDenoiser
+
+                        self.deep_denoisers[mode] = FFDNetDenoiser(ROOT / "models" / "ffdnet_gray.pth")
+                denoiser = self.deep_denoisers[mode]
             except (ImportError, OSError, RuntimeError) as exc:
                 QMessageBox.critical(self, "Deep enhancement unavailable", str(exc))
                 return False
             finally:
                 self.loading_overlay.finish()
 
-        expected_signature = ("ffdnet", noise_sigma) if denoiser is not None else ("classical", 0)
+        expected_signature = (denoiser.backend_id, noise_sigma) if denoiser is not None else ("classical", 0)
         pending_panels = [
             panel
             for panel in self.panels
@@ -1284,6 +1305,10 @@ class ContrastWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: ANN001
         for panel in self.panels:
             panel.close()
+        for denoiser in self.deep_denoisers.values():
+            close = getattr(denoiser, "close", None)
+            if close is not None:
+                close()
         super().closeEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
