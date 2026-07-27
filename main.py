@@ -235,8 +235,90 @@ def smooth_temporal_signal(values: np.ndarray, fps: float) -> np.ndarray:
     ).ravel()
 
 
-def detect_vertical_bar_crop(path: Path, info: VideoInfo) -> QRect:
-    # Estimate content bounds from sampled columns to remove pillarbox bars.
+def _detect_aligned_field_crop(gray_frames: list[np.ndarray]) -> QRect | None:
+    height, width = gray_frames[0].shape
+    temporal_level = np.percentile(np.stack(gray_frames, axis=0), 75, axis=0).astype(np.uint8)
+    center = temporal_level[height // 3 : height * 2 // 3, width // 3 : width * 2 // 3]
+    edge_depth = max(4, min(height, width) // 32)
+    edges = np.concatenate(
+        (
+            temporal_level[:edge_depth].ravel(),
+            temporal_level[-edge_depth:].ravel(),
+            temporal_level[:, :edge_depth].ravel(),
+            temporal_level[:, -edge_depth:].ravel(),
+        )
+    )
+    edge_level = float(np.median(edges))
+    center_level = float(np.median(center))
+    if center_level - edge_level < 12.0:
+        return None
+
+    threshold = edge_level + (center_level - edge_level) * 0.45
+    field_mask = (temporal_level > threshold).astype(np.uint8)
+    kernel_size = max(5, round(min(height, width) * 0.03) | 1)
+    field_mask = cv2.morphologyEx(
+        field_mask,
+        cv2.MORPH_CLOSE,
+        np.ones((kernel_size, kernel_size), dtype=np.uint8),
+    )
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(field_mask)
+    if component_count < 2:
+        return None
+    component = int(labels[height // 2, width // 2])
+    if component == 0:
+        component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    field_area = int(stats[component, cv2.CC_STAT_AREA])
+    field_width = int(stats[component, cv2.CC_STAT_WIDTH])
+    field_height = int(stats[component, cv2.CC_STAT_HEIGHT])
+    bounding_area = field_width * field_height
+    fill_fraction = field_area / max(1, bounding_area)
+    if field_area < width * height * 0.2 or not 0.55 <= fill_fraction <= 0.90:
+        return None
+
+    component_mask = (labels == component).astype(np.uint8)
+    distance = cv2.distanceTransform(component_mask, cv2.DIST_L2, 5)
+    center_y, center_x = np.unravel_index(int(np.argmax(distance)), distance.shape)
+    alignment = 32
+    maximum_size = min(field_width, field_height) // alignment * alignment
+    minimum_size = max(alignment, int(min(width, height) * 0.45) // alignment * alignment)
+    for size in range(maximum_size, minimum_size - 1, -alignment):
+        x = max(0, min(width - size, round(center_x - size / 2)))
+        y = max(0, min(height - size, round(center_y - size / 2)))
+        occupancy = float(np.mean(component_mask[y : y + size, x : x + size]))
+        if occupancy >= 0.995:
+            return QRect(x, y, size, size)
+    return None
+
+
+def _detect_pillarbox_crop(gray_frames: list[np.ndarray], width: int, height: int) -> QRect:
+    full_frame = QRect(0, 0, width, height)
+    column_profiles = [np.percentile(gray, 90, axis=0).astype(np.float32) for gray in gray_frames]
+    profile = np.median(np.stack(column_profiles, axis=0), axis=0)
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32)
+    smooth = np.convolve(profile, kernel / np.sum(kernel), mode="same")
+
+    center_start = width // 4
+    center_end = (width * 3) // 4
+    center_slice = smooth[center_start:center_end]
+    center_level = float(np.median(center_slice)) if center_slice.size else float(np.median(smooth))
+    edge_width = max(1, width // 12)
+    edge_left = float(np.median(smooth[:edge_width]))
+    edge_right = float(np.median(smooth[-edge_width:]))
+    edge_level = min(edge_left, edge_right)
+    threshold = max(3.0, edge_level + (center_level - edge_level) * 0.35)
+    content = smooth > threshold
+    if not np.any(content):
+        return full_frame
+
+    left = max(0, int(np.argmax(content)) - 2)
+    right = min(width - 1, int(width - 1 - np.argmax(content[::-1])) + 2)
+    cropped_width = right - left + 1
+    if cropped_width < int(width * 0.45) or left < 2 or width - right - 1 < 2:
+        return full_frame
+    return QRect(left, 0, cropped_width, height)
+
+
+def detect_fluoroscope_crop(path: Path, info: VideoInfo) -> QRect:
     full_frame = QRect(0, 0, info.width, info.height)
     if info.width <= 0 or info.height <= 0:
         return full_frame
@@ -248,52 +330,21 @@ def detect_vertical_bar_crop(path: Path, info: VideoInfo) -> QRect:
     try:
         sample_count = min(24, max(6, info.frame_count if info.frame_count > 0 else 6))
         frame_indexes = np.unique(np.linspace(0, max(0, info.frame_count - 1), num=sample_count, dtype=int))
-        column_profiles: list[np.ndarray] = []
+        gray_frames: list[np.ndarray] = []
         for frame_index in frame_indexes:
             capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
             ok, frame = capture.read()
             if not ok:
                 continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            column_profiles.append(np.percentile(gray, 90, axis=0).astype(np.float32))
+            gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
 
-        if len(column_profiles) < 3:
+        if len(gray_frames) < 3:
             return full_frame
-
-        profile = np.median(np.stack(column_profiles, axis=0), axis=0)
-        kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32)
-        smooth = np.convolve(profile, kernel / np.sum(kernel), mode="same")
-
-        center_start = info.width // 4
-        center_end = (info.width * 3) // 4
-        center_slice = smooth[center_start:center_end]
-        center_level = float(np.median(center_slice)) if center_slice.size else float(np.median(smooth))
-
-        edge_width = max(1, info.width // 12)
-        edge_left = float(np.median(smooth[:edge_width]))
-        edge_right = float(np.median(smooth[-edge_width:]))
-        edge_level = min(edge_left, edge_right)
-
-        threshold = max(3.0, edge_level + (center_level - edge_level) * 0.35)
-        content = smooth > threshold
-        if not np.any(content):
-            return full_frame
-
-        left = int(np.argmax(content))
-        right = int(info.width - 1 - np.argmax(content[::-1]))
-        left = max(0, left - 2)
-        right = min(info.width - 1, right + 2)
-        cropped_width = right - left + 1
-        left_margin = left
-        right_margin = info.width - right - 1
-
-        # Only crop when bars are clearly present on both sides and crop is reasonable.
-        if cropped_width < int(info.width * 0.45):
-            return full_frame
-        if left_margin < 2 or right_margin < 2:
-            return full_frame
-
-        return QRect(left, 0, cropped_width, info.height)
+        return _detect_aligned_field_crop(gray_frames) or _detect_pillarbox_crop(
+            gray_frames,
+            info.width,
+            info.height,
+        )
     finally:
         capture.release()
 
@@ -582,7 +633,7 @@ class VideoPanel(QFrame):
         self.color = color
         self.path = path
         self.info = probe_video(path)
-        self.crop_rect = detect_vertical_bar_crop(path, self.info)
+        self.crop_rect = detect_fluoroscope_crop(path, self.info)
         self.capture = cv2.VideoCapture(str(path))
         self.current_frame: np.ndarray | None = None
         self.current_frame_index = -1
@@ -1226,7 +1277,7 @@ class VideoPanel(QFrame):
         self.capture.release()
         self.path = path
         self.info = probe_video(path)
-        self.crop_rect = detect_vertical_bar_crop(path, self.info)
+        self.crop_rect = detect_fluoroscope_crop(path, self.info)
         self.capture = cv2.VideoCapture(str(path))
         self.current_frame_index = -1
         self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
