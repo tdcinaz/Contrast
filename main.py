@@ -165,8 +165,10 @@ class EnhancementParameters:
     adjustments_sharpen_amount: float = 0.0
     adjustments_gamma: float = 1.0
     smoothing_sigma_x: float = 0.55
+    segmentation_mode: str = "dark_contrast"
     segmentation_block_size: int = 51
     segmentation_sensitivity: float = 7.0
+    segmentation_change_threshold: float = 12.0
     segmentation_level_tolerance: int = 12
     segmentation_min_area: int = 80
 
@@ -555,6 +557,81 @@ def segment_dark_contrast(
     return brightness_map
 
 
+def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
+    if not gray_frames:
+        return np.zeros((1, 1), dtype=np.float32)
+
+    source_frames = [np.clip(frame, 0, 255).astype(np.uint8) for frame in gray_frames]
+    if len(source_frames) == 1:
+        return np.zeros_like(source_frames[0], dtype=np.float32)
+
+    stack = np.stack(source_frames, axis=0).astype(np.float32)
+    return np.percentile(stack, 90.0, axis=0) - np.percentile(stack, 10.0, axis=0)
+
+
+def segment_temporal_change_map(
+    temporal_change: np.ndarray,
+    change_threshold: float,
+    level_tolerance: int,
+    minimum_area: int,
+    smoothing_window: int,
+) -> np.ndarray:
+    smoothed_change = temporal_change.astype(np.float32, copy=True)
+    kernel_size = max(3, int(smoothing_window) | 1)
+    smoothed_change = cv2.GaussianBlur(smoothed_change, (kernel_size, kernel_size), sigmaX=0)
+
+    threshold = max(0.0, float(change_threshold))
+    mask = (smoothed_change >= threshold).astype(np.uint8)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    change_map = np.zeros_like(mask, dtype=np.uint8)
+    components: list[tuple[int, int, int]] = []
+    for component in range(1, component_count):
+        area = int(stats[component, cv2.CC_STAT_AREA])
+        if area >= minimum_area:
+            component_pixels = labels == component
+            component_change = int(np.median(smoothed_change[component_pixels]))
+            components.append((component_change, component, area))
+
+    components.sort()
+    tolerance = max(0, int(level_tolerance))
+    level_groups: list[list[tuple[int, int, int]]] = []
+    for component_info in components:
+        if not level_groups or component_info[0] - level_groups[-1][0][0] > tolerance:
+            level_groups.append([component_info])
+        else:
+            level_groups[-1].append(component_info)
+
+    for group in level_groups:
+        change_total = sum(change * area for change, _, area in group)
+        area_total = sum(area for _, _, area in group)
+        representative_change = max(1, min(255, round(change_total / area_total)))
+        for _, component, _ in group:
+            change_map[labels == component] = representative_change
+
+    return change_map
+
+
+def segment_temporal_change_contrast(
+    gray_frames: list[np.ndarray],
+    change_threshold: float,
+    level_tolerance: int,
+    minimum_area: int,
+    smoothing_window: int,
+) -> np.ndarray:
+    temporal_change = compute_temporal_change_map(gray_frames)
+    return segment_temporal_change_map(
+        temporal_change,
+        change_threshold,
+        level_tolerance,
+        minimum_area,
+        smoothing_window,
+    )
+
+
 def overlay_segmentation_mask(
     frame: np.ndarray,
     mask: np.ndarray,
@@ -795,6 +872,7 @@ class VideoPanel(QFrame):
         self.stage_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.encoded_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.segmentation_mask_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
+        self.temporal_change_map_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], np.ndarray] = {}
         self.active_sequence_key: tuple[tuple[str, tuple[object, ...]], ...] | None = None
         self.stage_duration_per_frame: dict[tuple[str, tuple[object, ...]], float] = {}
 
@@ -920,8 +998,10 @@ class VideoPanel(QFrame):
             return (
                 stage_key,
                 (
+                    str(parameters.segmentation_mode),
                     int(parameters.segmentation_block_size),
                     round(float(parameters.segmentation_sensitivity), 4),
+                    round(float(parameters.segmentation_change_threshold), 4),
                     int(parameters.segmentation_level_tolerance),
                     int(parameters.segmentation_min_area),
                 ),
@@ -1380,44 +1460,80 @@ class VideoPanel(QFrame):
                             flush_batch()
                 elif stage_key == "segmentation":
                     encoded_masks = segmentation_outputs.setdefault(stage_prefix, [])
-                    pending_masks: deque[tuple[int, np.ndarray, Future[tuple[np.ndarray, float]]]] = deque()
+                    segmentation_mode = str(parameters.segmentation_mode)
+                    if segmentation_mode == "temporal_change":
+                        stage_frames: list[tuple[int, np.ndarray]] = []
+                        while True:
+                            item = input_queue.get()
+                            if item is STREAM_END:
+                                break
+                            if cancelled.is_set():
+                                continue
+                            frame_index, frame = cast(tuple[int, np.ndarray], item)
+                            stage_frames.append((frame_index, frame))
+                        if stage_frames and not cancelled.is_set():
+                            input_prefix = stage_prefix[:-1]
+                            started_at = perf_counter()
+                            temporal_change = self.temporal_change_map_cache.get(input_prefix)
+                            if temporal_change is None:
+                                temporal_change = compute_temporal_change_map([frame for _, frame in stage_frames])
+                                self.temporal_change_map_cache[input_prefix] = temporal_change
+                            temporal_mask = segment_temporal_change_map(
+                                temporal_change,
+                                parameters.segmentation_change_threshold,
+                                parameters.segmentation_level_tolerance,
+                                parameters.segmentation_min_area,
+                                parameters.segmentation_block_size,
+                            )
+                            encoded_ok, encoded_mask = cv2.imencode(".png", temporal_mask)
+                            duration = perf_counter() - started_at
+                            if not encoded_ok:
+                                raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
+                            active_seconds += duration
+                            for frame_index, frame in stage_frames:
+                                encoded_masks.append(encoded_mask)
+                                if segmentation_mask_callback is not None:
+                                    segmentation_mask_callback(frame_index, encoded_mask)
+                                emit(frame_index, frame)
+                    else:
+                        pending_masks: deque[tuple[int, np.ndarray, Future[tuple[np.ndarray, float]]]] = deque()
 
-                    def segment_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
-                        started_at = perf_counter()
-                        mask = segment_dark_contrast(
-                            frame,
-                            parameters.segmentation_block_size,
-                            parameters.segmentation_sensitivity,
-                            parameters.segmentation_level_tolerance,
-                            parameters.segmentation_min_area,
-                        )
-                        encoded_ok, encoded_mask = cv2.imencode(".png", mask)
-                        if not encoded_ok:
-                            raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
-                        return encoded_mask, perf_counter() - started_at
+                        def segment_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
+                            started_at = perf_counter()
+                            mask = segment_dark_contrast(
+                                frame,
+                                parameters.segmentation_block_size,
+                                parameters.segmentation_sensitivity,
+                                parameters.segmentation_level_tolerance,
+                                parameters.segmentation_min_area,
+                            )
+                            encoded_ok, encoded_mask = cv2.imencode(".png", mask)
+                            if not encoded_ok:
+                                raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
+                            return encoded_mask, perf_counter() - started_at
 
-                    def drain_mask() -> None:
-                        nonlocal active_seconds
-                        frame_index, frame, future = pending_masks.popleft()
-                        encoded_mask, duration = future.result()
-                        active_seconds += duration
-                        encoded_masks.append(encoded_mask)
-                        if segmentation_mask_callback is not None:
-                            segmentation_mask_callback(frame_index, encoded_mask)
-                        emit(frame_index, frame)
+                        def drain_mask() -> None:
+                            nonlocal active_seconds
+                            frame_index, frame, future = pending_masks.popleft()
+                            encoded_mask, duration = future.result()
+                            active_seconds += duration
+                            encoded_masks.append(encoded_mask)
+                            if segmentation_mask_callback is not None:
+                                segmentation_mask_callback(frame_index, encoded_mask)
+                            emit(frame_index, frame)
 
-                    while True:
-                        item = input_queue.get()
-                        if item is STREAM_END:
-                            break
-                        if cancelled.is_set():
-                            continue
-                        frame_index, frame = cast(tuple[int, np.ndarray], item)
-                        pending_masks.append((frame_index, frame, frame_executor.submit(segment_frame, frame)))
-                        if len(pending_masks) >= frame_executor.max_workers:
+                        while True:
+                            item = input_queue.get()
+                            if item is STREAM_END:
+                                break
+                            if cancelled.is_set():
+                                continue
+                            frame_index, frame = cast(tuple[int, np.ndarray], item)
+                            pending_masks.append((frame_index, frame, frame_executor.submit(segment_frame, frame)))
+                            if len(pending_masks) >= frame_executor.max_workers:
+                                drain_mask()
+                        while pending_masks:
                             drain_mask()
-                    while pending_masks:
-                        drain_mask()
                 else:
                     while True:
                         item = input_queue.get()
@@ -1598,6 +1714,7 @@ class VideoPanel(QFrame):
         self.stage_frame_cache.clear()
         self.encoded_frame_cache.clear()
         self.segmentation_mask_cache.clear()
+        self.temporal_change_map_cache.clear()
         self.active_sequence_key = None
         self.stage_duration_per_frame.clear()
 
@@ -2291,12 +2408,25 @@ class ContrastWindow(QMainWindow):
         self.smoothing_stage_drawer.content_layout.addLayout(smoothing_row)
 
         segmentation_block_row = QHBoxLayout()
+        segmentation_block_row.addWidget(QLabel("Segmentation basis"))
+        self.segmentation_mode_combo = QComboBox()
+        self.segmentation_mode_combo.addItem("Dark contrast (per frame)", "dark_contrast")
+        self.segmentation_mode_combo.addItem("Temporal brightness change (full video)", "temporal_change")
+        self.segmentation_mode_combo.setToolTip(
+            "Temporal mode builds one mask from per-pixel brightness change over the full trimmed video"
+        )
+        segmentation_block_row.addWidget(self.segmentation_mode_combo)
+        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_block_row)
+
+        segmentation_block_row = QHBoxLayout()
         segmentation_block_row.addWidget(QLabel("Adaptive neighborhood"))
         self.segmentation_block_spin = QSpinBox()
         self.segmentation_block_spin.setRange(3, 151)
         self.segmentation_block_spin.setSingleStep(2)
         self.segmentation_block_spin.setValue(51)
-        self.segmentation_block_spin.setToolTip("Local neighborhood used to distinguish dark contrast")
+        self.segmentation_block_spin.setToolTip(
+            "Local neighborhood for dark-contrast mode and temporal-map smoothing for temporal-change mode"
+        )
         segmentation_block_row.addWidget(self.segmentation_block_spin)
         self.segmentation_stage_drawer.content_layout.addLayout(segmentation_block_row)
 
@@ -2309,6 +2439,20 @@ class ContrastWindow(QMainWindow):
         self.segmentation_sensitivity_spin.setValue(7.0)
         segmentation_sensitivity_row.addWidget(self.segmentation_sensitivity_spin)
         self.segmentation_stage_drawer.content_layout.addLayout(segmentation_sensitivity_row)
+
+        segmentation_change_threshold_row = QHBoxLayout()
+        segmentation_change_threshold_row.addWidget(QLabel("Change threshold"))
+        self.segmentation_change_threshold_spin = QDoubleSpinBox()
+        self.segmentation_change_threshold_spin.setRange(0.0, 100.0)
+        self.segmentation_change_threshold_spin.setSingleStep(0.5)
+        self.segmentation_change_threshold_spin.setDecimals(1)
+        self.segmentation_change_threshold_spin.setValue(12.0)
+        self.segmentation_change_threshold_spin.setSuffix(" levels")
+        self.segmentation_change_threshold_spin.setToolTip(
+            "Minimum per-pixel full-video brightness change kept in temporal-change segmentation mode"
+        )
+        segmentation_change_threshold_row.addWidget(self.segmentation_change_threshold_spin)
+        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_change_threshold_row)
 
         segmentation_tolerance_row = QHBoxLayout()
         segmentation_tolerance_row.addWidget(QLabel("Brightness tolerance"))
@@ -2332,6 +2476,7 @@ class ContrastWindow(QMainWindow):
         self.segmentation_stage_drawer.content_layout.addLayout(segmentation_area_row)
 
         self.gain_auto_target_check.toggled.connect(self._on_gain_auto_target_toggled)
+        self.segmentation_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         for spin in [
             self.gain_target_spin,
             self.gain_min_spin,
@@ -2351,6 +2496,7 @@ class ContrastWindow(QMainWindow):
             self.smoothing_sigma_spin,
             self.segmentation_block_spin,
             self.segmentation_sensitivity_spin,
+            self.segmentation_change_threshold_spin,
             self.segmentation_tolerance_spin,
             self.segmentation_area_spin,
         ]:
@@ -2623,8 +2769,10 @@ class ContrastWindow(QMainWindow):
             adjustments_sharpen_amount=self.adjustments_sharpen_spin.value(),
             adjustments_gamma=self.adjustments_gamma_spin.value(),
             smoothing_sigma_x=self.smoothing_sigma_spin.value(),
+            segmentation_mode=str(self.segmentation_mode_combo.currentData()),
             segmentation_block_size=self.segmentation_block_spin.value(),
             segmentation_sensitivity=self.segmentation_sensitivity_spin.value(),
+            segmentation_change_threshold=self.segmentation_change_threshold_spin.value(),
             segmentation_level_tolerance=self.segmentation_tolerance_spin.value(),
             segmentation_min_area=self.segmentation_area_spin.value(),
         )
