@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QStackedWidget,
     QSplitter,
     QStatusBar,
     QStyle,
@@ -56,10 +57,9 @@ CONFIG_DIRECTORY = ROOT / "configs"
 RECENT_CONFIG_FILE = CONFIG_DIRECTORY / "recent.json"
 CONFIG_VERSION = 1
 STREAM_END = object()
-DEFAULT_VIDEOS = {
-    "Pre-deployment": ROOT / "PPI150_PreDeployment_Contrast.mov",
-    "Post-deployment": ROOT / "PPI150_PostDeployment_Contrast.mov",
-}
+PANEL_COLORS = [QColor("#38bdf8"), QColor("#f97316")]
+MODE_SINGLE = "single"
+MODE_COMPARISON = "comparison"
 
 
 @contextmanager
@@ -2353,8 +2353,10 @@ class EnhancementProgressPanel(QFrame):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
 
-        self.panel_labels = [QLabel("Pre-deployment"), QLabel("Post-deployment")]
+        self.panel_labels = [QLabel("Video 1"), QLabel("Video 2")]
         self.panel_progress_bars = [QProgressBar(), QProgressBar()]
+        self._active_labels = ["Video 1", "Video 2"]
+        self._panel_count = 2
         for label, progress_bar in zip(self.panel_labels, self.panel_progress_bars):
             label.setObjectName("subtleLabel")
             progress_bar.setRange(0, 1000)
@@ -2373,12 +2375,27 @@ class EnhancementProgressPanel(QFrame):
     def _overall_units(self, value: float) -> int:
         return max(0, round(max(0.0, value) * 1000.0))
 
+    def configure_panels(self, labels: list[str]) -> None:
+        self._panel_count = max(1, min(2, len(labels))) if labels else 1
+        defaults = [f"Video {index + 1}" for index in range(self._panel_count)]
+        self._active_labels = [
+            labels[index] if index < len(labels) else defaults[index]
+            for index in range(self._panel_count)
+        ]
+        for index, (label, progress_bar) in enumerate(zip(self.panel_labels, self.panel_progress_bars)):
+            is_visible = index < self._panel_count
+            label.setVisible(is_visible)
+            progress_bar.setVisible(is_visible)
+            if is_visible:
+                label.setText(self._active_labels[index])
+
     def begin(self, message: str) -> None:
         self.message_label.setText(message)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setValue(0)
-        for index, progress_bar in enumerate(self.panel_progress_bars):
-            self.panel_labels[index].setText("Pre-deployment" if index == 0 else "Post-deployment")
+        for index in range(self._panel_count):
+            progress_bar = self.panel_progress_bars[index]
+            self.panel_labels[index].setText(self._active_labels[index])
             progress_bar.setRange(0, 0)
             progress_bar.setValue(0)
         self.show()
@@ -2388,7 +2405,9 @@ class EnhancementProgressPanel(QFrame):
         self.progress_bar.setValue(min(self._overall_units(value), self.progress_bar.maximum()))
 
     def set_panel_progress(self, panel_index: int, stage_message: str, value: float, maximum: float) -> None:
-        label = "Pre-deployment" if panel_index == 0 else "Post-deployment"
+        if panel_index < 0 or panel_index >= self._panel_count:
+            return
+        label = self._active_labels[panel_index]
         self.panel_labels[panel_index].setText(f"{label}: {stage_message}" if stage_message else label)
         progress_bar = self.panel_progress_bars[panel_index]
         progress_bar.setRange(0, max(1, self._overall_units(maximum)))
@@ -2597,10 +2616,6 @@ class StageDrawer(QFrame):
 class ContrastWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        missing = [str(path) for path in DEFAULT_VIDEOS.values() if not path.exists()]
-        if missing:
-            raise FileNotFoundError("Missing default video files: " + ", ".join(missing))
-
         self.setWindowTitle("Contrast Residence Analyzer")
         self.resize(1500, 940)
         self.timer = QTimer(self)
@@ -2628,15 +2643,14 @@ class ContrastWindow(QMainWindow):
         self.enhancement_poll_timer.setInterval(30)
         self.enhancement_poll_timer.timeout.connect(self._poll_enhancement)
 
-        self.pre_panel = VideoPanel("Pre-deployment", QColor("#38bdf8"), DEFAULT_VIDEOS["Pre-deployment"])
-        self.post_panel = VideoPanel("Post-deployment", QColor("#f97316"), DEFAULT_VIDEOS["Post-deployment"])
-        self.panels = [self.pre_panel, self.post_panel]
-        for panel in self.panels:
-            panel.roiChanged.connect(self.on_roi_changed)
+        self.pre_panel: VideoPanel | None = None
+        self.post_panel: VideoPanel | None = None
+        self.panels: list[VideoPanel] = []
+        self.active_mode = MODE_SINGLE
 
         self.source_max_frame = 0
         self.max_frame = 0
-        self.fps = min(panel.info.fps for panel in self.panels)
+        self.fps = 30.0
         self.playback_speed = 1.0
         self.play_interval_ms = self._play_interval_ms()
         self._sync_trimmed_video_window()
@@ -2649,14 +2663,114 @@ class ContrastWindow(QMainWindow):
         self.set_display_enhancement(False)
         self.update_time_label()
         self._update_stage_statuses()
-        self.on_roi_changed()
+        self._set_video_controls_enabled(False)
         QTimer.singleShot(0, self.prompt_load_most_recent_config)
 
+    def _set_video_controls_enabled(self, enabled: bool) -> None:
+        self.play_button.setEnabled(enabled)
+        self.frame_slider.setEnabled(enabled)
+        self.frame_spin.setEnabled(enabled)
+        self.speed_slider.setEnabled(enabled)
+        self.compare_view_check.setEnabled(enabled and len(self.panels) >= 2)
+        self.overlay_mask_check.setEnabled(enabled and self._has_enabled_stage("segmentation"))
+        self.open_pre_action.setEnabled(enabled and bool(self.pre_panel))
+        self.open_post_action.setEnabled(enabled and bool(self.post_panel))
+
+    def _open_video_file(self, title: str) -> Path | None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            str(ROOT),
+            "Video files (*.mov *.mp4 *.avi *.mkv);;All files (*)",
+        )
+        return Path(path) if path else None
+
+    def _clear_video_panels(self) -> None:
+        for panel in self.panels:
+            panel.close()
+            self.video_layout.removeWidget(panel)
+            panel.setParent(None)
+        self.panels = []
+        self.pre_panel = None
+        self.post_panel = None
+
+    def _set_video_panels(self, videos: list[Path]) -> None:
+        if not videos:
+            self._clear_video_panels()
+            self.active_mode = MODE_SINGLE
+            self.enhancement_progress.configure_panels(["Video 1"])
+            self._set_video_controls_enabled(False)
+            self.video_stack.setCurrentWidget(self.mode_selection_page)
+            self._sync_trimmed_video_window()
+            self._set_playback_limit(self.source_max_frame)
+            self.current_frame_index = 0
+            self.update_time_label()
+            return
+
+        self.pause()
+        self._clear_video_panels()
+        labels = ["Pre-deployment", "Post-deployment"] if len(videos) > 1 else ["Video"]
+        for index, path in enumerate(videos):
+            color = PANEL_COLORS[min(index, len(PANEL_COLORS) - 1)]
+            panel = VideoPanel(labels[index], color, path)
+            panel.roiChanged.connect(self.on_roi_changed)
+            self.video_layout.addWidget(panel)
+            self.panels.append(panel)
+        self.pre_panel = self.panels[0] if self.panels else None
+        self.post_panel = self.panels[1] if len(self.panels) > 1 else None
+        self.active_mode = MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE
+        self.open_pre_action.setText(f"Open {self.pre_panel.label.lower()} video..." if self.pre_panel else "Open video 1...")
+        self.open_post_action.setText(f"Open {self.post_panel.label.lower()} video..." if self.post_panel else "Open video 2...")
+        self.compare_view_check.blockSignals(True)
+        self.compare_view_check.setChecked(len(self.panels) > 1)
+        self.compare_view_check.blockSignals(False)
+        self.compare_view_check.setEnabled(len(self.panels) > 1)
+        self.enhancement_progress.configure_panels([panel.label for panel in self.panels])
+        self.video_stack.setCurrentWidget(self.video_row)
+        self.results.clear()
+        if not self._apply_source_pipeline_stages():
+            self._sync_trimmed_video_window()
+        self._set_playback_limit(self.source_max_frame)
+        self.current_frame_index = -1
+        self.set_frame_index(0)
+        self.clear_plots_and_metrics()
+        self._update_stage_statuses()
+        self._set_video_controls_enabled(True)
+        if len(self.panels) == 1:
+            self.pre_card.title.setText("Residence")
+            self.post_card.title.setText("Comparison")
+            self.delta_card.title.setText("Difference")
+        else:
+            self.pre_card.title.setText("Pre residence")
+            self.post_card.title.setText("Post residence")
+            self.delta_card.title.setText("Difference")
+
+    def _select_mode_and_videos(self, mode: str) -> bool:
+        if mode == MODE_SINGLE:
+            first = self._open_video_file("Open video")
+            if first is None:
+                return False
+            self._set_video_panels([first])
+            return True
+
+        first = self._open_video_file("Open pre-deployment video")
+        if first is None:
+            return False
+        second = self._open_video_file("Open post-deployment video")
+        if second is None:
+            return False
+        self._set_video_panels([first, second])
+        return True
+
     def _build_actions(self) -> None:
-        self.open_pre_action = QAction("Open pre-deployment video...", self)
+        self.open_pre_action = QAction("Open video 1...", self)
         self.open_pre_action.triggered.connect(lambda: self.open_video(self.pre_panel))
-        self.open_post_action = QAction("Open post-deployment video...", self)
+        self.open_post_action = QAction("Open video 2...", self)
         self.open_post_action.triggered.connect(lambda: self.open_video(self.post_panel))
+        self.open_single_mode_action = QAction("Switch to single video mode...", self)
+        self.open_single_mode_action.triggered.connect(lambda: self._select_mode_and_videos(MODE_SINGLE))
+        self.open_comparison_mode_action = QAction("Switch to comparison mode...", self)
+        self.open_comparison_mode_action.triggered.connect(lambda: self._select_mode_and_videos(MODE_COMPARISON))
         self.save_config_action = QAction("Save configuration...", self)
         self.save_config_action.triggered.connect(self.save_config)
         self.load_config_action = QAction("Load configuration...", self)
@@ -2669,12 +2783,21 @@ class ContrastWindow(QMainWindow):
         file_menu.addAction(self.open_pre_action)
         file_menu.addAction(self.open_post_action)
         file_menu.addSeparator()
+        file_menu.addAction(self.open_single_mode_action)
+        file_menu.addAction(self.open_comparison_mode_action)
+        file_menu.addSeparator()
         file_menu.addAction(self.save_config_action)
         file_menu.addAction(self.load_config_action)
         file_menu.addSeparator()
         file_menu.addAction(self.export_action)
 
     def _sync_trimmed_video_window(self) -> None:
+        if not self.panels:
+            self.source_max_frame = 0
+            self.max_frame = 0
+            self.fps = 30.0
+            self.play_interval_ms = self._play_interval_ms()
+            return
         common_frame_count = min(panel.playback_frame_count for panel in self.panels)
         for panel in self.panels:
             if panel.trim_frame_count != common_frame_count:
@@ -2685,6 +2808,8 @@ class ContrastWindow(QMainWindow):
         self.play_interval_ms = self._play_interval_ms()
 
     def _apply_source_pipeline_stages(self) -> bool:
+        if not self.panels:
+            return False
         auto_crop_enabled = self._has_enabled_stage("auto_crop")
         temporal_alignment_enabled = self._has_enabled_stage("temporal_alignment")
         states = [
@@ -2708,6 +2833,8 @@ class ContrastWindow(QMainWindow):
         return True
 
     def _source_pipeline_is_current(self, auto_crop: bool, temporal_alignment: bool) -> bool:
+        if not self.panels:
+            return True
         configuration = (auto_crop, temporal_alignment)
         return all(panel.source_pipeline_configuration == configuration for panel in self.panels)
 
@@ -2753,12 +2880,38 @@ class ContrastWindow(QMainWindow):
         self.overlay_mask_check.setToolTip("Show segmentation masks over enhanced video")
         self.overlay_mask_check.toggled.connect(self.on_segmentation_overlay_toggled)
 
-        video_row = QWidget()
-        video_layout = QHBoxLayout(video_row)
-        video_layout.setContentsMargins(0, 0, 0, 0)
-        video_layout.setSpacing(14)
-        video_layout.addWidget(self.pre_panel)
-        video_layout.addWidget(self.post_panel)
+        self.video_row = QWidget()
+        self.video_layout = QHBoxLayout(self.video_row)
+        self.video_layout.setContentsMargins(0, 0, 0, 0)
+        self.video_layout.setSpacing(14)
+
+        self.mode_selection_page = QWidget()
+        mode_layout = QVBoxLayout(self.mode_selection_page)
+        mode_layout.setContentsMargins(24, 24, 24, 24)
+        mode_layout.setSpacing(14)
+        mode_layout.addStretch()
+        mode_title = QLabel("Choose how to load video")
+        mode_title.setObjectName("panelTitle")
+        mode_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        mode_hint = QLabel("Open one video for single-view processing, or load two videos for side-by-side comparison.")
+        mode_hint.setObjectName("subtleLabel")
+        mode_hint.setWordWrap(True)
+        mode_hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.single_mode_button = QPushButton("Open single video")
+        self.single_mode_button.clicked.connect(lambda: self._select_mode_and_videos(MODE_SINGLE))
+        self.comparison_mode_button = QPushButton("Open comparison videos")
+        self.comparison_mode_button.clicked.connect(lambda: self._select_mode_and_videos(MODE_COMPARISON))
+        self.single_mode_button.setObjectName("primaryButton")
+        mode_layout.addWidget(mode_title, 0, Qt.AlignmentFlag.AlignHCenter)
+        mode_layout.addWidget(mode_hint, 0, Qt.AlignmentFlag.AlignHCenter)
+        mode_layout.addWidget(self.single_mode_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        mode_layout.addWidget(self.comparison_mode_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        mode_layout.addStretch()
+
+        self.video_stack = QStackedWidget()
+        self.video_stack.addWidget(self.mode_selection_page)
+        self.video_stack.addWidget(self.video_row)
+        self.video_stack.setCurrentWidget(self.mode_selection_page)
 
         playback_row = QWidget()
         playback_layout = QHBoxLayout(playback_row)
@@ -2792,7 +2945,7 @@ class ContrastWindow(QMainWindow):
         right_layout = QVBoxLayout(right_column)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(14)
-        right_layout.addWidget(video_row, 3)
+        right_layout.addWidget(self.video_stack, 3)
         right_layout.addWidget(playback_row)
         right_layout.addWidget(plot_panel, 2)
 
@@ -3767,7 +3920,9 @@ class ContrastWindow(QMainWindow):
             """
         )
 
-    def open_video(self, panel: VideoPanel) -> None:
+    def open_video(self, panel: VideoPanel | None) -> None:
+        if panel is None:
+            return
         path, _ = QFileDialog.getOpenFileName(
             self,
             f"Open {panel.label} video",
@@ -3831,11 +3986,14 @@ class ContrastWindow(QMainWindow):
         self.timer.stop()
         self.play_button.setText("")
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        if any(panel.enhance_display for panel in self.panels):
+        if self.panels and any(panel.enhance_display for panel in self.panels):
             for panel in self.panels:
                 panel.seek(self.current_frame_index)
 
     def advance_frame(self) -> None:
+        if not self.panels:
+            self.pause()
+            return
         if self.current_frame_index >= self.max_frame:
             if self._enhancement_future is not None:
                 return
@@ -3854,6 +4012,15 @@ class ContrastWindow(QMainWindow):
         self.update_time_label()
 
     def set_frame_index(self, frame_index: int) -> None:
+        if not self.panels:
+            self.current_frame_index = 0
+            for widget in [self.frame_slider, self.frame_spin]:
+                if widget.value() != 0:
+                    widget.blockSignals(True)
+                    widget.setValue(0)
+                    widget.blockSignals(False)
+            self.update_time_label()
+            return
         frame_index = max(0, min(frame_index, self.max_frame))
         if frame_index == self.current_frame_index and self.frame_slider.value() == frame_index:
             return
@@ -3915,6 +4082,12 @@ class ContrastWindow(QMainWindow):
         roi_drawers = self._stage_drawers("roi_extraction")
         analysis_drawers = self._stage_drawers("roi_residence_analysis")
         analysis_enabled = self._has_enabled_stage("roi_residence_analysis")
+        if not self.panels:
+            for drawer in roi_drawers:
+                drawer.set_status("Load video files to run ROI extraction.", analysis_enabled)
+            for drawer in analysis_drawers:
+                drawer.set_status("Load video files to run ROI residence analysis.", analysis_enabled)
+            return
         if not self._has_enabled_stage("roi_extraction"):
             extraction_message = "Disabled. Enable this stage to extract aneurysm ROI masks from the current enhanced video."
             for drawer in roi_drawers:
@@ -3949,6 +4122,9 @@ class ContrastWindow(QMainWindow):
             drawer.set_status("Ready to analyze the current ROI masks.", False)
 
     def on_roi_changed(self) -> None:
+        if not self.panels:
+            self.statusBar().showMessage("Load a video to begin processing.")
+            return
         self.results.clear()
         self.clear_plots_and_metrics()
         self._update_stage_statuses()
@@ -3972,11 +4148,15 @@ class ContrastWindow(QMainWindow):
         self.rebuild_enhancement_pipeline()
 
     def set_display_enhancement(self, enabled: bool) -> None:
+        if not self.panels:
+            return
         for panel in self.panels:
             panel.set_enhancement(enabled, self.current_frame_index)
         self.statusBar().showMessage("Video enhancement enabled." if enabled else "Video enhancement disabled.")
 
     def on_compare_view_toggled(self, enabled: bool) -> None:
+        if len(self.panels) < 2:
+            return
         for panel in self.panels:
             panel.set_comparison(enabled, self.current_frame_index)
         if enabled:
@@ -3985,6 +4165,8 @@ class ContrastWindow(QMainWindow):
             self.statusBar().showMessage("Single-view mode enabled.")
 
     def on_segmentation_overlay_toggled(self, enabled: bool) -> None:
+        if not self.panels:
+            return
         for panel in self.panels:
             panel.set_segmentation_overlay(enabled, self.current_frame_index)
         self.statusBar().showMessage(
@@ -3996,7 +4178,7 @@ class ContrastWindow(QMainWindow):
         stages = self.enhancement_stages()
         use_deep_model = stages.denoise and active_mode != "classical"
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
-        self.overlay_mask_check.setEnabled(stages.segmentation)
+        self.overlay_mask_check.setEnabled(bool(self.panels) and stages.segmentation)
         self.denoise_strength_label.setEnabled(uses_ffdnet)
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
@@ -4224,7 +4406,7 @@ class ContrastWindow(QMainWindow):
         active_mode = str(self.enhancement_mode_combo.currentData())
         use_deep_model = stages.denoise and active_mode != "classical"
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
-        self.overlay_mask_check.setEnabled(stages.segmentation)
+        self.overlay_mask_check.setEnabled(bool(self.panels) and stages.segmentation)
         self.denoise_strength_label.setEnabled(uses_ffdnet)
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
@@ -4278,6 +4460,10 @@ class ContrastWindow(QMainWindow):
             self._start_enhancement_request(request)
 
     def _start_enhancement_request(self, request: EnhancementRequest) -> None:
+        if not self.panels:
+            self._update_stage_statuses()
+            self.statusBar().showMessage("Load a video before running pipeline stages.")
+            return
         self._enhancement_pending_request = None
         self._enhancement_active_request = request
         self._enhancement_cancel = Event()
@@ -4295,6 +4481,8 @@ class ContrastWindow(QMainWindow):
             panel.seek(self.current_frame_index)
         self.open_pre_action.setEnabled(False)
         self.open_post_action.setEnabled(False)
+        self.open_single_mode_action.setEnabled(False)
+        self.open_comparison_mode_action.setEnabled(False)
         self.load_config_action.setEnabled(False)
         self.enhancement_progress.begin("Preparing enhanced videos...")
         self.statusBar().showMessage("Enhancement is running; playback follows the frames ready in both videos.")
@@ -4307,6 +4495,8 @@ class ContrastWindow(QMainWindow):
         self.enhancement_poll_timer.start()
 
     def _run_enhancement_request(self, request: EnhancementRequest, cancel_event: Event) -> bool:
+        if not self.panels:
+            return request.source_pipeline_current and not request.stages.any_enabled
         source_stage_count = 0
 
         def calculate_source_panel(panel_index: int) -> SourcePipelineState:
@@ -4532,7 +4722,7 @@ class ContrastWindow(QMainWindow):
                 frames.append(encoded)
                 changed_panels.add(panel_index)
 
-        if changed_panels:
+        if changed_panels and self.panels:
             ready_frame = min(len(panel.enhanced_frames or []) for panel in self.panels) - 1
             self._set_playback_limit(max(0, ready_frame))
             for panel_index in changed_panels:
@@ -4570,8 +4760,9 @@ class ContrastWindow(QMainWindow):
             self._start_enhancement_request(self._enhancement_pending_request)
             return
 
-        self.open_pre_action.setEnabled(True)
-        self.open_post_action.setEnabled(True)
+        self._set_video_controls_enabled(bool(self.panels))
+        self.open_single_mode_action.setEnabled(True)
+        self.open_comparison_mode_action.setEnabled(True)
         self.load_config_action.setEnabled(True)
         self.enhancement_progress.finish()
         self.enhancement_poll_timer.stop()
@@ -4603,8 +4794,9 @@ class ContrastWindow(QMainWindow):
         if self._enhancement_cancel is not None:
             self._enhancement_cancel.set()
         else:
-            self.open_pre_action.setEnabled(True)
-            self.open_post_action.setEnabled(True)
+            self._set_video_controls_enabled(bool(self.panels))
+            self.open_single_mode_action.setEnabled(True)
+            self.open_comparison_mode_action.setEnabled(True)
             self.load_config_action.setEnabled(True)
             self.enhancement_poll_timer.stop()
         self.enhancement_progress.finish()
@@ -4618,6 +4810,8 @@ class ContrastWindow(QMainWindow):
             self.run_analysis()
 
     def run_analysis(self) -> bool:
+        if not self.panels:
+            return False
         failure = self._analysis_requirement_failure()
         if failure is not None:
             self.results.clear()
@@ -4692,13 +4886,14 @@ class ContrastWindow(QMainWindow):
         self.normalized_plot.clear()
         self.raw_plot.clear()
         pens = {
-            "Pre-deployment": pg.mkPen("#38bdf8", width=2.5),
-            "Post-deployment": pg.mkPen("#f97316", width=2.5),
+            panel.label: pg.mkPen(panel.color.name(), width=2.5)
+            for panel in self.panels
         }
         threshold = self.threshold_spin.value()
         for label, result in self.results.items():
-            self.normalized_plot.plot(result.time, result.normalized_signal, pen=pens[label], name=label)
-            self.raw_plot.plot(result.time, result.mean_intensity, pen=pens[label], name=label)
+            pen = pens.get(label, pg.mkPen("#cbd5e1", width=2.5))
+            self.normalized_plot.plot(result.time, result.normalized_signal, pen=pen, name=label)
+            self.raw_plot.plot(result.time, result.mean_intensity, pen=pen, name=label)
 
         if self.results:
             max_time = max(result.time[-1] for result in self.results.values() if len(result.time))
@@ -4709,6 +4904,8 @@ class ContrastWindow(QMainWindow):
 
         pre = self.results.get("Pre-deployment")
         post = self.results.get("Post-deployment")
+        if pre is None and self.panels:
+            pre = self.results.get(self.panels[0].label)
         if pre:
             self.pre_card.set_metric(format_seconds(pre.residence_time), self._metric_detail(pre))
         if post:
@@ -4779,11 +4976,12 @@ class ContrastWindow(QMainWindow):
         return values
 
     def _config_data(self) -> dict[str, object]:
+        mode = MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE
         return {
             "version": CONFIG_VERSION,
             "videos": {
-                "pre_deployment": str(self.pre_panel.path),
-                "post_deployment": str(self.post_panel.path),
+                "mode": mode,
+                "paths": [str(panel.path) for panel in self.panels],
             },
             "pipeline": [
                 {
@@ -4822,16 +5020,29 @@ class ContrastWindow(QMainWindow):
             finally:
                 widget.blockSignals(False)
 
-    def _validate_config_data(self, config: object) -> tuple[dict[str, object], Path, Path]:
+    def _validate_config_data(self, config: object) -> tuple[dict[str, object], list[Path]]:
         if not isinstance(config, dict) or config.get("version") != CONFIG_VERSION:
             raise ValueError(f"Unsupported configuration version. Expected version {CONFIG_VERSION}.")
         videos = config.get("videos")
         pipeline = config.get("pipeline")
         if not isinstance(videos, dict) or not isinstance(pipeline, list):
             raise ValueError("Configuration must include videos and pipeline sections.")
-        pre_path = Path(str(videos.get("pre_deployment", ""))).expanduser()
-        post_path = Path(str(videos.get("post_deployment", ""))).expanduser()
-        missing = [str(path) for path in (pre_path, post_path) if not path.is_file()]
+
+        video_paths: list[Path]
+        if "paths" in videos:
+            raw_paths = videos.get("paths")
+            if not isinstance(raw_paths, list):
+                raise ValueError("Configured video paths must be a list.")
+            video_paths = [Path(str(path)).expanduser() for path in raw_paths]
+        else:
+            # Backward compatibility for older two-video config shape.
+            pre_path = Path(str(videos.get("pre_deployment", ""))).expanduser()
+            post_path = Path(str(videos.get("post_deployment", ""))).expanduser()
+            video_paths = [pre_path, post_path]
+
+        if len(video_paths) not in (0, 1, 2):
+            raise ValueError("Configuration must include zero, one, or two videos.")
+        missing = [str(path) for path in video_paths if not path.is_file()]
         if missing:
             raise ValueError("Configured video files are unavailable: " + ", ".join(missing))
         for stage in pipeline:
@@ -4842,7 +5053,7 @@ class ContrastWindow(QMainWindow):
             controls = stage.get("controls", {})
             if not isinstance(controls, dict):
                 raise ValueError("Pipeline stage controls must be an object.")
-        return config, pre_path, post_path
+        return config, video_paths
 
     def _remember_recent_config(self, path: Path) -> None:
         CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -4862,6 +5073,9 @@ class ContrastWindow(QMainWindow):
         return max(configs, key=lambda path: path.stat().st_mtime, default=None)
 
     def save_config(self) -> None:
+        if not self.panels:
+            self.statusBar().showMessage("Load video files before saving a configuration.")
+            return
         CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -4894,8 +5108,8 @@ class ContrastWindow(QMainWindow):
     def _load_config_file(self, path: Path, show_error: bool = True) -> bool:
         try:
             config = json.loads(path.read_text())
-            config, pre_path, post_path = self._validate_config_data(config)
-            self._apply_config(config, pre_path, post_path)
+            config, video_paths = self._validate_config_data(config)
+            self._apply_config(config, video_paths)
             self._remember_recent_config(path)
         except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
             if show_error:
@@ -4904,12 +5118,11 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded configuration from {path}")
         return True
 
-    def _apply_config(self, config: dict[str, object], pre_path: Path, post_path: Path) -> None:
+    def _apply_config(self, config: dict[str, object], video_paths: list[Path]) -> None:
         self.pause()
         self._loading_config = True
         try:
-            self.pre_panel.set_video(pre_path)
-            self.post_panel.set_video(post_path)
+            self._set_video_panels(video_paths)
             for drawer in self.pipeline_stage_drawers:
                 self.enhancement_layout.removeWidget(drawer)
                 drawer.hide()
@@ -4954,6 +5167,7 @@ class ContrastWindow(QMainWindow):
     def prompt_load_most_recent_config(self) -> None:
         path = self._most_recent_config_path()
         if path is None:
+            self.video_stack.setCurrentWidget(self.mode_selection_page)
             return
         answer = QMessageBox.question(
             self,
@@ -4963,14 +5177,16 @@ class ContrastWindow(QMainWindow):
             QMessageBox.StandardButton.Yes,
         )
         if answer == QMessageBox.StandardButton.Yes:
-            self._load_config_file(path)
+            if self._load_config_file(path):
+                return
+        self.video_stack.setCurrentWidget(self.mode_selection_page)
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self.enhancement_poll_timer.stop()
         if self._enhancement_cancel is not None:
             self._enhancement_cancel.set()
         self._enhancement_executor.shutdown(wait=True, cancel_futures=True)
-        for panel in self.panels:
+        for panel in list(self.panels):
             panel.close()
         for denoiser in self.deep_denoisers.values():
             close = getattr(denoiser, "close", None)
