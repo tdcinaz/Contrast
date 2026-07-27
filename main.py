@@ -2553,6 +2553,7 @@ class StageDrawer(QFrame):
         ):
             if not self._is_dragging:
                 self._is_dragging = True
+                self.grabMouse()
                 self.grab_handle.setCursor(Qt.CursorShape.ClosedHandCursor)
                 self.dragStarted.emit(self, event.globalPosition().toPoint())
             self.dragMoved.emit(event.globalPosition().toPoint())
@@ -2563,6 +2564,7 @@ class StageDrawer(QFrame):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._is_dragging:
             self.dragFinished.emit(event.globalPosition().toPoint())
+            self.releaseMouse()
             self._is_dragging = False
         self._drag_from_handle = False
         self.grab_handle.setCursor(Qt.CursorShape.OpenHandCursor if self._drag_enabled else Qt.CursorShape.ArrowCursor)
@@ -4125,29 +4127,26 @@ class ContrastWindow(QMainWindow):
 
         parent = self.enhancement_layout.parentWidget()
         cursor_y = parent.mapFromGlobal(global_position).y()
-        movable_drawers = [
-            stage_drawer
-            for stage_drawer in order
-            if stage_drawer is not drawer and not self._is_fixed_pipeline_stage(stage_drawer)
-        ]
-        if not movable_drawers:
+        other_drawers = [item for item in order if item is not drawer]
+        if not other_drawers:
             return
 
-        other_drawers = [item for item in order if item is not drawer]
-        top = min(item.geometry().top() for item in other_drawers)
-        bottom = max(item.geometry().bottom() for item in other_drawers) - drawer.height()
+        clamp_widgets: list[QWidget] = [*other_drawers, placeholder]
+        top = min(item.geometry().top() for item in clamp_widgets)
+        bottom = max(item.geometry().bottom() for item in clamp_widgets) - drawer.height()
         drawer.move(self._stage_drag_x, max(top, min(cursor_y - self._stage_drag_offset_y, bottom)))
 
-        target = min(movable_drawers, key=lambda item: abs(item.geometry().center().y() - cursor_y))
         source_index = order.index(drawer)
-        target_index = order.index(target)
-        insertion_index = target_index + int(cursor_y > target.geometry().center().y())
+        insertion_index = len(other_drawers)
+        for index, item in enumerate(other_drawers):
+            if cursor_y < item.geometry().center().y():
+                insertion_index = index
+                break
+
         order.pop(source_index)
-        if source_index < insertion_index:
-            insertion_index -= 1
         order.insert(insertion_index, drawer)
 
-        next_drawer = next((item for item in order[insertion_index + 1 :] if item is not drawer), self.add_stage_button)
+        next_drawer = order[insertion_index + 1] if insertion_index < len(order) - 1 else self.add_stage_button
         self.enhancement_layout.removeWidget(placeholder)
         self.enhancement_layout.insertWidget(self.enhancement_layout.indexOf(next_drawer), placeholder)
 
