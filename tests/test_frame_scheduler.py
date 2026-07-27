@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread, current_thread
 from unittest.mock import patch
 
-from frame_scheduler import AdaptiveFrameExecutor, default_worker_count
+from frame_scheduler import AdaptiveFrameExecutor, default_worker_count, performance_cpu_ids
 
 
 class AdaptiveFrameExecutorTests(unittest.TestCase):
@@ -56,12 +58,18 @@ class AdaptiveFrameExecutorTests(unittest.TestCase):
             self.assertTrue(second_submitted.wait(2.0))
             submitter.join()
 
-    def test_default_uses_half_available_parallelism(self) -> None:
-        with patch.dict(os.environ, {}, clear=True), patch(
-            "frame_scheduler.available_parallelism",
-            return_value=20,
-        ):
+    def test_default_uses_performance_cpu_tier(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch("frame_scheduler.performance_cpu_ids", return_value=tuple(range(10))):
             self.assertEqual(default_worker_count(), 10)
+
+    def test_selects_highest_frequency_cpu_tier(self) -> None:
+        with TemporaryDirectory() as directory, patch("frame_scheduler.available_cpu_ids", return_value=(0, 1, 2, 3)):
+            root = Path(directory)
+            for cpu_id, frequency in enumerate((2_800_000, 3_900_000, 2_800_000, 3_900_000)):
+                frequency_path = root / f"cpu{cpu_id}" / "cpufreq" / "cpuinfo_max_freq"
+                frequency_path.parent.mkdir(parents=True)
+                frequency_path.write_text(str(frequency))
+            self.assertEqual(performance_cpu_ids(root), (1, 3))
 
     def test_environment_override_and_invalid_limits(self) -> None:
         with patch.dict(os.environ, {"CONTRAST_FRAME_WORKERS": "3"}):

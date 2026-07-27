@@ -8,7 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from queue import Empty, SimpleQueue
+from queue import Empty, Full, Queue, SimpleQueue
 from threading import Event, Lock
 from time import perf_counter
 from typing import Callable, Generator, Protocol, cast
@@ -899,23 +899,42 @@ class VideoPanel(QFrame):
                 return False
             return True
 
-        queues = [SimpleQueue[object]() for _ in range(len(missing_stages) + 1)]
+        queues = [Queue[object](maxsize=frame_executor.max_pending) for _ in range(len(missing_stages) + 1)]
         source_output: list[np.ndarray] = []
         stage_outputs: list[list[np.ndarray]] = [[] for _ in missing_stages]
         encoded_frames: list[np.ndarray] = []
 
+        def enqueue(queue: Queue[object], item: object) -> bool:
+            while not cancelled.is_set():
+                try:
+                    queue.put(item, timeout=0.05)
+                    return True
+                except Full:
+                    continue
+            return False
+
+        def close_queue(queue: Queue[object]) -> None:
+            if cancelled.is_set():
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except Empty:
+                        break
+                queue.put_nowait(STREAM_END)
+                return
+            enqueue(queue, STREAM_END)
+
         def produce_frames() -> None:
             if not source_missing:
                 for index, frame in enumerate(self.stage_frame_cache[start_prefix]):
-                    if cancelled.is_set():
+                    if not enqueue(queues[0], (index, frame)):
                         break
-                    queues[0].put((index, frame))
-                queues[0].put(STREAM_END)
+                close_queue(queues[0])
                 return
 
             capture = cv2.VideoCapture(str(self.path))
             if not capture.isOpened():
-                queues[0].put(STREAM_END)
+                close_queue(queues[0])
                 raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
             active_seconds = 0.0
             try:
@@ -929,7 +948,8 @@ class VideoPanel(QFrame):
                     gray = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
                     active_seconds += perf_counter() - started_at
                     source_output.append(gray)
-                    queues[0].put((index, gray))
+                    if not enqueue(queues[0], (index, gray)):
+                        break
                     if not report_frame(0, "Decode source frames", index + 1):
                         break
             except Exception:
@@ -937,7 +957,7 @@ class VideoPanel(QFrame):
                 raise
             finally:
                 capture.release()
-                queues[0].put(STREAM_END)
+                close_queue(queues[0])
                 if not cancelled.is_set():
                     self._record_stage_duration(self._source_stage_token(), active_seconds, frame_count)
 
@@ -955,8 +975,11 @@ class VideoPanel(QFrame):
             pending_frames: deque[tuple[int, Future[tuple[np.ndarray, float]]]] = deque()
 
             def emit(frame_index: int, frame: np.ndarray) -> bool:
+                if cancelled.is_set():
+                    return False
                 output.append(frame)
-                output_queue.put((frame_index, frame))
+                if not enqueue(output_queue, (frame_index, frame)):
+                    return False
                 return report_frame(work_index, stage_name, len(output))
 
             def apply_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
@@ -1081,7 +1104,7 @@ class VideoPanel(QFrame):
                 cancelled.set()
                 raise
             finally:
-                output_queue.put(STREAM_END)
+                close_queue(output_queue)
                 if not cancelled.is_set():
                     self._record_stage_duration(token, active_seconds, frame_count)
 
@@ -2202,59 +2225,79 @@ class ContrastWindow(QMainWindow):
 
     def _run_enhancement_request(self, request: EnhancementRequest, cancel_event: Event) -> bool:
         use_deep_model = request.stages.denoise and request.mode != "classical"
-        denoiser: FrameDenoiser | None = None
-        active_denoiser_key = (
+        denoiser_base_key = (
             f"{request.mode}:{request.precision}:batch{request.batch_size}"
             if use_deep_model
             else ""
         )
+        denoiser_count = len(self.panels) if request.mode.endswith("-ngc") and use_deep_model else int(use_deep_model)
+        active_denoiser_keys = {
+            f"{denoiser_base_key}:worker{worker_index}"
+            for worker_index in range(denoiser_count)
+        }
         for key, inactive_denoiser in list(self.deep_denoisers.items()):
-            if key == active_denoiser_key:
+            if key in active_denoiser_keys:
                 continue
             close = getattr(inactive_denoiser, "close", None)
             if close is not None:
                 close()
             del self.deep_denoisers[key]
+
+        denoisers: list[FrameDenoiser] = []
         if use_deep_model:
-            denoiser_key = active_denoiser_key
-            if denoiser_key not in self.deep_denoisers:
-                with self._enhancement_progress_lock:
-                    self._enhancement_message = f"Loading {request.model_label}..."
-                if request.mode.endswith("-ngc"):
-                    from container_denoiser import ContainerDenoiser
+            for worker_index in range(denoiser_count):
+                denoiser_key = f"{denoiser_base_key}:worker{worker_index}"
+                if denoiser_key not in self.deep_denoisers:
+                    with self._enhancement_progress_lock:
+                        worker_label = f" worker {worker_index + 1}/{denoiser_count}" if denoiser_count > 1 else ""
+                        self._enhancement_message = f"Loading {request.model_label}{worker_label}..."
+                    if request.mode.endswith("-ngc"):
+                        from container_denoiser import ContainerDenoiser
 
-                    model_name = request.mode.removesuffix("-ngc")
-                    weights_name = "ffdnet_gray.pth" if model_name == "ffdnet" else f"{model_name.replace('-', '_')}.pth"
-                    self.deep_denoisers[denoiser_key] = ContainerDenoiser(
-                        model_name,
-                        ROOT / "models" / weights_name,
-                        request.batch_size,
-                        request.precision,
-                    )
-                else:
-                    from deep_denoiser import FFDNetDenoiser
+                        model_name = request.mode.removesuffix("-ngc")
+                        weights_name = (
+                            "ffdnet_gray.pth"
+                            if model_name == "ffdnet"
+                            else f"{model_name.replace('-', '_')}.pth"
+                        )
+                        self.deep_denoisers[denoiser_key] = ContainerDenoiser(
+                            model_name,
+                            ROOT / "models" / weights_name,
+                            request.batch_size,
+                            request.precision,
+                        )
+                    else:
+                        from deep_denoiser import FFDNetDenoiser
 
-                    self.deep_denoisers[denoiser_key] = FFDNetDenoiser(
-                        ROOT / "models" / "ffdnet_gray.pth",
-                        request.precision,
-                    )
-            denoiser = self.deep_denoisers[denoiser_key]
+                        self.deep_denoisers[denoiser_key] = FFDNetDenoiser(
+                            ROOT / "models" / "ffdnet_gray.pth",
+                            request.precision,
+                        )
+                denoisers.append(self.deep_denoisers[denoiser_key])
 
         if cancel_event.is_set():
             return False
-        backend_id = denoiser.backend_id if denoiser is not None else "classical"
+        backend_id = denoisers[0].backend_id if denoisers else "classical"
         panel_work = [
             panel.estimate_prepare_work(backend_id, request.noise_sigma, request.stages, request.parameters)
             for panel in self.panels
         ]
         with self._enhancement_progress_lock:
             self._enhancement_progress_totals = [max(work, 0.001) for work in panel_work]
-            if denoiser is not None:
-                self._enhancement_message = f"Running {request.model_label} on {denoiser.device_name}..."
+            if denoisers:
+                worker_label = f" with {len(denoisers)} accelerator workers" if len(denoisers) > 1 else ""
+                self._enhancement_message = (
+                    f"Running {request.model_label} on {denoisers[0].device_name}{worker_label}..."
+                )
             else:
                 self._enhancement_message = "Running classical video enhancement..."
 
-        worker_denoiser = SynchronizedFrameDenoiser(denoiser) if denoiser is not None else None
+        if len(denoisers) == 1:
+            panel_denoisers: list[FrameDenoiser | None] = [SynchronizedFrameDenoiser(denoisers[0])] * len(self.panels)
+        elif denoisers:
+            panel_denoisers = list(denoisers)
+        else:
+            panel_denoisers = [None] * len(self.panels)
 
         def prepare_panel(panel_index: int, frame_executor: AdaptiveFrameExecutor) -> bool:
             panel = self.panels[panel_index]
@@ -2274,7 +2317,7 @@ class ContrastWindow(QMainWindow):
                 self._enhancement_frame_events.put((request.generation, panel_index, frame_index, encoded))
 
             prepared = panel.prepare_enhanced_frames(
-                worker_denoiser,
+                panel_denoisers[panel_index],
                 request.noise_sigma,
                 request.batch_size,
                 request.stages,

@@ -5,6 +5,8 @@ import hashlib
 import os
 import sys
 import urllib.request
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -109,6 +111,73 @@ def _validate_precision(precision: str) -> None:
         raise ValueError(f"Unsupported inference precision: {precision}")
 
 
+@dataclass(slots=True)
+class _CudaGraphState:
+    graph: torch.cuda.CUDAGraph
+    image: torch.Tensor
+    sigma: torch.Tensor | None
+    output: torch.Tensor
+
+
+class _CudaGraphRunner:
+    def __init__(self, model: nn.Module, precision: str, uses_sigma: bool) -> None:
+        self.model = model
+        self.precision = precision
+        self.uses_sigma = uses_sigma
+        self.enabled = os.environ.get("CONTRAST_CUDA_GRAPHS", "1") != "0"
+        self._graphs: OrderedDict[tuple[int, ...], _CudaGraphState] = OrderedDict()
+        self._graph_limit = 8
+
+    def _forward(self, image: torch.Tensor, sigma: torch.Tensor | None) -> torch.Tensor:
+        with torch.inference_mode(), torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=self.precision == "fp16",
+        ):
+            if self.uses_sigma:
+                assert sigma is not None
+                return self.model(image, sigma)
+            return self.model(image)
+
+    def _capture(self, image: torch.Tensor, sigma: torch.Tensor | None) -> _CudaGraphState:
+        static_image = torch.empty_like(image)
+        static_image.copy_(image)
+        static_sigma = torch.empty_like(sigma) if sigma is not None else None
+        if static_sigma is not None and sigma is not None:
+            static_sigma.copy_(sigma)
+
+        current_stream = torch.cuda.current_stream()
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(2):
+                self._forward(static_image, static_sigma)
+        current_stream.wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = self._forward(static_image, static_sigma)
+        return _CudaGraphState(graph, static_image, static_sigma, output)
+
+    def run(self, image: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
+        key = tuple(image.shape)
+        if not self.enabled:
+            return self._forward(image, sigma)
+        state = self._graphs.get(key)
+        if state is None:
+            state = self._capture(image, sigma)
+            if len(self._graphs) >= self._graph_limit:
+                self._graphs.popitem(last=False)
+            self._graphs[key] = state
+        else:
+            self._graphs.move_to_end(key)
+        state.image.copy_(image)
+        if state.sigma is not None and sigma is not None:
+            state.sigma.copy_(sigma)
+        state.graph.replay()
+        return state.output
+
+
 class FFDNetDenoiser:
     def __init__(self, weights_path: Path, precision: str = "fp16") -> None:
         if not torch.cuda.is_available():
@@ -124,6 +193,7 @@ class FFDNetDenoiser:
         self.model.load_state_dict(state, strict=True)
         self.model.eval().to(self.device, memory_format=torch.channels_last)
         torch.backends.cudnn.benchmark = True
+        self._runner = _CudaGraphRunner(self.model, precision, uses_sigma=True)
 
     @property
     def device_name(self) -> str:
@@ -135,7 +205,12 @@ class FFDNetDenoiser:
     def denoise_batch(self, images: list[np.ndarray], noise_sigma: float) -> list[np.ndarray]:
         if not images:
             return []
-        tensor = torch.from_numpy(np.stack(images, axis=0)).to(
+        return self.denoise_array(np.stack(images, axis=0), noise_sigma)
+
+    def denoise_array(self, images: np.ndarray, noise_sigma: float) -> list[np.ndarray]:
+        if images.ndim != 3 or images.dtype != np.uint8:
+            raise ValueError("FFDNet requires a uint8 grayscale frame batch.")
+        tensor = torch.from_numpy(images).to(
             self.device,
             dtype=torch.float32,
             non_blocking=True,
@@ -147,13 +222,8 @@ class FFDNetDenoiser:
             device=self.device,
         )
 
-        with torch.inference_mode(), torch.autocast(
-            device_type="cuda",
-            dtype=torch.float16,
-            enabled=self.precision == "fp16",
-        ):
-            output = self.model(tensor, sigma)
-            output = (output.squeeze(1).clamp(0, 1) * 255).to(torch.uint8)
+        output = self._runner.run(tensor, sigma)
+        output = (output.squeeze(1).clamp(0, 1) * 255).to(torch.uint8)
         return list(output.cpu().numpy())
 
 
@@ -176,6 +246,7 @@ class DnCNNDenoiser:
         self.model.load_state_dict(state, strict=True)
         self.model.eval().to(self.device, memory_format=torch.channels_last)
         torch.backends.cudnn.benchmark = True
+        self._runner = _CudaGraphRunner(self.model, precision, uses_sigma=False)
 
     @property
     def device_name(self) -> str:
@@ -187,17 +258,17 @@ class DnCNNDenoiser:
     def denoise_batch(self, images: list[np.ndarray], noise_sigma: float = 0.0) -> list[np.ndarray]:
         if not images:
             return []
-        tensor = torch.from_numpy(np.stack(images, axis=0)).to(
+        return self.denoise_array(np.stack(images, axis=0), noise_sigma)
+
+    def denoise_array(self, images: np.ndarray, noise_sigma: float = 0.0) -> list[np.ndarray]:
+        if images.ndim != 3 or images.dtype != np.uint8:
+            raise ValueError("DnCNN requires a uint8 grayscale frame batch.")
+        tensor = torch.from_numpy(images).to(
             self.device,
             dtype=torch.float32,
             non_blocking=True,
         )
         tensor = tensor.unsqueeze(1).div_(255.0).contiguous(memory_format=torch.channels_last)
-        with torch.inference_mode(), torch.autocast(
-            device_type="cuda",
-            dtype=torch.float16,
-            enabled=self.precision == "fp16",
-        ):
-            output = self.model(tensor)
-            output = (output.squeeze(1).clamp(0, 1) * 255).to(torch.uint8)
+        output = self._runner.run(tensor)
+        output = (output.squeeze(1).clamp(0, 1) * 255).to(torch.uint8)
         return list(output.cpu().numpy())

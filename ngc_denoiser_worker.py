@@ -38,17 +38,14 @@ def main() -> None:
             if command == "setup":
                 shape = tuple(int(value) for value in request["shape"])
                 capacity = int(request["capacity"])
-                input_frames = np.memmap(request["input"], mode="r", dtype=np.uint8, shape=(capacity, *shape))
+                input_frames = np.memmap(request["input"], mode="r+", dtype=np.uint8, shape=(capacity, *shape))
                 output_frames = np.memmap(request["output"], mode="r+", dtype=np.uint8, shape=(capacity, *shape))
                 respond({"status": "ok"})
             elif command == "denoise":
                 if input_frames is None or output_frames is None:
                     raise RuntimeError("Shared frame buffers have not been configured.")
                 count = int(request["count"])
-                results = denoiser.denoise_batch(
-                    [input_frames[index] for index in range(count)],
-                    float(request["sigma"]),
-                )
+                results = denoiser.denoise_array(input_frames[:count], float(request["sigma"]))
                 output_frames[:count] = results
                 respond({"status": "ok"})
             elif command == "close":
