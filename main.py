@@ -108,6 +108,7 @@ class VideoInfo:
 @dataclass(frozen=True, slots=True)
 class EnhancementStages:
     gain_stabilization: bool = False
+    brightness_stabilization: bool = False
     scanline_correction: bool = False
     denoise: bool = False
     temporal_filter: bool = False
@@ -116,6 +117,7 @@ class EnhancementStages:
     final_smoothing: bool = False
     segmentation: bool = False
     stage_order: tuple[str, ...] = (
+        "brightness_stabilization",
         "gain_stabilization",
         "scanline_correction",
         "denoise",
@@ -131,6 +133,7 @@ class EnhancementStages:
         return any(
             (
                 self.gain_stabilization,
+                self.brightness_stabilization,
                 self.scanline_correction,
                 self.denoise,
                 self.temporal_filter,
@@ -440,6 +443,76 @@ def stabilize_frame_gain(gray: np.ndarray, target_median: float, min_gain: float
     current_median = max(1.0, float(np.median(gray)))
     gain = float(np.clip(target_median / current_median, min_gain, max_gain))
     return np.clip(gray.astype(np.float32) * gain, 0, 255)
+
+
+def _fit_robust_intensity_map(current: np.ndarray, reference: np.ndarray) -> tuple[float, float]:
+    current_values = current.astype(np.float64, copy=False).ravel()
+    reference_values = reference.astype(np.float64, copy=False).ravel()
+    keep = np.isfinite(current_values) & np.isfinite(reference_values)
+    gain = 1.0
+    offset = 0.0
+
+    for _ in range(4):
+        kept_current = current_values[keep]
+        kept_reference = reference_values[keep]
+        if kept_current.size < 24:
+            break
+        current_center = float(np.mean(kept_current))
+        reference_center = float(np.mean(kept_reference))
+        centered_current = kept_current - current_center
+        denominator = float(np.dot(centered_current, centered_current))
+        if denominator < 1e-6:
+            gain = 1.0
+            offset = float(np.median(kept_reference - kept_current))
+            break
+        gain = float(np.dot(centered_current, kept_reference - reference_center) / denominator)
+        offset = reference_center - gain * current_center
+        residual = reference_values - (gain * current_values + offset)
+        residual_center = float(np.median(residual[keep]))
+        residual_scale = 1.4826 * float(np.median(np.abs(residual[keep] - residual_center))) + 0.5
+        next_keep = np.abs(residual - residual_center) <= 2.8 * residual_scale
+        if int(np.count_nonzero(next_keep)) < 24:
+            break
+        keep = next_keep
+
+    clipped_gain = float(np.clip(gain, 0.75, 1.33))
+    if clipped_gain != gain:
+        offset = float(np.median(reference_values[keep] - clipped_gain * current_values[keep]))
+    return clipped_gain, float(np.clip(offset, -48.0, 48.0))
+
+
+def estimate_intensity_corrections(
+    gray_frames: list[np.ndarray],
+    analysis_size: int = 192,
+    quantile_count: int = 48,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not gray_frames:
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+    frame_height, frame_width = gray_frames[0].shape
+    scale = min(1.0, float(analysis_size) / max(frame_height, frame_width))
+    analysis_width = max(16, int(round(frame_width * scale)))
+    analysis_height = max(16, int(round(frame_height * scale)))
+    percentiles = np.linspace(70.0, 98.0, num=max(24, quantile_count), dtype=np.float32)
+    frame_quantiles = np.empty((len(gray_frames), percentiles.size), dtype=np.float32)
+    for index, frame in enumerate(gray_frames):
+        analysis_frame = cv2.resize(frame, (analysis_width, analysis_height), interpolation=cv2.INTER_AREA)
+        frame_quantiles[index] = np.percentile(analysis_frame, percentiles)
+
+    reference_quantiles = np.median(frame_quantiles, axis=0)
+    gains = np.empty(len(gray_frames), dtype=np.float32)
+    offsets = np.empty(len(gray_frames), dtype=np.float32)
+    for index, current_quantiles in enumerate(frame_quantiles):
+        gains[index], offsets[index] = _fit_robust_intensity_map(
+            current_quantiles,
+            reference_quantiles,
+        )
+    return gains, offsets
+
+
+def stabilize_frame_intensity(gray: np.ndarray, gain: float, offset: float) -> np.ndarray:
+    stabilized = gray.astype(np.float32) * float(gain) + float(offset)
+    return np.clip(stabilized, 0, 255).astype(np.uint8)
 
 
 def correct_scanlines(gray: np.ndarray, bias_clip: float, sigma_y: float) -> np.ndarray:
@@ -952,6 +1025,8 @@ class VideoPanel(QFrame):
                     round(float(parameters.gain_max), 4),
                 ),
             )
+        if stage_key == "brightness_stabilization":
+            return (stage_key, tuple())
         if stage_key == "scanline_correction":
             return (
                 stage_key,
@@ -1041,6 +1116,8 @@ class VideoPanel(QFrame):
             return 0.0025
         if stage_key == "gain_stabilization":
             return 0.0012
+        if stage_key == "brightness_stabilization":
+            return 0.0020
         if stage_key == "scanline_correction":
             return 0.0025
         if stage_key == "denoise":
@@ -1066,6 +1143,8 @@ class VideoPanel(QFrame):
             return 0.0035
         if stage_key == "gain_stabilization":
             return 0.0018
+        if stage_key == "brightness_stabilization":
+            return 0.0030
         if stage_key == "scanline_correction":
             return 0.0035
         if stage_key == "denoise":
@@ -1125,7 +1204,8 @@ class VideoPanel(QFrame):
 
     def _stage_display_name(self, stage_key: str) -> str:
         names = {
-            "gain_stabilization": "Gain stabilization",
+            "gain_stabilization": "Median gain normalization",
+            "brightness_stabilization": "Gain / brightness stabilization",
             "scanline_correction": "Scanline correction",
             "denoise": "Spatial denoising",
             "temporal_filter": "Motion-aware temporal filtering",
@@ -1458,6 +1538,49 @@ class VideoPanel(QFrame):
                         batch.append(cast(tuple[int, np.ndarray], item))
                         if len(batch) >= batch_size:
                             flush_batch()
+                elif stage_key == "brightness_stabilization":
+                    stage_frames: list[tuple[int, np.ndarray]] = []
+                    while True:
+                        item = input_queue.get()
+                        if item is STREAM_END:
+                            break
+                        if cancelled.is_set():
+                            continue
+                        stage_frames.append(cast(tuple[int, np.ndarray], item))
+
+                    if stage_frames and not cancelled.is_set():
+                        frames_only = [frame for _, frame in stage_frames]
+                        estimate_started_at = perf_counter()
+                        gains, offsets = estimate_intensity_corrections(frames_only)
+                        active_seconds += perf_counter() - estimate_started_at
+
+                        pending_stabilized: deque[tuple[int, Future[tuple[np.ndarray, float]]]] = deque()
+
+                        def stabilize_frame(frame: np.ndarray, gain: float, offset: float) -> tuple[np.ndarray, float]:
+                            started_at = perf_counter()
+                            stabilized = stabilize_frame_intensity(frame, gain, offset)
+                            return stabilized, perf_counter() - started_at
+
+                        for (frame_index, frame), gain, offset in zip(stage_frames, gains, offsets):
+                            pending_stabilized.append(
+                                (
+                                    frame_index,
+                                    frame_executor.submit(stabilize_frame, frame, float(gain), float(offset)),
+                                )
+                            )
+                            if len(pending_stabilized) >= frame_executor.max_workers:
+                                frame_number, future = pending_stabilized.popleft()
+                                transformed, duration = future.result()
+                                active_seconds += duration
+                                if cancelled.is_set() or not emit(frame_number, transformed):
+                                    break
+
+                        while pending_stabilized and not cancelled.is_set():
+                            frame_number, future = pending_stabilized.popleft()
+                            transformed, duration = future.result()
+                            active_seconds += duration
+                            if not emit(frame_number, transformed):
+                                break
                 elif stage_key == "segmentation":
                     encoded_masks = segmentation_outputs.setdefault(stage_prefix, [])
                     segmentation_mode = str(parameters.segmentation_mode)
@@ -2081,19 +2204,25 @@ class ContrastWindow(QMainWindow):
         pipeline_label.setObjectName("pipelineLabel")
         enhancement_layout.addWidget(pipeline_label)
         self.enhancement_layout = enhancement_layout
-        self.gain_stage_drawer = StageDrawer("gain_stabilization", "Gain stabilization", 1)
-        self.scanline_stage_drawer = StageDrawer("scanline_correction", "Scanline correction", 2)
-        self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 3)
-        self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 4)
-        self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 5)
-        self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 6)
-        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 7)
+        self.brightness_stage_drawer = StageDrawer(
+            "brightness_stabilization",
+            "Gain / brightness stabilization",
+            1,
+        )
+        self.gain_stage_drawer = StageDrawer("gain_stabilization", "Median gain normalization", 2)
+        self.scanline_stage_drawer = StageDrawer("scanline_correction", "Scanline correction", 3)
+        self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 4)
+        self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 5)
+        self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 6)
+        self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 7)
+        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 8)
         self.segmentation_stage_drawer = StageDrawer(
             "segmentation",
             "Brightness-coded contrast segmentation",
-            8,
+            9,
         )
         self.gain_stage_check = self.gain_stage_drawer.enable_check
+        self.brightness_stage_check = self.brightness_stage_drawer.enable_check
         self.scanline_stage_check = self.scanline_stage_drawer.enable_check
         self.denoise_stage_check = self.denoise_stage_drawer.enable_check
         self.temporal_stage_check = self.temporal_stage_drawer.enable_check
@@ -2102,6 +2231,7 @@ class ContrastWindow(QMainWindow):
         self.smoothing_stage_check = self.smoothing_stage_drawer.enable_check
         self.segmentation_stage_check = self.segmentation_stage_drawer.enable_check
         self.pipeline_stage_checks = [
+            self.brightness_stage_check,
             self.gain_stage_check,
             self.scanline_stage_check,
             self.denoise_stage_check,
@@ -2112,6 +2242,7 @@ class ContrastWindow(QMainWindow):
             self.segmentation_stage_check,
         ]
         self.pipeline_stage_drawers = [
+            self.brightness_stage_drawer,
             self.gain_stage_drawer,
             self.scanline_stage_drawer,
             self.denoise_stage_drawer,
@@ -2283,6 +2414,13 @@ class ContrastWindow(QMainWindow):
         gain_bounds_row.addWidget(self.gain_min_spin)
         gain_bounds_row.addWidget(self.gain_max_spin)
         self.gain_stage_drawer.content_layout.addLayout(gain_bounds_row)
+
+        brightness_hint = QLabel(
+            "Corrects frame-wide gain and brightness jitter from robust, temporally stable image probes."
+        )
+        brightness_hint.setObjectName("subtleLabel")
+        brightness_hint.setWordWrap(True)
+        self.brightness_stage_drawer.content_layout.addWidget(brightness_hint)
 
         scanline_clip_row = QHBoxLayout()
         scanline_clip_row.addWidget(QLabel("Row bias clip"))
@@ -2712,6 +2850,7 @@ class ContrastWindow(QMainWindow):
     def enhancement_stages(self) -> EnhancementStages:
         return EnhancementStages(
             gain_stabilization=self.gain_stage_check.isChecked(),
+            brightness_stabilization=self.brightness_stage_check.isChecked(),
             scanline_correction=self.scanline_stage_check.isChecked(),
             denoise=self.denoise_stage_check.isChecked(),
             temporal_filter=self.temporal_stage_check.isChecked(),
@@ -2725,7 +2864,7 @@ class ContrastWindow(QMainWindow):
     def _move_pipeline_stage(self, drawer: StageDrawer, direction: int) -> None:
         current_index = self.pipeline_stage_drawers.index(drawer)
         target_index = current_index + direction
-        if target_index < 0 or target_index >= len(self.pipeline_stage_drawers):
+        if drawer is self.brightness_stage_drawer or target_index <= 0 or target_index >= len(self.pipeline_stage_drawers):
             return
         self.pipeline_stage_drawers[current_index], self.pipeline_stage_drawers[target_index] = (
             self.pipeline_stage_drawers[target_index],
@@ -2743,7 +2882,11 @@ class ContrastWindow(QMainWindow):
             insert_index = self.enhancement_layout.count()
         for offset, drawer in enumerate(self.pipeline_stage_drawers):
             drawer.set_stage_index(offset + 1)
-            drawer.set_move_enabled(offset > 0, offset < len(self.pipeline_stage_drawers) - 1)
+            is_fixed_first_stage = drawer is self.brightness_stage_drawer
+            drawer.set_move_enabled(
+                not is_fixed_first_stage and offset > 1,
+                not is_fixed_first_stage and offset < len(self.pipeline_stage_drawers) - 1,
+            )
             self.enhancement_layout.insertWidget(insert_index + offset, drawer)
 
     def enhancement_parameters(self) -> EnhancementParameters:
