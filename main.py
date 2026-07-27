@@ -2608,6 +2608,7 @@ class ContrastWindow(QMainWindow):
         controls_layout = QVBoxLayout(controls)
         controls_layout.setContentsMargins(12, 12, 12, 12)
         controls_layout.setSpacing(10)
+        self._pipeline_controls_base_right_margin = controls_layout.contentsMargins().right()
 
         hint = QLabel(
             "ROI residence analysis depends on the aneurysm ROI extraction stage. "
@@ -2739,18 +2740,45 @@ class ContrastWindow(QMainWindow):
         controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        controls_scroll.verticalScrollBar().rangeChanged.connect(self._update_pipeline_column_width)
         for drawer in self.pipeline_stage_drawers:
             drawer.expand_button.toggled.connect(self._update_pipeline_column_width)
         return controls_scroll
+
+    def _pipeline_scrollbar_reserve_width(self) -> int:
+        scrollbar = self.pipeline_controls_scroll.verticalScrollBar()
+        style_width = self.style().pixelMetric(
+            QStyle.PixelMetric.PM_ScrollBarExtent,
+            None,
+            self.pipeline_controls_scroll,
+        )
+        return max(style_width, scrollbar.sizeHint().width(), 0)
+
+    def _sync_pipeline_scroll_gutter(self) -> None:
+        margins = self.enhancement_layout.contentsMargins()
+        base_right = getattr(self, "_pipeline_controls_base_right_margin", margins.right())
+        scrollbar = self.pipeline_controls_scroll.verticalScrollBar()
+        reserve_width = self._pipeline_scrollbar_reserve_width()
+        needs_scrollbar = scrollbar.maximum() > scrollbar.minimum()
+        target_right = base_right if needs_scrollbar else base_right + reserve_width
+        if margins.right() != target_right:
+            self.enhancement_layout.setContentsMargins(
+                margins.left(),
+                margins.top(),
+                target_right,
+                margins.bottom(),
+            )
 
     def _update_pipeline_column_width(self) -> None:
         if not hasattr(self, "pipeline_controls_scroll"):
             return
 
+        self._sync_pipeline_scroll_gutter()
         drawer_width = max(drawer.minimumSizeHint().width() for drawer in self.pipeline_stage_drawers)
         margins = self.enhancement_layout.contentsMargins()
-        scrollbar_width = self.pipeline_controls_scroll.verticalScrollBar().sizeHint().width()
-        required_width = drawer_width + margins.left() + margins.right() + scrollbar_width
+        base_right = getattr(self, "_pipeline_controls_base_right_margin", margins.right())
+        reserve_width = self._pipeline_scrollbar_reserve_width()
+        required_width = drawer_width + margins.left() + base_right + reserve_width
         self.pipeline_controls_scroll.setMinimumWidth(required_width)
         self.pipeline_left_column.setMinimumWidth(required_width)
 
