@@ -2500,14 +2500,11 @@ class ContrastWindow(QMainWindow):
         self.play_interval_ms = self._play_interval_ms()
 
     def _build_ui(self) -> None:
-        self.play_button = QPushButton("Play")
+        self.play_button = QPushButton()
+        self.play_button.setText("")
+        self.play_button.setToolTip("Play/Pause")
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.play_button.clicked.connect(self.toggle_playback)
-
-        self.step_back_button = QPushButton("-1 frame")
-        self.step_back_button.clicked.connect(lambda: self.set_frame_index(self.current_frame_index - 1))
-        self.step_forward_button = QPushButton("+1 frame")
-        self.step_forward_button.clicked.connect(lambda: self.set_frame_index(self.current_frame_index + 1))
 
         self.frame_slider = QSlider(Qt.Orientation.Horizontal)
         self.frame_slider.setRange(0, self.max_frame)
@@ -2556,8 +2553,6 @@ class ContrastWindow(QMainWindow):
         playback_layout.setContentsMargins(0, 0, 0, 0)
         playback_layout.setSpacing(8)
         playback_layout.addWidget(self.play_button)
-        playback_layout.addWidget(self.step_back_button)
-        playback_layout.addWidget(self.step_forward_button)
         playback_layout.addWidget(self.frame_slider, 1)
         playback_layout.addWidget(QLabel("Frame"))
         playback_layout.addWidget(self.frame_spin)
@@ -3276,7 +3271,7 @@ class ContrastWindow(QMainWindow):
 
     def play(self) -> None:
         self.is_playing = True
-        self.play_button.setText("Pause")
+        self.play_button.setText("")
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
         self.timer.start(self.play_interval_ms)
 
@@ -3299,7 +3294,7 @@ class ContrastWindow(QMainWindow):
     def pause(self) -> None:
         self.is_playing = False
         self.timer.stop()
-        self.play_button.setText("Play")
+        self.play_button.setText("")
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         if any(panel.enhance_display for panel in self.panels):
             for panel in self.panels:
@@ -3321,7 +3316,6 @@ class ContrastWindow(QMainWindow):
                 widget.blockSignals(True)
                 widget.setValue(next_frame_index)
                 widget.blockSignals(False)
-        self.step_forward_button.setEnabled(self.current_frame_index < self.max_frame)
         self.update_time_label()
 
     def set_frame_index(self, frame_index: int) -> None:
@@ -3336,7 +3330,6 @@ class ContrastWindow(QMainWindow):
                 widget.blockSignals(True)
                 widget.setValue(frame_index)
                 widget.blockSignals(False)
-        self.step_forward_button.setEnabled(self.current_frame_index < self.max_frame)
         self.update_time_label()
 
     def _set_playback_limit(self, frame_index: int) -> None:
@@ -3353,7 +3346,6 @@ class ContrastWindow(QMainWindow):
                 widget.blockSignals(True)
                 widget.setValue(self.current_frame_index)
                 widget.blockSignals(False)
-        self.step_forward_button.setEnabled(self.current_frame_index < self.max_frame)
         self.update_time_label()
 
     def update_time_label(self) -> None:
