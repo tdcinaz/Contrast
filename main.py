@@ -32,7 +32,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
-    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -41,7 +40,6 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QStyle,
-    QTabWidget,
     QToolButton,
     QToolBar,
     QVBoxLayout,
@@ -1944,6 +1942,18 @@ class VideoPanel(QFrame):
         self.active_sequence_key = None
         self.stage_duration_per_frame.clear()
 
+    def analysis_frames(
+        self,
+        backend_id: str,
+        noise_sigma: int,
+        stages: EnhancementStages,
+        parameters: EnhancementParameters,
+    ) -> list[np.ndarray] | None:
+        sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
+        if not sequence_key:
+            return self.source_gray_frames
+        return self.stage_frame_cache.get(sequence_key)
+
     def close(self) -> None:
         self.capture.release()
         super().close()
@@ -2281,22 +2291,13 @@ class ContrastWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
 
     def _build_controls_panel(self) -> QWidget:
-        controls = QTabWidget()
+        controls = QWidget()
         controls.setMaximumWidth(410)
         controls.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding)
 
-        enhancement_tab = QWidget()
-        enhancement_layout = QVBoxLayout(enhancement_tab)
-        enhancement_layout.setContentsMargins(12, 12, 12, 12)
-        enhancement_layout.setSpacing(10)
-
-        analysis_tab = QWidget()
-        analysis_layout = QVBoxLayout(analysis_tab)
-        analysis_layout.setContentsMargins(12, 12, 12, 12)
-        analysis_layout.setSpacing(10)
-
-        controls.addTab(enhancement_tab, "Enhancement")
-        controls.addTab(analysis_tab, "Aneurysm analysis")
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(12, 12, 12, 12)
+        controls_layout.setSpacing(10)
 
         hint = QLabel(
             "Aneurysm ROIs are extracted automatically from circular regions that darken as contrast enters. "
@@ -2304,12 +2305,12 @@ class ContrastWindow(QMainWindow):
         )
         hint.setWordWrap(True)
         hint.setObjectName("hintLabel")
-        analysis_layout.addWidget(hint)
+        controls_layout.addWidget(hint)
 
         pipeline_label = QLabel("Live processing pipeline (applied in this order, top to bottom)")
         pipeline_label.setObjectName("pipelineLabel")
-        enhancement_layout.addWidget(pipeline_label)
-        self.enhancement_layout = enhancement_layout
+        controls_layout.addWidget(pipeline_label)
+        self.enhancement_layout = controls_layout
         self.brightness_stage_drawer = StageDrawer(
             "brightness_stabilization",
             "Gain / brightness stabilization",
@@ -2327,6 +2328,11 @@ class ContrastWindow(QMainWindow):
             "Brightness-coded contrast segmentation",
             9,
         )
+        self.analysis_stage_drawer = StageDrawer(
+            "roi_residence_analysis",
+            "ROI residence analysis",
+            10,
+        )
         self.gain_stage_check = self.gain_stage_drawer.enable_check
         self.brightness_stage_check = self.brightness_stage_drawer.enable_check
         self.scanline_stage_check = self.scanline_stage_drawer.enable_check
@@ -2336,7 +2342,8 @@ class ContrastWindow(QMainWindow):
         self.adjustments_stage_check = self.adjustments_stage_drawer.enable_check
         self.smoothing_stage_check = self.smoothing_stage_drawer.enable_check
         self.segmentation_stage_check = self.segmentation_stage_drawer.enable_check
-        self.pipeline_stage_checks = [
+        self.analysis_stage_check = self.analysis_stage_drawer.enable_check
+        self.frame_pipeline_stage_checks = [
             self.brightness_stage_check,
             self.gain_stage_check,
             self.scanline_stage_check,
@@ -2347,7 +2354,8 @@ class ContrastWindow(QMainWindow):
             self.smoothing_stage_check,
             self.segmentation_stage_check,
         ]
-        self.pipeline_stage_drawers = [
+        self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
+        self.frame_pipeline_stage_drawers = [
             self.brightness_stage_drawer,
             self.gain_stage_drawer,
             self.scanline_stage_drawer,
@@ -2358,6 +2366,7 @@ class ContrastWindow(QMainWindow):
             self.smoothing_stage_drawer,
             self.segmentation_stage_drawer,
         ]
+        self.pipeline_stage_drawers = [*self.frame_pipeline_stage_drawers, self.analysis_stage_drawer]
         for check in self.pipeline_stage_checks:
             check.setChecked(False)
             check.stateChanged.connect(self.on_pipeline_stages_changed)
@@ -2365,22 +2374,17 @@ class ContrastWindow(QMainWindow):
         for drawer in self.pipeline_stage_drawers:
             drawer.moveRequested.connect(lambda direction, current=drawer: self._move_pipeline_stage(current, direction))
         for drawer in self.pipeline_stage_drawers:
-            enhancement_layout.addWidget(drawer)
+            controls_layout.addWidget(drawer)
 
         self.reset_pipeline_button = QPushButton("Show original videos")
         self.reset_pipeline_button.clicked.connect(self.reset_enhancement_pipeline)
-        enhancement_layout.addWidget(self.reset_pipeline_button)
+        controls_layout.addWidget(self.reset_pipeline_button)
         self._refresh_pipeline_stage_ui()
-        enhancement_layout.addStretch()
+        controls_layout.addStretch()
         self.enhancement_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         self.denoise_strength_spin.valueChanged.connect(self.on_enhancement_settings_changed)
         self.inference_batch_spin.valueChanged.connect(self.on_enhancement_settings_changed)
         self.inference_precision_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
-
-        self.gain_correct_check = QCheckBox("Correct gain drift in analysis")
-        self.gain_correct_check.setChecked(True)
-        self.gain_correct_check.stateChanged.connect(lambda: self.on_analysis_filter_changed())
-        analysis_layout.addWidget(self.gain_correct_check)
 
         threshold_row = QHBoxLayout()
         threshold_row.addWidget(QLabel("Clearance threshold"))
@@ -2389,31 +2393,25 @@ class ContrastWindow(QMainWindow):
         self.threshold_spin.setSingleStep(0.05)
         self.threshold_spin.setValue(0.20)
         self.threshold_spin.setDecimals(2)
-        self.threshold_spin.valueChanged.connect(self.refresh_analysis_from_existing)
+        self.threshold_spin.valueChanged.connect(self.on_analysis_threshold_changed)
         threshold_row.addWidget(self.threshold_spin)
-        analysis_layout.addLayout(threshold_row)
+        self.analysis_stage_drawer.content_layout.addLayout(threshold_row)
 
         self.redetect_button = QPushButton("Redetect aneurysms")
         self.redetect_button.clicked.connect(self.redetect_aneurysms)
-        analysis_layout.addWidget(self.redetect_button)
-
-        self.analyze_button = QPushButton("Analyze aneurysms")
-        self.analyze_button.setObjectName("primaryButton")
-        self.analyze_button.clicked.connect(self.run_analysis)
-        analysis_layout.addWidget(self.analyze_button)
+        self.analysis_stage_drawer.content_layout.addWidget(self.redetect_button)
 
         self.export_button = QPushButton("Export CSV")
         self.export_button.clicked.connect(self.export_csv)
         self.export_button.setEnabled(False)
-        analysis_layout.addWidget(self.export_button)
-        analysis_layout.addStretch()
+        self.analysis_stage_drawer.content_layout.addWidget(self.export_button)
 
         self.pre_card = MetricCard("Pre residence")
         self.post_card = MetricCard("Post residence")
         self.delta_card = MetricCard("Difference")
-        analysis_layout.addWidget(self.pre_card)
-        analysis_layout.addWidget(self.post_card)
-        analysis_layout.addWidget(self.delta_card)
+        self.analysis_stage_drawer.content_layout.addWidget(self.pre_card)
+        self.analysis_stage_drawer.content_layout.addWidget(self.post_card)
+        self.analysis_stage_drawer.content_layout.addWidget(self.delta_card)
 
         controls_scroll = QScrollArea()
         controls_scroll.setObjectName("controlsScroll")
@@ -2814,7 +2812,7 @@ class ContrastWindow(QMainWindow):
         self.set_frame_index(0)
         self.clear_plots_and_metrics()
 
-        if self.enhancement_stages().any_enabled:
+        if self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
         else:
             self.set_display_enhancement(False)
@@ -2917,7 +2915,12 @@ class ContrastWindow(QMainWindow):
         self.clear_plots_and_metrics()
         ready = all(panel.roi() for panel in self.panels)
         if ready:
-            self.statusBar().showMessage("Automatic aneurysm ROIs are ready. Run analysis to compare contrast residence.")
+            if self.analysis_stage_check.isChecked() and self._enhancement_future is None:
+                if self.run_analysis():
+                    return
+            self.statusBar().showMessage(
+                "Automatic aneurysm ROIs are ready. Enable ROI residence analysis to compare contrast residence."
+            )
         else:
             self.statusBar().showMessage("Automatic aneurysm extraction needs review; redetect or draw a correction.")
 
@@ -2957,7 +2960,7 @@ class ContrastWindow(QMainWindow):
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
         self.inference_precision_combo.setEnabled(use_deep_model)
-        if stages.any_enabled:
+        if self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
         else:
             self._stop_enhancement_preview()
@@ -2974,19 +2977,39 @@ class ContrastWindow(QMainWindow):
             image_adjustments=self.adjustments_stage_check.isChecked(),
             final_smoothing=self.smoothing_stage_check.isChecked(),
             segmentation=self.segmentation_stage_check.isChecked(),
-            stage_order=tuple(drawer.stage_key for drawer in self.pipeline_stage_drawers),
+            stage_order=tuple(drawer.stage_key for drawer in self.frame_pipeline_stage_drawers),
         )
+
+    def _pipeline_has_active_stage(self) -> bool:
+        return self.enhancement_stages().any_enabled or self.analysis_stage_check.isChecked()
+
+    def _current_backend_id(self, stages: EnhancementStages) -> str:
+        mode = str(self.enhancement_mode_combo.currentData())
+        if not stages.denoise or mode == "classical":
+            return "classical"
+        precision = str(self.inference_precision_combo.currentData())
+        if mode.endswith("-ngc"):
+            return f"{mode.removesuffix('-ngc')}-ngc-26.06-{precision}-batch{self.inference_batch_spin.value()}"
+        return f"ffdnet-native-{precision}"
 
     def _move_pipeline_stage(self, drawer: StageDrawer, direction: int) -> None:
         current_index = self.pipeline_stage_drawers.index(drawer)
         target_index = current_index + direction
-        if drawer is self.brightness_stage_drawer or target_index <= 0 or target_index >= len(self.pipeline_stage_drawers):
+        last_movable_index = len(self.pipeline_stage_drawers) - 2
+        if (
+            drawer is self.brightness_stage_drawer
+            or drawer is self.analysis_stage_drawer
+            or target_index <= 0
+            or target_index > last_movable_index
+        ):
             return
         self.pipeline_stage_drawers[current_index], self.pipeline_stage_drawers[target_index] = (
             self.pipeline_stage_drawers[target_index],
             self.pipeline_stage_drawers[current_index],
         )
-        self.pipeline_stage_checks = [item.enable_check for item in self.pipeline_stage_drawers]
+        self.frame_pipeline_stage_drawers = self.pipeline_stage_drawers[:-1]
+        self.frame_pipeline_stage_checks = [item.enable_check for item in self.frame_pipeline_stage_drawers]
+        self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
         self._refresh_pipeline_stage_ui()
         self.on_enhancement_settings_changed()
 
@@ -2999,9 +3022,10 @@ class ContrastWindow(QMainWindow):
         for offset, drawer in enumerate(self.pipeline_stage_drawers):
             drawer.set_stage_index(offset + 1)
             is_fixed_first_stage = drawer is self.brightness_stage_drawer
+            is_fixed_last_stage = drawer is self.analysis_stage_drawer
             drawer.set_move_enabled(
-                not is_fixed_first_stage and offset > 1,
-                not is_fixed_first_stage and offset < len(self.pipeline_stage_drawers) - 1,
+                not is_fixed_first_stage and not is_fixed_last_stage and offset > 1,
+                not is_fixed_first_stage and not is_fixed_last_stage and offset < len(self.pipeline_stage_drawers) - 2,
             )
             self.enhancement_layout.insertWidget(insert_index + offset, drawer)
 
@@ -3046,11 +3070,13 @@ class ContrastWindow(QMainWindow):
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
         self.inference_precision_combo.setEnabled(use_deep_model)
-        if stages.any_enabled:
+        if self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
         else:
             self._stop_enhancement_preview()
             self.set_display_enhancement(False)
+            self.results.clear()
+            self.clear_plots_and_metrics()
             self.statusBar().showMessage("Showing original videos.")
 
     def reset_enhancement_pipeline(self) -> None:
@@ -3330,6 +3356,8 @@ class ContrastWindow(QMainWindow):
             self._set_playback_limit(self.source_max_frame)
             for panel in self.panels:
                 panel.seek(self.current_frame_index)
+            if self.analysis_stage_check.isChecked() and self.run_analysis():
+                return
             self.statusBar().showMessage("Video enhancement complete.")
         else:
             self.set_display_enhancement(False)
@@ -3347,62 +3375,54 @@ class ContrastWindow(QMainWindow):
         self.enhancement_progress.finish()
         self._set_playback_limit(self.source_max_frame)
 
-    def on_analysis_filter_changed(self) -> None:
+    def on_analysis_threshold_changed(self) -> None:
         if self.results:
-            self.results.clear()
-            self.clear_plots_and_metrics()
-            self.statusBar().showMessage("Analysis filter changed. Run ROI analysis again.")
+            self.refresh_analysis_from_existing()
+        elif self.analysis_stage_check.isChecked() and self._enhancement_future is None:
+            self.run_analysis()
 
-    def run_analysis(self) -> None:
+    def run_analysis(self) -> bool:
         missing = [panel.label for panel in self.panels if panel.roi() is None]
         if missing:
-            QMessageBox.information(
-                self,
-                "Aneurysm not detected",
-                "Automatic extraction could not identify the aneurysm in: "
-                + ", ".join(missing)
-                + ". Redetect or draw a correction on the video.",
+            self.results.clear()
+            self.clear_plots_and_metrics()
+            self.statusBar().showMessage(
+                "Automatic aneurysm extraction needs review before ROI residence analysis can run."
             )
-            return
+            return False
+
+        if self._enhancement_future is not None:
+            return False
 
         self.pause()
+        stages = self.enhancement_stages()
+        parameters = self.enhancement_parameters()
+        backend_id = self._current_backend_id(stages)
         threshold = self.threshold_spin.value()
-        progress = QProgressDialog("Measuring ROI intensity...", "Cancel", 0, sum(panel.playback_frame_count for panel in self.panels), self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(250)
-        progress.setValue(0)
+        gain_corrected = stages.brightness_stabilization or stages.gain_stabilization
 
-        self.results.clear()
-        completed = 0
-        try:
-            for panel in self.panels:
-                assert panel.roi() is not None
-                result = analyze_video(
-                    panel.label,
-                    panel.path,
-                    panel.info,
-                    panel.crop_rect,
-                    panel.trim_start_frame,
-                    panel.playback_frame_count,
-                    panel.roi(),
-                    threshold,
-                    self.gain_correct_check.isChecked(),
-                    progress,
-                    completed,
-                )
-                completed += panel.playback_frame_count
-                progress.setValue(completed)
-                if progress.wasCanceled():
-                    self.statusBar().showMessage("Analysis canceled.")
-                    return
-                self.results[panel.label] = result
-        finally:
-            progress.close()
+        results: dict[str, AnalysisResult] = {}
+        for panel in self.panels:
+            assert panel.roi() is not None
+            gray_frames = panel.analysis_frames(backend_id, self.denoise_strength_spin.value(), stages, parameters)
+            if gray_frames is None:
+                return False
+            results[panel.label] = analyze_gray_frames(
+                panel.label,
+                panel.path,
+                panel.info.fps,
+                panel.roi(),
+                gray_frames,
+                threshold,
+                gain_corrected,
+            )
 
+        self.results = results
         self.refresh_plots_and_metrics()
         self.export_action.setEnabled(True)
         self.export_button.setEnabled(True)
-        self.statusBar().showMessage("Analysis complete. Residence time is measured above the selected normalized threshold.")
+        self.statusBar().showMessage("ROI residence analysis updated from the current enhanced pipeline output.")
+        return True
 
     def refresh_analysis_from_existing(self) -> None:
         if not self.results:
@@ -3513,59 +3533,30 @@ class ContrastWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def analyze_video(
+def analyze_gray_frames(
     label: str,
     path: Path,
-    info: VideoInfo,
-    crop_rect: QRect,
-    start_frame: int,
-    frame_count: int,
+    fps: float,
     roi: QRect,
+    gray_frames: list[np.ndarray],
     threshold_fraction: float,
     gain_corrected: bool,
-    progress: QProgressDialog,
-    progress_offset: int,
 ) -> AnalysisResult:
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Could not open video: {path}")
-
     x, y = roi.x(), roi.y()
     width, height = roi.width(), roi.height()
     means: list[float] = []
     references: list[float] = []
 
-    try:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        for frame_index in range(frame_count):
-            ok, frame = capture.read()
-            if not ok:
-                break
-            gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
-            roi_pixels = gray[y : y + height, x : x + width]
-            means.append(float(np.mean(roi_pixels)))
-            references.append(reference_mean(gray, roi))
-            if frame_index % 15 == 0:
-                progress.setValue(progress_offset + frame_index)
-                QApplication.processEvents()
-                if progress.wasCanceled():
-                    break
-    finally:
-        capture.release()
+    for gray in gray_frames:
+        roi_pixels = gray[y : y + height, x : x + width]
+        means.append(float(np.mean(roi_pixels)))
+        references.append(reference_mean(gray, roi))
 
     roi_intensity = np.asarray(means, dtype=float)
     reference_intensity = np.asarray(references, dtype=float)
-    measurement_intensity = roi_intensity
-    if gain_corrected and len(roi_intensity):
-        baseline_count = baseline_sample_count(info.fps, len(reference_intensity))
-        smoothed_reference = smooth_temporal_signal(reference_intensity, info.fps)
-        baseline_reference = float(np.median(smoothed_reference[:baseline_count]))
-        reference_safe = np.clip(smoothed_reference, 1.0, None)
-        gain = np.clip(baseline_reference / reference_safe, 0.55, 1.85)
-        measurement_intensity = roi_intensity * gain
-    measurement_intensity = smooth_temporal_signal(measurement_intensity, info.fps)
+    measurement_intensity = smooth_temporal_signal(roi_intensity, fps)
 
-    return build_analysis_result(label, path, info.fps, roi, measurement_intensity, reference_intensity, threshold_fraction, gain_corrected)
+    return build_analysis_result(label, path, fps, roi, measurement_intensity, reference_intensity, threshold_fraction, gain_corrected)
 
 
 def build_analysis_result(
