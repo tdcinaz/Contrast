@@ -160,6 +160,7 @@ class EnhancementParameters:
     smoothing_sigma_x: float = 0.55
     segmentation_block_size: int = 51
     segmentation_sensitivity: float = 7.0
+    segmentation_level_tolerance: int = 12
     segmentation_min_area: int = 80
 
 
@@ -438,6 +439,7 @@ def segment_dark_contrast(
     gray: np.ndarray,
     block_size: int,
     sensitivity: float,
+    level_tolerance: int,
     minimum_area: int,
 ) -> np.ndarray:
     source = np.clip(gray, 0, 255).astype(np.uint8)
@@ -455,11 +457,29 @@ def segment_dark_contrast(
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     brightness_map = np.zeros_like(mask)
+    components: list[tuple[int, int, int]] = []
     for component in range(1, component_count):
-        if int(stats[component, cv2.CC_STAT_AREA]) >= minimum_area:
+        area = int(stats[component, cv2.CC_STAT_AREA])
+        if area >= minimum_area:
             component_pixels = labels == component
             component_brightness = int(np.median(source[component_pixels]))
-            brightness_map[component_pixels] = max(1, component_brightness)
+            components.append((component_brightness, component, area))
+
+    components.sort()
+    tolerance = max(0, int(level_tolerance))
+    level_groups: list[list[tuple[int, int, int]]] = []
+    for component_info in components:
+        if not level_groups or component_info[0] - level_groups[-1][0][0] > tolerance:
+            level_groups.append([component_info])
+        else:
+            level_groups[-1].append(component_info)
+
+    for group in level_groups:
+        brightness_total = sum(brightness * area for brightness, _, area in group)
+        area_total = sum(area for _, _, area in group)
+        representative_brightness = max(1, round(brightness_total / area_total))
+        for _, component, _ in group:
+            brightness_map[labels == component] = representative_brightness
     return brightness_map
 
 
@@ -785,6 +805,7 @@ class VideoPanel(QFrame):
                 (
                     int(parameters.segmentation_block_size),
                     round(float(parameters.segmentation_sensitivity), 4),
+                    int(parameters.segmentation_level_tolerance),
                     int(parameters.segmentation_min_area),
                 ),
             )
@@ -1236,6 +1257,7 @@ class VideoPanel(QFrame):
                             frame,
                             parameters.segmentation_block_size,
                             parameters.segmentation_sensitivity,
+                            parameters.segmentation_level_tolerance,
                             parameters.segmentation_min_area,
                         )
                         encoded_ok, encoded_mask = cv2.imencode(".png", mask)
@@ -2105,6 +2127,18 @@ class ContrastWindow(QMainWindow):
         segmentation_sensitivity_row.addWidget(self.segmentation_sensitivity_spin)
         self.segmentation_stage_drawer.content_layout.addLayout(segmentation_sensitivity_row)
 
+        segmentation_tolerance_row = QHBoxLayout()
+        segmentation_tolerance_row.addWidget(QLabel("Brightness tolerance"))
+        self.segmentation_tolerance_spin = QSpinBox()
+        self.segmentation_tolerance_spin.setRange(0, 64)
+        self.segmentation_tolerance_spin.setValue(12)
+        self.segmentation_tolerance_spin.setSuffix(" levels")
+        self.segmentation_tolerance_spin.setToolTip(
+            "Maximum grayscale range grouped into one component level; 0 preserves exact levels"
+        )
+        segmentation_tolerance_row.addWidget(self.segmentation_tolerance_spin)
+        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_tolerance_row)
+
         segmentation_area_row = QHBoxLayout()
         segmentation_area_row.addWidget(QLabel("Minimum component area"))
         self.segmentation_area_spin = QSpinBox()
@@ -2130,6 +2164,7 @@ class ContrastWindow(QMainWindow):
             self.smoothing_sigma_spin,
             self.segmentation_block_spin,
             self.segmentation_sensitivity_spin,
+            self.segmentation_tolerance_spin,
             self.segmentation_area_spin,
         ]:
             spin.valueChanged.connect(self.on_enhancement_settings_changed)
@@ -2401,6 +2436,7 @@ class ContrastWindow(QMainWindow):
             smoothing_sigma_x=self.smoothing_sigma_spin.value(),
             segmentation_block_size=self.segmentation_block_spin.value(),
             segmentation_sensitivity=self.segmentation_sensitivity_spin.value(),
+            segmentation_level_tolerance=self.segmentation_tolerance_spin.value(),
             segmentation_min_area=self.segmentation_area_spin.value(),
         )
 

@@ -18,12 +18,37 @@ class SegmentationTests(unittest.TestCase):
         cv2.circle(frame, (105, 80), 18, 95, thickness=-1)
         cv2.circle(frame, (20, 20), 2, 60, thickness=-1)
 
-        mask = segment_dark_contrast(frame, block_size=51, sensitivity=7.0, minimum_area=80)
+        mask = segment_dark_contrast(
+            frame,
+            block_size=51,
+            sensitivity=7.0,
+            level_tolerance=0,
+            minimum_area=80,
+        )
 
         self.assertEqual(mask[80, 55], 45)
         self.assertEqual(mask[80, 105], 95)
         self.assertEqual(mask[20, 20], 0)
         self.assertEqual(mask.dtype, np.uint8)
+
+    def test_groups_component_levels_within_brightness_tolerance(self) -> None:
+        frame = np.full((180, 220), 180, dtype=np.uint8)
+        cv2.circle(frame, (35, 90), 15, 45, thickness=-1)
+        cv2.circle(frame, (85, 90), 15, 52, thickness=-1)
+        cv2.circle(frame, (135, 90), 15, 59, thickness=-1)
+        cv2.circle(frame, (185, 90), 15, 95, thickness=-1)
+
+        component_map = segment_dark_contrast(
+            frame,
+            block_size=41,
+            sensitivity=7.0,
+            level_tolerance=10,
+            minimum_area=80,
+        )
+
+        self.assertEqual(component_map[90, 35], component_map[90, 85])
+        self.assertNotEqual(component_map[90, 85], component_map[90, 135])
+        self.assertNotEqual(component_map[90, 135], component_map[90, 185])
 
     def test_overlay_changes_only_masked_pixels_without_mutating_input(self) -> None:
         frame = np.full((4, 4, 3), 100, dtype=np.uint8)
