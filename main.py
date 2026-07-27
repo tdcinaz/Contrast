@@ -2296,14 +2296,14 @@ class StageDrawer(QFrame):
         self.content = QWidget()
         self.content.setVisible(False)
         self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(72, 4, 8, 8)
+        self.content_layout.setContentsMargins(8, 8, 8, 8)
         self.content_layout.setSpacing(6)
 
         self.status_label = QLabel()
         self.status_label.setVisible(False)
         self.status_label.setWordWrap(True)
         self.status_label.setObjectName("stageStatusLabel")
-        self.status_label.setContentsMargins(72, 0, 0, 0)
+        self.status_label.setContentsMargins(8, 0, 8, 0)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
