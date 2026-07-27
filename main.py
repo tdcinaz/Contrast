@@ -107,6 +107,7 @@ class VideoInfo:
 class EnhancementStages:
     gain_stabilization: bool = False
     brightness_stabilization: bool = False
+    roi_extraction: bool = False
     scanline_correction: bool = False
     denoise: bool = False
     temporal_filter: bool = False
@@ -116,6 +117,7 @@ class EnhancementStages:
     segmentation: bool = False
     stage_order: tuple[str, ...] = (
         "brightness_stabilization",
+        "roi_extraction",
         "gain_stabilization",
         "scanline_correction",
         "denoise",
@@ -132,6 +134,7 @@ class EnhancementStages:
             (
                 self.gain_stabilization,
                 self.brightness_stabilization,
+                self.roi_extraction,
                 self.scanline_correction,
                 self.denoise,
                 self.temporal_filter,
@@ -166,6 +169,9 @@ class EnhancementParameters:
     adjustments_sharpen_amount: float = 0.0
     adjustments_gamma: float = 1.0
     smoothing_sigma_x: float = 0.55
+    roi_softening_enabled: bool = False
+    roi_softening_radius_ratio: float = 0.12
+    roi_softening_threshold: float = 0.10
     segmentation_mode: str = "dark_contrast"
     segmentation_block_size: int = 51
     segmentation_sensitivity: float = 7.0
@@ -668,7 +674,14 @@ def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
     return np.percentile(stack, 90.0, axis=0) - np.percentile(stack, 10.0, axis=0)
 
 
-def detect_aneurysm_roi(gray_frames: list[np.ndarray], fps: float) -> ROISelection | None:
+def detect_aneurysm_roi(
+    gray_frames: list[np.ndarray],
+    fps: float,
+    *,
+    soften_mask: bool = False,
+    soften_radius_ratio: float = 0.12,
+    soften_threshold: float = 0.10,
+) -> ROISelection | None:
     if len(gray_frames) < 3:
         return None
 
@@ -748,13 +761,27 @@ def detect_aneurysm_roi(gray_frames: list[np.ndarray], fps: float) -> ROISelecti
 
     _, contour = best_candidate
     roi_x, roi_y, roi_width, roi_height = cv2.boundingRect(contour)
-    roi = QRect(int(roi_x), int(roi_y), int(roi_width), int(roi_height))
+    soften_radius = max(0, round(min(roi_width, roi_height) * max(0.0, soften_radius_ratio))) if soften_mask else 0
     local_contour = contour.copy()
-    local_contour[:, 0, 0] -= roi_x
-    local_contour[:, 0, 1] -= roi_y
-    roi_mask = np.zeros((roi_height, roi_width), dtype=np.uint8)
+    local_contour[:, 0, 0] -= roi_x - soften_radius
+    local_contour[:, 0, 1] -= roi_y - soften_radius
+    roi_mask = np.zeros((roi_height + soften_radius * 2, roi_width + soften_radius * 2), dtype=np.uint8)
     cv2.drawContours(roi_mask, [local_contour], -1, 1, thickness=-1)
-    return ROISelection(roi, roi_mask.astype(bool))
+    if soften_radius > 0:
+        soften_kernel_size = soften_radius * 2 + 1
+        soften_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (soften_kernel_size, soften_kernel_size))
+        roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_CLOSE, soften_kernel)
+        roi_mask = cv2.dilate(roi_mask, soften_kernel, iterations=1)
+        roi_mask = cv2.GaussianBlur(roi_mask.astype(np.float32), (soften_kernel_size, soften_kernel_size), sigmaX=0)
+        roi_mask = (roi_mask >= float(np.clip(soften_threshold, 0.0, 1.0))).astype(np.uint8)
+
+    mask_points = cv2.findNonZero(roi_mask)
+    if mask_points is None:
+        return None
+    mask_x, mask_y, mask_width, mask_height = cv2.boundingRect(mask_points)
+    roi = QRect(int(roi_x - soften_radius + mask_x), int(roi_y - soften_radius + mask_y), int(mask_width), int(mask_height))
+    cropped_mask = roi_mask[mask_y : mask_y + mask_height, mask_x : mask_x + mask_width]
+    return ROISelection(roi, cropped_mask.astype(bool))
 
 
 def segment_temporal_change_map(
@@ -1056,9 +1083,11 @@ class VideoDisplay(QLabel):
             return
         self._drag_origin = None
         if self._roi and self._roi.width() >= 4 and self._roi.height() >= 4:
+            self._roi_mask = np.ones((self._roi.height(), self._roi.width()), dtype=bool)
             self.roiChanged.emit(QRect(self._roi))
         else:
             self._roi = None
+            self._roi_mask = None
         self.update()
 
     def _display_to_frame_point(self, point: QPoint) -> QPoint:
@@ -1115,9 +1144,11 @@ class VideoPanel(QFrame):
         self.stage_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.encoded_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.segmentation_mask_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
+        self.roi_selection_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], ROISelection | None] = {}
         self.temporal_change_map_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], np.ndarray] = {}
         self.active_sequence_key: tuple[tuple[str, tuple[object, ...]], ...] | None = None
         self.stage_duration_per_frame: dict[tuple[str, tuple[object, ...]], float] = {}
+        self.stage_roi_selection: ROISelection | None = None
 
         self.display = VideoDisplay(label, color)
         self.display.set_comparison_enabled(self.comparison_display)
@@ -1145,7 +1176,6 @@ class VideoPanel(QFrame):
         self.setObjectName("videoPanel")
         gray_frames = self._sample_cropped_gray_frames()
         self.set_trim_window(detect_pre_injection_trim_start(gray_frames, self.info.fps))
-        self.auto_detect_aneurysm(gray_frames)
         self.seek(0)
 
     def _sample_cropped_gray_frames(self) -> list[np.ndarray]:
@@ -1199,6 +1229,15 @@ class VideoPanel(QFrame):
             )
         if stage_key == "brightness_stabilization":
             return (stage_key, tuple())
+        if stage_key == "roi_extraction":
+            return (
+                stage_key,
+                (
+                    bool(parameters.roi_softening_enabled),
+                    round(float(parameters.roi_softening_radius_ratio), 4),
+                    round(float(parameters.roi_softening_threshold), 4),
+                ),
+            )
         if stage_key == "scanline_correction":
             return (
                 stage_key,
@@ -1282,6 +1321,21 @@ class VideoPanel(QFrame):
                 return self.segmentation_mask_cache.get(sequence_key[: index + 1])
         return None
 
+    def _roi_selection_for_sequence(
+        self,
+        sequence_key: tuple[tuple[str, tuple[object, ...]], ...],
+    ) -> ROISelection | None:
+        for index, token in enumerate(sequence_key):
+            if token[0] == "roi_extraction":
+                return self.roi_selection_cache.get(sequence_key[: index + 1])
+        return None
+
+    def _sequence_has_roi_extraction(
+        self,
+        sequence_key: tuple[tuple[str, tuple[object, ...]], ...],
+    ) -> bool:
+        return any(token[0] == "roi_extraction" for token in sequence_key)
+
     def _default_stage_seconds_per_frame(self, stage_token: tuple[str, tuple[object, ...]]) -> float:
         stage_key = stage_token[0]
         if stage_key == "source_decode":
@@ -1290,6 +1344,8 @@ class VideoPanel(QFrame):
             return 0.0012
         if stage_key == "brightness_stabilization":
             return 0.0020
+        if stage_key == "roi_extraction":
+            return 0.0018
         if stage_key == "scanline_correction":
             return 0.0025
         if stage_key == "denoise":
@@ -1317,6 +1373,8 @@ class VideoPanel(QFrame):
             return 0.0018
         if stage_key == "brightness_stabilization":
             return 0.0030
+        if stage_key == "roi_extraction":
+            return 0.0028
         if stage_key == "scanline_correction":
             return 0.0035
         if stage_key == "denoise":
@@ -1378,6 +1436,7 @@ class VideoPanel(QFrame):
         names = {
             "gain_stabilization": "Median gain normalization",
             "brightness_stabilization": "Gain / brightness stabilization",
+            "roi_extraction": "Aneurysm ROI extraction",
             "scanline_correction": "Scanline correction",
             "denoise": "Spatial denoising",
             "temporal_filter": "Motion-aware temporal filtering",
@@ -1444,6 +1503,7 @@ class VideoPanel(QFrame):
         if sequence_key in self.encoded_frame_cache:
             encoded_frames = self.encoded_frame_cache[sequence_key]
             segmentation_masks = self._segmentation_masks_for_sequence(sequence_key)
+            roi_selection = self._roi_selection_for_sequence(sequence_key)
             if encoded_frame_callback is not None or segmentation_mask_callback is not None:
                 for index, encoded in enumerate(encoded_frames):
                     if cancel_callback is not None and cancel_callback():
@@ -1456,6 +1516,10 @@ class VideoPanel(QFrame):
                 self.enhanced_frames = encoded_frames
             self.segmentation_masks = segmentation_masks
             self.active_sequence_key = sequence_key
+            if self._sequence_has_roi_extraction(sequence_key):
+                self._activate_stage_roi_selection(roi_selection)
+            else:
+                self.stage_roi_selection = None
             return True
 
         if frame_executor is None:
@@ -1524,6 +1588,7 @@ class VideoPanel(QFrame):
         source_output: list[np.ndarray] = []
         stage_outputs: list[list[np.ndarray]] = [[] for _ in missing_stages]
         segmentation_outputs: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
+        roi_outputs: dict[tuple[tuple[str, tuple[object, ...]], ...], ROISelection | None] = {}
         encoded_frames: list[np.ndarray] = []
 
         def enqueue(queue: Queue[object], item: object) -> bool:
@@ -1829,6 +1894,30 @@ class VideoPanel(QFrame):
                                 drain_mask()
                         while pending_masks:
                             drain_mask()
+                elif stage_key == "roi_extraction":
+                    stage_frames: list[tuple[int, np.ndarray]] = []
+                    while True:
+                        item = input_queue.get()
+                        if item is STREAM_END:
+                            break
+                        if cancelled.is_set():
+                            continue
+                        frame_index, frame = cast(tuple[int, np.ndarray], item)
+                        stage_frames.append((frame_index, frame))
+
+                    if stage_frames and not cancelled.is_set():
+                        started_at = perf_counter()
+                        roi_outputs[stage_prefix] = detect_aneurysm_roi(
+                            [frame for _, frame in stage_frames],
+                            self.info.fps,
+                            soften_mask=bool(parameters.roi_softening_enabled),
+                            soften_radius_ratio=float(parameters.roi_softening_radius_ratio),
+                            soften_threshold=float(parameters.roi_softening_threshold),
+                        )
+                        active_seconds += perf_counter() - started_at
+                        for frame_index, frame in stage_frames:
+                            if not emit(frame_index, frame):
+                                break
                 else:
                     while True:
                         item = input_queue.get()
@@ -1913,12 +2002,17 @@ class VideoPanel(QFrame):
         for (_, stage_prefix), output in zip(missing_stages, stage_outputs):
             self.stage_frame_cache[stage_prefix] = output
         self.segmentation_mask_cache.update(segmentation_outputs)
+        self.roi_selection_cache.update(roi_outputs)
         self.encoded_frame_cache[sequence_key] = encoded_frames
 
         if activate_result:
             self.enhanced_frames = self.encoded_frame_cache[sequence_key]
         self.segmentation_masks = self._segmentation_masks_for_sequence(sequence_key)
         self.active_sequence_key = sequence_key
+        if self._sequence_has_roi_extraction(sequence_key):
+            self._activate_stage_roi_selection(self._roi_selection_for_sequence(sequence_key))
+        else:
+            self.stage_roi_selection = None
         return True
 
     def _metadata_text(self) -> str:
@@ -1979,6 +2073,16 @@ class VideoPanel(QFrame):
     def roi_mask(self) -> np.ndarray | None:
         return self.display.roi_mask()
 
+    def _activate_stage_roi_selection(self, roi_selection: ROISelection | None) -> None:
+        self.stage_roi_selection = roi_selection
+        if roi_selection is None:
+            self.display.set_roi(None)
+            return
+        self.display.set_roi(roi_selection.rect, roi_selection.mask)
+
+    def has_stage_roi_mask(self) -> bool:
+        return self.stage_roi_selection is not None and self.stage_roi_selection.mask is not None
+
     def auto_detect_aneurysm(self, gray_frames: list[np.ndarray] | None = None) -> QRect | None:
         source_frames = gray_frames if gray_frames is not None else self._sample_cropped_gray_frames()
         start = self.trim_start_frame
@@ -2000,7 +2104,7 @@ class VideoPanel(QFrame):
         gray_frames = self._sample_cropped_gray_frames()
         self.set_trim_window(detect_pre_injection_trim_start(gray_frames, self.info.fps))
         self.meta_label.setText(self._metadata_text())
-        self.auto_detect_aneurysm(gray_frames)
+        self._activate_stage_roi_selection(None)
         self.display.set_comparison_enabled(self.comparison_display)
         self.seek(0)
 
@@ -2021,9 +2125,11 @@ class VideoPanel(QFrame):
         self.enhanced_frames = None
         self.segmentation_masks = None
         self.source_gray_frames = None
+        self.stage_roi_selection = None
         self.stage_frame_cache.clear()
         self.encoded_frame_cache.clear()
         self.segmentation_mask_cache.clear()
+        self.roi_selection_cache.clear()
         self.temporal_change_map_cache.clear()
         self.active_sequence_key = None
         self.stage_duration_per_frame.clear()
@@ -2174,10 +2280,16 @@ class StageDrawer(QFrame):
         self.content_layout.setContentsMargins(12, 4, 8, 8)
         self.content_layout.setSpacing(6)
 
+        self.status_label = QLabel()
+        self.status_label.setVisible(False)
+        self.status_label.setWordWrap(True)
+        self.status_label.setObjectName("stageStatusLabel")
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(6)
         layout.addLayout(header)
+        layout.addWidget(self.status_label)
         layout.addWidget(self.content)
 
         self.enable_check.stateChanged.connect(self.enabledChanged.emit)
@@ -2195,6 +2307,16 @@ class StageDrawer(QFrame):
     def set_move_enabled(self, can_move_up: bool, can_move_down: bool) -> None:
         self.move_up_button.setEnabled(can_move_up)
         self.move_down_button.setEnabled(can_move_down)
+
+    def set_status(self, message: str | None, is_error: bool = False) -> None:
+        if not message:
+            self.status_label.clear()
+            self.status_label.setVisible(False)
+            return
+        color = "#fca5a5" if is_error else "#9fb0c6"
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(f"color: {color};")
+        self.status_label.setVisible(True)
 
 
 class ContrastWindow(QMainWindow):
@@ -2248,6 +2370,7 @@ class ContrastWindow(QMainWindow):
         self.on_enhancement_settings_changed()
         self.set_display_enhancement(False)
         self.update_time_label()
+        self._update_stage_statuses()
         self.on_roi_changed()
 
     def _build_actions(self) -> None:
@@ -2386,8 +2509,8 @@ class ContrastWindow(QMainWindow):
         controls_layout.setSpacing(10)
 
         hint = QLabel(
-            "Aneurysm ROIs are extracted automatically from circular regions that darken as contrast enters. "
-            "Drag on a video only when a detected ROI needs correction."
+            "ROI residence analysis depends on the aneurysm ROI extraction stage. "
+            "Enable that stage to extract a mask from the current enhanced video, then drag only when a detected ROI needs correction."
         )
         hint.setWordWrap(True)
         hint.setObjectName("hintLabel")
@@ -2402,25 +2525,27 @@ class ContrastWindow(QMainWindow):
             "Gain / brightness stabilization",
             1,
         )
-        self.gain_stage_drawer = StageDrawer("gain_stabilization", "Median gain normalization", 2)
-        self.scanline_stage_drawer = StageDrawer("scanline_correction", "Scanline correction", 3)
-        self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 4)
-        self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 5)
-        self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 6)
-        self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 7)
-        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 8)
+        self.roi_stage_drawer = StageDrawer("roi_extraction", "Aneurysm ROI extraction", 2)
+        self.gain_stage_drawer = StageDrawer("gain_stabilization", "Median gain normalization", 3)
+        self.scanline_stage_drawer = StageDrawer("scanline_correction", "Scanline correction", 4)
+        self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 5)
+        self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 6)
+        self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 7)
+        self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 8)
+        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 9)
         self.segmentation_stage_drawer = StageDrawer(
             "segmentation",
             "Brightness-coded contrast segmentation",
-            9,
+            10,
         )
         self.analysis_stage_drawer = StageDrawer(
             "roi_residence_analysis",
             "ROI residence analysis",
-            10,
+            11,
         )
         self.gain_stage_check = self.gain_stage_drawer.enable_check
         self.brightness_stage_check = self.brightness_stage_drawer.enable_check
+        self.roi_stage_check = self.roi_stage_drawer.enable_check
         self.scanline_stage_check = self.scanline_stage_drawer.enable_check
         self.denoise_stage_check = self.denoise_stage_drawer.enable_check
         self.temporal_stage_check = self.temporal_stage_drawer.enable_check
@@ -2431,6 +2556,7 @@ class ContrastWindow(QMainWindow):
         self.analysis_stage_check = self.analysis_stage_drawer.enable_check
         self.frame_pipeline_stage_checks = [
             self.brightness_stage_check,
+            self.roi_stage_check,
             self.gain_stage_check,
             self.scanline_stage_check,
             self.denoise_stage_check,
@@ -2443,6 +2569,7 @@ class ContrastWindow(QMainWindow):
         self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
         self.frame_pipeline_stage_drawers = [
             self.brightness_stage_drawer,
+            self.roi_stage_drawer,
             self.gain_stage_drawer,
             self.scanline_stage_drawer,
             self.denoise_stage_drawer,
@@ -2482,10 +2609,6 @@ class ContrastWindow(QMainWindow):
         self.threshold_spin.valueChanged.connect(self.on_analysis_threshold_changed)
         threshold_row.addWidget(self.threshold_spin)
         self.analysis_stage_drawer.content_layout.addLayout(threshold_row)
-
-        self.redetect_button = QPushButton("Redetect aneurysms")
-        self.redetect_button.clicked.connect(self.redetect_aneurysms)
-        self.analysis_stage_drawer.content_layout.addWidget(self.redetect_button)
 
         self.export_button = QPushButton("Export CSV")
         self.export_button.clicked.connect(self.export_csv)
@@ -2615,6 +2738,48 @@ class ContrastWindow(QMainWindow):
         brightness_hint.setObjectName("subtleLabel")
         brightness_hint.setWordWrap(True)
         self.brightness_stage_drawer.content_layout.addWidget(brightness_hint)
+
+        roi_hint = QLabel(
+            "Extracts an aneurysm ROI mask from the current upstream video state. "
+            "Enable softening to expand and round the detected mask before ROI analysis uses it."
+        )
+        roi_hint.setObjectName("subtleLabel")
+        roi_hint.setWordWrap(True)
+        self.roi_stage_drawer.content_layout.addWidget(roi_hint)
+
+        roi_soften_row = QHBoxLayout()
+        self.roi_soften_check = QCheckBox("Soften and expand mask")
+        self.roi_soften_check.setChecked(False)
+        roi_soften_row.addWidget(self.roi_soften_check)
+        roi_soften_row.addStretch()
+        self.roi_stage_drawer.content_layout.addLayout(roi_soften_row)
+
+        roi_radius_row = QHBoxLayout()
+        roi_radius_row.addWidget(QLabel("Softening radius"))
+        self.roi_radius_spin = QDoubleSpinBox()
+        self.roi_radius_spin.setRange(0.02, 0.40)
+        self.roi_radius_spin.setSingleStep(0.01)
+        self.roi_radius_spin.setDecimals(2)
+        self.roi_radius_spin.setValue(0.12)
+        self.roi_radius_spin.setSuffix(" x ROI")
+        self.roi_radius_spin.setEnabled(False)
+        roi_radius_row.addWidget(self.roi_radius_spin)
+        self.roi_stage_drawer.content_layout.addLayout(roi_radius_row)
+
+        roi_threshold_row = QHBoxLayout()
+        roi_threshold_row.addWidget(QLabel("Soft mask threshold"))
+        self.roi_threshold_spin = QDoubleSpinBox()
+        self.roi_threshold_spin.setRange(0.01, 0.95)
+        self.roi_threshold_spin.setSingleStep(0.01)
+        self.roi_threshold_spin.setDecimals(2)
+        self.roi_threshold_spin.setValue(0.10)
+        self.roi_threshold_spin.setEnabled(False)
+        roi_threshold_row.addWidget(self.roi_threshold_spin)
+        self.roi_stage_drawer.content_layout.addLayout(roi_threshold_row)
+
+        self.redetect_button = QPushButton("Refresh ROI extraction")
+        self.redetect_button.clicked.connect(self.redetect_aneurysms)
+        self.roi_stage_drawer.content_layout.addWidget(self.redetect_button)
 
         scanline_clip_row = QHBoxLayout()
         scanline_clip_row.addWidget(QLabel("Row bias clip"))
@@ -2808,11 +2973,14 @@ class ContrastWindow(QMainWindow):
         self.segmentation_stage_drawer.content_layout.addLayout(segmentation_area_row)
 
         self.gain_auto_target_check.toggled.connect(self._on_gain_auto_target_toggled)
+        self.roi_soften_check.toggled.connect(self._on_roi_soften_toggled)
         self.segmentation_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         for spin in [
             self.gain_target_spin,
             self.gain_min_spin,
             self.gain_max_spin,
+            self.roi_radius_spin,
+            self.roi_threshold_spin,
             self.scanline_clip_spin,
             self.scanline_sigma_spin,
             self.bilateral_diameter_spin,
@@ -2836,6 +3004,11 @@ class ContrastWindow(QMainWindow):
 
     def _on_gain_auto_target_toggled(self, checked: bool) -> None:
         self.gain_target_spin.setEnabled(not checked)
+        self.on_enhancement_settings_changed()
+
+    def _on_roi_soften_toggled(self, checked: bool) -> None:
+        self.roi_radius_spin.setEnabled(checked)
+        self.roi_threshold_spin.setEnabled(checked)
         self.on_enhancement_settings_changed()
 
     def _apply_style(self) -> None:
@@ -2897,6 +3070,7 @@ class ContrastWindow(QMainWindow):
         self.frame_spin.setRange(0, self.max_frame)
         self.set_frame_index(0)
         self.clear_plots_and_metrics()
+        self._update_stage_statuses()
 
         if self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
@@ -2996,25 +3170,66 @@ class ContrastWindow(QMainWindow):
         total_time = self.max_frame / self.fps if self.fps else 0.0
         self.time_label.setText(f"{current_time:05.2f} s / {total_time:05.2f} s")
 
+    def _missing_stage_roi_labels(self) -> list[str]:
+        return [panel.label for panel in self.panels if not panel.has_stage_roi_mask()]
+
+    def _analysis_requirement_failure(self) -> str | None:
+        if not self.roi_stage_check.isChecked():
+            return "ROI residence analysis failed: enable upstream aneurysm ROI extraction."
+        missing_masks = self._missing_stage_roi_labels()
+        if missing_masks:
+            labels = ", ".join(missing_masks)
+            return f"ROI residence analysis failed: ROI extraction did not produce masks for {labels}."
+        return None
+
+    def _update_stage_statuses(self) -> None:
+        if not self.roi_stage_check.isChecked():
+            extraction_message = "Disabled. Enable this stage to extract aneurysm ROI masks from the current enhanced video."
+            self.roi_stage_drawer.set_status(extraction_message, self.analysis_stage_check.isChecked())
+        elif self._enhancement_future is not None:
+            self.roi_stage_drawer.set_status("Running ROI extraction on the current enhanced video...", False)
+        else:
+            missing_masks = self._missing_stage_roi_labels()
+            if missing_masks:
+                labels = ", ".join(missing_masks)
+                self.roi_stage_drawer.set_status(f"Failed for {labels}. Adjust upstream stages or ROI extraction parameters.", True)
+            else:
+                self.roi_stage_drawer.set_status("ROI masks ready for downstream analysis.", False)
+
+        if not self.analysis_stage_check.isChecked():
+            self.analysis_stage_drawer.set_status(None)
+            return
+        failure = self._analysis_requirement_failure()
+        if failure is not None:
+            self.analysis_stage_drawer.set_status(failure, True)
+            return
+        if self._enhancement_future is not None:
+            self.analysis_stage_drawer.set_status("Waiting for upstream ROI extraction to finish.", False)
+            return
+        self.analysis_stage_drawer.set_status("Ready to analyze the current ROI masks.", False)
+
     def on_roi_changed(self) -> None:
         self.results.clear()
         self.clear_plots_and_metrics()
-        ready = all(panel.roi() for panel in self.panels)
+        self._update_stage_statuses()
+        ready = all(panel.roi() and panel.roi_mask() is not None for panel in self.panels)
         if ready:
             if self.analysis_stage_check.isChecked() and self._enhancement_future is None:
                 if self.run_analysis():
                     return
             self.statusBar().showMessage(
-                "Automatic aneurysm ROIs are ready. Enable ROI residence analysis to compare contrast residence."
+                "ROI masks are ready. Enable ROI residence analysis to compare contrast residence."
             )
         else:
-            self.statusBar().showMessage("Automatic aneurysm extraction needs review; redetect or draw a correction.")
+            self.statusBar().showMessage("ROI extraction needs review; refresh the stage or draw a correction.")
 
     def redetect_aneurysms(self) -> None:
         self.pause()
-        for panel in self.panels:
-            panel.auto_detect_aneurysm()
-        self.on_roi_changed()
+        if not self.roi_stage_check.isChecked():
+            self._update_stage_statuses()
+            self.statusBar().showMessage("Enable the Aneurysm ROI extraction stage before refreshing ROI masks.")
+            return
+        self.rebuild_enhancement_pipeline()
 
     def set_display_enhancement(self, enabled: bool) -> None:
         for panel in self.panels:
@@ -3050,12 +3265,14 @@ class ContrastWindow(QMainWindow):
             self.rebuild_enhancement_pipeline()
         else:
             self._stop_enhancement_preview()
+            self._update_stage_statuses()
             self.statusBar().showMessage("Enhancement settings updated. Enable one or more stages to preview.")
 
     def enhancement_stages(self) -> EnhancementStages:
         return EnhancementStages(
             gain_stabilization=self.gain_stage_check.isChecked(),
             brightness_stabilization=self.brightness_stage_check.isChecked(),
+            roi_extraction=self.roi_stage_check.isChecked(),
             scanline_correction=self.scanline_stage_check.isChecked(),
             denoise=self.denoise_stage_check.isChecked(),
             temporal_filter=self.temporal_stage_check.isChecked(),
@@ -3125,6 +3342,9 @@ class ContrastWindow(QMainWindow):
             gain_target_median=self.gain_target_spin.value(),
             gain_min=gain_min,
             gain_max=gain_max,
+            roi_softening_enabled=self.roi_soften_check.isChecked(),
+            roi_softening_radius_ratio=self.roi_radius_spin.value(),
+            roi_softening_threshold=self.roi_threshold_spin.value(),
             scanline_bias_clip=self.scanline_clip_spin.value(),
             scanline_sigma_y=self.scanline_sigma_spin.value(),
             bilateral_diameter=self.bilateral_diameter_spin.value(),
@@ -3163,6 +3383,7 @@ class ContrastWindow(QMainWindow):
             self.set_display_enhancement(False)
             self.results.clear()
             self.clear_plots_and_metrics()
+            self._update_stage_statuses()
             self.statusBar().showMessage("Showing original videos.")
 
     def reset_enhancement_pipeline(self) -> None:
@@ -3217,6 +3438,7 @@ class ContrastWindow(QMainWindow):
         self.open_post_action.setEnabled(False)
         self.enhancement_progress.begin("Preparing enhanced videos...")
         self.statusBar().showMessage("Enhancement is running; playback follows the frames ready in both videos.")
+        self._update_stage_statuses()
         self._enhancement_future = self._enhancement_executor.submit(
             self._run_enhancement_request,
             request,
@@ -3436,18 +3658,22 @@ class ContrastWindow(QMainWindow):
         if error is not None:
             self.set_display_enhancement(False)
             self._set_playback_limit(self.source_max_frame)
+            self._update_stage_statuses()
             QMessageBox.critical(self, "Enhancement failed", str(error))
             return
         if prepared:
             self._set_playback_limit(self.source_max_frame)
             for panel in self.panels:
                 panel.seek(self.current_frame_index)
+            self._update_stage_statuses()
             if self.analysis_stage_check.isChecked() and self.run_analysis():
                 return
-            self.statusBar().showMessage("Video enhancement complete.")
+            failure = self._analysis_requirement_failure()
+            self.statusBar().showMessage(failure if failure is not None else "Video enhancement complete.")
         else:
             self.set_display_enhancement(False)
             self._set_playback_limit(self.source_max_frame)
+            self._update_stage_statuses()
 
     def _stop_enhancement_preview(self) -> None:
         self._enhancement_generation += 1
@@ -3460,6 +3686,7 @@ class ContrastWindow(QMainWindow):
             self.enhancement_poll_timer.stop()
         self.enhancement_progress.finish()
         self._set_playback_limit(self.source_max_frame)
+        self._update_stage_statuses()
 
     def on_analysis_threshold_changed(self) -> None:
         if self.results:
@@ -3468,13 +3695,20 @@ class ContrastWindow(QMainWindow):
             self.run_analysis()
 
     def run_analysis(self) -> bool:
-        missing = [panel.label for panel in self.panels if panel.roi() is None]
+        failure = self._analysis_requirement_failure()
+        if failure is not None:
+            self.results.clear()
+            self.clear_plots_and_metrics()
+            self._update_stage_statuses()
+            self.statusBar().showMessage(failure)
+            return False
+
+        missing = [panel.label for panel in self.panels if panel.roi() is None or panel.roi_mask() is None]
         if missing:
             self.results.clear()
             self.clear_plots_and_metrics()
-            self.statusBar().showMessage(
-                "Automatic aneurysm extraction needs review before ROI residence analysis can run."
-            )
+            self._update_stage_statuses()
+            self.statusBar().showMessage("ROI masks need review before ROI residence analysis can run.")
             return False
 
         if self._enhancement_future is not None:
@@ -3508,6 +3742,7 @@ class ContrastWindow(QMainWindow):
         self.refresh_plots_and_metrics()
         self.export_action.setEnabled(True)
         self.export_button.setEnabled(True)
+        self._update_stage_statuses()
         self.statusBar().showMessage("ROI residence analysis updated from the current enhanced pipeline output.")
         return True
 

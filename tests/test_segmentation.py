@@ -73,7 +73,52 @@ class SegmentationTests(unittest.TestCase):
             False,
         )
 
-        self.assertAlmostEqual(result.mean_intensity[0], 60.0, delta=1.0)
+        full_box_mean = float(np.mean(analysis_frame[roi.rect.y() : roi.rect.y() + roi.rect.height(), roi.rect.x() : roi.rect.x() + roi.rect.width()]))
+        self.assertGreaterEqual(result.mean_intensity[0], 60.0)
+        self.assertLess(result.mean_intensity[0], full_box_mean - 5.0)
+
+    def test_detected_roi_mask_is_softened_and_expanded_when_enabled(self) -> None:
+        frames: list[np.ndarray] = []
+        for index in range(8):
+            frame = np.full((96, 96), 180, dtype=np.uint8)
+            level = 178 if index < 3 else 60
+            cv2.circle(frame, (48, 48), 14, level, thickness=-1)
+            frames.append(frame)
+
+        raw_roi = detect_aneurysm_roi(frames, fps=10.0)
+        roi = detect_aneurysm_roi(frames, fps=10.0, soften_mask=True, soften_radius_ratio=0.12, soften_threshold=0.10)
+
+        self.assertIsNotNone(raw_roi)
+        self.assertIsNotNone(roi)
+        assert raw_roi is not None
+        assert roi is not None
+        self.assertGreater(int(np.count_nonzero(roi.mask)), int(np.count_nonzero(raw_roi.mask)))
+
+    def test_analysis_requirement_fails_without_upstream_roi_stage(self) -> None:
+        window = SimpleNamespace(
+            roi_stage_check=SimpleNamespace(isChecked=lambda: False),
+            panels=[],
+            _missing_stage_roi_labels=lambda: [],
+        )
+
+        failure = ContrastWindow._analysis_requirement_failure(window)
+
+        self.assertEqual(failure, "ROI residence analysis failed: enable upstream aneurysm ROI extraction.")
+
+    def test_analysis_requirement_fails_when_roi_stage_has_no_mask(self) -> None:
+        panel = SimpleNamespace(label="Pre-deployment", has_stage_roi_mask=lambda: False)
+        window = SimpleNamespace(
+            roi_stage_check=SimpleNamespace(isChecked=lambda: True),
+            panels=[panel],
+            _missing_stage_roi_labels=lambda: ["Pre-deployment"],
+        )
+
+        failure = ContrastWindow._analysis_requirement_failure(window)
+
+        self.assertEqual(
+            failure,
+            "ROI residence analysis failed: ROI extraction did not produce masks for Pre-deployment.",
+        )
 
     def test_preserves_component_brightness_and_removes_small_components(self) -> None:
         frame = np.full((160, 160), 180, dtype=np.uint8)
