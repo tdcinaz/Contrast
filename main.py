@@ -642,6 +642,93 @@ def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
     return np.percentile(stack, 90.0, axis=0) - np.percentile(stack, 10.0, axis=0)
 
 
+def detect_aneurysm_roi(gray_frames: list[np.ndarray], fps: float) -> QRect | None:
+    if len(gray_frames) < 3:
+        return None
+
+    height, width = gray_frames[0].shape
+    if height < 16 or width < 16 or any(frame.shape != (height, width) for frame in gray_frames):
+        return None
+
+    baseline_count = min(len(gray_frames) - 1, max(3, round(max(1.0, fps) * 0.6)))
+    temporal_indexes = np.linspace(
+        baseline_count,
+        len(gray_frames) - 1,
+        num=min(72, len(gray_frames) - baseline_count),
+        dtype=int,
+    )
+    sample_indexes = np.unique(np.concatenate((np.arange(baseline_count), temporal_indexes)))
+    target_median = float(np.median([np.median(gray_frames[index]) for index in sample_indexes]))
+    stabilized = np.empty((len(sample_indexes), height, width), dtype=np.uint8)
+    for output_index, frame_index in enumerate(sample_indexes):
+        stabilized[output_index] = stabilize_frame_gain(
+            gray_frames[frame_index],
+            target_median,
+            0.75,
+            1.33,
+        )
+    sampled_baseline_count = int(np.searchsorted(sample_indexes, baseline_count))
+    baseline = np.percentile(stabilized[:sampled_baseline_count], 75.0, axis=0)
+    darkest = np.percentile(stabilized, 10.0, axis=0)
+    darkening = cv2.GaussianBlur(np.clip(baseline - darkest, 0, None), (5, 5), sigmaX=0)
+
+    active_values = darkening[darkening >= 3.0]
+    if active_values.size < max(20, round(height * width * 0.0005)):
+        return None
+
+    minimum_area = max(80, round(height * width * 0.0008))
+    maximum_area = round(height * width * 0.25)
+    thresholds = sorted(
+        {
+            max(3.0, float(np.percentile(active_values, percentile)))
+            for percentile in (45.0, 60.0, 75.0, 87.5, 95.0, 97.0, 99.0)
+        }
+    )
+    best_candidate: tuple[float, float, float, float] | None = None
+    open_kernel = np.ones((3, 3), dtype=np.uint8)
+    close_kernel = np.ones((5, 5), dtype=np.uint8)
+
+    for threshold in thresholds:
+        mask = (darkening >= threshold).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if not minimum_area <= area <= maximum_area:
+                continue
+            perimeter = float(cv2.arcLength(contour, True))
+            if perimeter <= 0:
+                continue
+            circularity = float(4.0 * math.pi * area / (perimeter * perimeter))
+            x, y, component_width, component_height = cv2.boundingRect(contour)
+            aspect_ratio = max(component_width, component_height) / max(1, min(component_width, component_height))
+            if circularity < 0.32 or aspect_ratio > 2.2:
+                continue
+
+            component_mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.drawContours(component_mask, [contour], -1, 1, thickness=-1)
+            selected = component_mask.astype(bool)
+            response = float(np.median(darkening[selected]))
+            fill_fraction = area / max(1, component_width * component_height)
+            edge_margin = min(x, y, width - (x + component_width), height - (y + component_height))
+            edge_factor = 0.65 if edge_margin <= 1 else 1.0
+            score = response * math.sqrt(area) * circularity**2 * (0.5 + fill_fraction) * edge_factor
+            if best_candidate is None or score > best_candidate[0]:
+                (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+                best_candidate = (score, float(center_x), float(center_y), float(radius))
+
+    if best_candidate is None:
+        return None
+
+    _, center_x, center_y, radius = best_candidate
+    roi_size = max(8, round(radius * 2.3))
+    roi_size = min(roi_size, width, height)
+    roi_x = max(0, min(width - roi_size, round(center_x - roi_size / 2)))
+    roi_y = max(0, min(height - roi_size, round(center_y - roi_size / 2)))
+    return QRect(roi_x, roi_y, roi_size, roi_size)
+
+
 def segment_temporal_change_map(
     temporal_change: np.ndarray,
     change_threshold: float,
@@ -802,6 +889,11 @@ class VideoDisplay(QLabel):
         self._roi = None
         self.update()
 
+    def set_roi(self, roi: QRect | None) -> None:
+        self._roi = QRect(roi) if roi is not None and roi.isValid() else None
+        self.update()
+        self.roiChanged.emit(QRect(self._roi) if self._roi is not None else QRect())
+
     def paintEvent(self, event) -> None:  # noqa: ANN001
         super().paintEvent(event)
         painter = QPainter(self)
@@ -951,7 +1043,7 @@ class VideoPanel(QFrame):
 
         self.display = VideoDisplay(label, color)
         self.display.set_comparison_enabled(self.comparison_display)
-        self.display.roiChanged.connect(self.roiChanged.emit)
+        self.display.roiChanged.connect(lambda _roi: self.roiChanged.emit())
 
         self.title_label = QLabel(label)
         self.title_label.setObjectName("panelTitle")
@@ -973,7 +1065,9 @@ class VideoPanel(QFrame):
         layout.addWidget(self.display, 1)
 
         self.setObjectName("videoPanel")
-        self.set_trim_window(detect_pre_injection_trim_start(self._sample_cropped_gray_frames(), self.info.fps))
+        gray_frames = self._sample_cropped_gray_frames()
+        self.set_trim_window(detect_pre_injection_trim_start(gray_frames, self.info.fps))
+        self.auto_detect_aneurysm(gray_frames)
         self.seek(0)
 
     def _sample_cropped_gray_frames(self) -> list[np.ndarray]:
@@ -1804,6 +1898,14 @@ class VideoPanel(QFrame):
     def roi(self) -> QRect | None:
         return self.display.roi()
 
+    def auto_detect_aneurysm(self, gray_frames: list[np.ndarray] | None = None) -> QRect | None:
+        source_frames = gray_frames if gray_frames is not None else self._sample_cropped_gray_frames()
+        start = self.trim_start_frame
+        end = min(len(source_frames), start + self.playback_frame_count)
+        roi = detect_aneurysm_roi(source_frames[start:end], self.info.fps)
+        self.display.set_roi(roi)
+        return roi
+
     def set_video(self, path: Path) -> None:
         self.capture.release()
         self.path = path
@@ -1811,9 +1913,10 @@ class VideoPanel(QFrame):
         self.crop_rect = detect_fluoroscope_crop(path, self.info)
         self.capture = cv2.VideoCapture(str(path))
         self.path_label.setText(path.name)
-        self.set_trim_window(detect_pre_injection_trim_start(self._sample_cropped_gray_frames(), self.info.fps))
+        gray_frames = self._sample_cropped_gray_frames()
+        self.set_trim_window(detect_pre_injection_trim_start(gray_frames, self.info.fps))
         self.meta_label.setText(self._metadata_text())
-        self.display.clear_roi()
+        self.auto_detect_aneurysm(gray_frames)
         self.display.set_comparison_enabled(self.comparison_display)
         self.seek(0)
 
@@ -2049,7 +2152,7 @@ class ContrastWindow(QMainWindow):
         self.on_enhancement_settings_changed()
         self.set_display_enhancement(False)
         self.update_time_label()
-        self.statusBar().showMessage("Draw one ROI on each video, then run analysis.")
+        self.on_roi_changed()
 
     def _build_actions(self) -> None:
         self.open_pre_action = QAction("Open pre-deployment video...", self)
@@ -2193,9 +2296,12 @@ class ContrastWindow(QMainWindow):
         analysis_layout.setSpacing(10)
 
         controls.addTab(enhancement_tab, "Enhancement")
-        controls.addTab(analysis_tab, "ROI analysis")
+        controls.addTab(analysis_tab, "Aneurysm analysis")
 
-        hint = QLabel("Draw a box over the aneurysm sac in each video. The signal is computed as baseline brightness minus ROI brightness, so darker contrast produces a positive curve.")
+        hint = QLabel(
+            "Aneurysm ROIs are extracted automatically from circular regions that darken as contrast enters. "
+            "Drag on a video only when a detected ROI needs correction."
+        )
         hint.setWordWrap(True)
         hint.setObjectName("hintLabel")
         analysis_layout.addWidget(hint)
@@ -2287,7 +2393,11 @@ class ContrastWindow(QMainWindow):
         threshold_row.addWidget(self.threshold_spin)
         analysis_layout.addLayout(threshold_row)
 
-        self.analyze_button = QPushButton("Analyze ROIs")
+        self.redetect_button = QPushButton("Redetect aneurysms")
+        self.redetect_button.clicked.connect(self.redetect_aneurysms)
+        analysis_layout.addWidget(self.redetect_button)
+
+        self.analyze_button = QPushButton("Analyze aneurysms")
         self.analyze_button.setObjectName("primaryButton")
         self.analyze_button.clicked.connect(self.run_analysis)
         analysis_layout.addWidget(self.analyze_button)
@@ -2807,9 +2917,15 @@ class ContrastWindow(QMainWindow):
         self.clear_plots_and_metrics()
         ready = all(panel.roi() for panel in self.panels)
         if ready:
-            self.statusBar().showMessage("Both ROIs are selected. Run analysis to compare contrast residence.")
+            self.statusBar().showMessage("Automatic aneurysm ROIs are ready. Run analysis to compare contrast residence.")
         else:
-            self.statusBar().showMessage("Draw one ROI on each video.")
+            self.statusBar().showMessage("Automatic aneurysm extraction needs review; redetect or draw a correction.")
+
+    def redetect_aneurysms(self) -> None:
+        self.pause()
+        for panel in self.panels:
+            panel.auto_detect_aneurysm()
+        self.on_roi_changed()
 
     def set_display_enhancement(self, enabled: bool) -> None:
         for panel in self.panels:
@@ -3240,7 +3356,13 @@ class ContrastWindow(QMainWindow):
     def run_analysis(self) -> None:
         missing = [panel.label for panel in self.panels if panel.roi() is None]
         if missing:
-            QMessageBox.information(self, "ROIs required", "Draw an ROI on: " + ", ".join(missing))
+            QMessageBox.information(
+                self,
+                "Aneurysm not detected",
+                "Automatic extraction could not identify the aneurysm in: "
+                + ", ".join(missing)
+                + ". Redetect or draw a correction on the video.",
+            )
             return
 
         self.pause()

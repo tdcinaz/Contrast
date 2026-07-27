@@ -18,16 +18,17 @@ Use the **File** menu to choose different videos if needed.
 
 ## Workflow
 
-1. Use the playback controls to navigate to a frame where the aneurysm sac is visible. Adjust the playback speed slider as needed.
-2. Drag with the mouse on each video to draw an ROI box around the saccular aneurysm.
+1. Let the app automatically extract the aneurysm ROI from each video. It identifies compact, roughly circular regions that darken as contrast enters.
+2. Review the detected boxes during playback. Use **Redetect aneurysms** to rerun extraction, or drag on a video only to correct a detection manually.
 3. Enable live processing stages in order. Each change rebuilds both full videos, updates the video panels, and passes the cumulative result to every enabled downstream stage.
-4. Click **Analyze ROIs**.
+4. Click **Analyze aneurysms**.
 5. Compare the normalized contrast curves, raw ROI brightness curves, and residence-time cards.
 6. Adjust the clearance threshold if needed. The metrics update from the already measured curves.
 7. Export a CSV for downstream analysis.
 
 Quality controls are available:
 
+- **Automatic aneurysm extraction** stabilizes frame-wide intensity, measures directional darkening from the pre-injection baseline through the trimmed video, and searches multiple response levels for compact circular components. Candidates are ranked by temporal contrast response, area, circularity, and fill. The resulting square ROI feeds the existing residence analysis directly; manual dragging remains available for correction when model geometry or artifacts make the automatic result unsuitable.
 - **Automatic fluoroscope crop** runs when each video is loaded. Circular collimator fields are segmented across sampled frames, then cropped to the largest centered square with at least 99.5% in-field coverage and a size divisible by 32. This removes dark margins, gives paired videos consistent accelerator-friendly shapes, and applies before ROI drawing, enhancement, and analysis. Non-circular videos retain the pillarbox-only fallback.
 
 - **NGC FFDNet (Docker)** is the default display-enhancement backend. It runs FFDNet in the local `nvcr.io/nvidia/pytorch:26.06-py3` ARM64 image and exchanges configurable batches with the desktop process through shared memory. One persistent NGC worker is assigned to each concurrently enhanced video, and mapped batches are passed directly to PyTorch without an intermediate host copy.

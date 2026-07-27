@@ -12,6 +12,7 @@ from main import (
     ContrastWindow,
     VideoPanel,
     compute_temporal_change_map,
+    detect_aneurysm_roi,
     overlay_segmentation_mask,
     segment_dark_contrast,
     segment_temporal_change_map,
@@ -20,6 +21,31 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_aneurysm_detection_rejects_video_without_temporal_darkening(self) -> None:
+        frames = [np.full((120, 160), 175, dtype=np.uint8) for _ in range(12)]
+        for frame in frames:
+            cv2.circle(frame, (80, 60), 22, 95, thickness=-1)
+
+        self.assertIsNone(detect_aneurysm_roi(frames, fps=10.0))
+
+    def test_detects_circular_contrast_filling_region_over_vessel_and_static_shapes(self) -> None:
+        frames: list[np.ndarray] = []
+        for step in range(16):
+            frame = np.full((180, 240), 180 + step // 4, dtype=np.uint8)
+            cv2.circle(frame, (65, 55), 17, 95 + step // 4, thickness=-1)
+            cv2.rectangle(frame, (125, 82), (225, 94), 180 - step * 5, thickness=-1)
+            cv2.circle(frame, (82, 125), 24, 180 - step * 6, thickness=-1)
+            frames.append(frame)
+
+        roi = detect_aneurysm_roi(frames, fps=10.0)
+
+        self.assertIsNotNone(roi)
+        assert roi is not None
+        self.assertTrue(roi.contains(82, 125))
+        self.assertFalse(roi.contains(65, 55))
+        self.assertFalse(roi.contains(180, 88))
+        self.assertAlmostEqual(roi.width(), roi.height(), delta=4)
+
     def test_preserves_component_brightness_and_removes_small_components(self) -> None:
         frame = np.full((160, 160), 180, dtype=np.uint8)
         cv2.circle(frame, (55, 80), 18, 45, thickness=-1)
