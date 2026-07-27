@@ -220,6 +220,16 @@ class EnhancementRequest:
     noise_sigma: int
     batch_size: int
     precision: str
+    auto_crop: bool
+    temporal_alignment: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePipelineState:
+    crop_rect: QRect
+    trim_start: int
+    auto_crop_rect: QRect | None
+    trim_cache_key: tuple[int, int, int, int] | None
 
 
 @dataclass(slots=True)
@@ -439,7 +449,11 @@ def _detect_pillarbox_crop(gray_frames: list[np.ndarray], width: int, height: in
     return QRect(left, 0, cropped_width, height)
 
 
-def detect_fluoroscope_crop(path: Path, info: VideoInfo) -> QRect:
+def detect_fluoroscope_crop(
+    path: Path,
+    info: VideoInfo,
+    progress_callback: Callable[[int, int], bool] | None = None,
+) -> QRect:
     full_frame = QRect(0, 0, info.width, info.height)
     if info.width <= 0 or info.height <= 0:
         return full_frame
@@ -452,12 +466,14 @@ def detect_fluoroscope_crop(path: Path, info: VideoInfo) -> QRect:
         sample_count = min(24, max(6, info.frame_count if info.frame_count > 0 else 6))
         frame_indexes = np.unique(np.linspace(0, max(0, info.frame_count - 1), num=sample_count, dtype=int))
         gray_frames: list[np.ndarray] = []
-        for frame_index in frame_indexes:
+        for sample_index, frame_index in enumerate(frame_indexes):
             capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
             ok, frame = capture.read()
             if not ok:
                 continue
             gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            if progress_callback is not None and not progress_callback(sample_index + 1, len(frame_indexes)):
+                return full_frame
 
         if len(gray_frames) < 3:
             return full_frame
@@ -1215,49 +1231,99 @@ class VideoPanel(QFrame):
     def _crop_rect_key(self, crop_rect: QRect) -> tuple[int, int, int, int]:
         return crop_rect.x(), crop_rect.y(), crop_rect.width(), crop_rect.height()
 
-    def apply_source_pipeline(self, auto_crop_enabled: bool, temporal_alignment_enabled: bool) -> bool:
+    def calculate_source_pipeline(
+        self,
+        auto_crop_enabled: bool,
+        temporal_alignment_enabled: bool,
+        progress_callback: Callable[[str, float, float], bool] | None = None,
+    ) -> SourcePipelineState:
         full_rect = self._full_frame_rect()
         next_crop_rect = full_rect
+        source_stage_count = int(auto_crop_enabled) + int(temporal_alignment_enabled)
+        completed_stages = 0
+
+        def report(stage: str, done: float, total: float) -> bool:
+            return progress_callback is None or progress_callback(
+                stage,
+                completed_stages + done / max(1.0, total),
+                source_stage_count,
+            )
+
+        auto_crop_rect = self._auto_crop_rect_cache
         if auto_crop_enabled:
-            if self._auto_crop_rect_cache is None:
-                self._auto_crop_rect_cache = detect_fluoroscope_crop(self.path, self.info)
-            next_crop_rect = QRect(self._auto_crop_rect_cache)
+            if auto_crop_rect is None:
+                auto_crop_rect = detect_fluoroscope_crop(
+                    self.path,
+                    self.info,
+                    lambda done, total: report("Auto-cropping", done, total),
+                )
+            next_crop_rect = QRect(auto_crop_rect)
+            report("Auto-cropping", 1.0, 1.0)
+            completed_stages += 1
 
         next_trim_start = 0
+        trim_cache_key: tuple[int, int, int, int] | None = None
         if temporal_alignment_enabled:
             crop_key = self._crop_rect_key(next_crop_rect)
+            trim_cache_key = crop_key
             cached_trim_start = self._trim_start_cache.get(crop_key)
             if cached_trim_start is None:
-                previous_crop = QRect(self.crop_rect)
-                self.crop_rect = QRect(next_crop_rect)
-                gray_frames = self._sample_cropped_gray_frames()
-                self.crop_rect = previous_crop
+                gray_frames = self._sample_cropped_gray_frames(
+                    next_crop_rect,
+                    lambda done, total: report("Aligning contrast timing", done, total),
+                )
                 cached_trim_start = detect_pre_injection_trim_start(gray_frames, self.info.fps)
-                self._trim_start_cache[crop_key] = cached_trim_start
             next_trim_start = cached_trim_start
+            report("Aligning contrast timing", 1.0, 1.0)
 
-        available_frames = max(1, self.info.frame_count - next_trim_start)
+        return SourcePipelineState(
+            crop_rect=next_crop_rect,
+            trim_start=next_trim_start,
+            auto_crop_rect=auto_crop_rect,
+            trim_cache_key=trim_cache_key,
+        )
+
+    def apply_source_pipeline_state(self, state: SourcePipelineState) -> bool:
+        if state.auto_crop_rect is not None:
+            self._auto_crop_rect_cache = QRect(state.auto_crop_rect)
+        if state.trim_cache_key is not None:
+            self._trim_start_cache[state.trim_cache_key] = state.trim_start
+
+        available_frames = max(1, self.info.frame_count - state.trim_start)
         if (
-            next_crop_rect == self.crop_rect
-            and next_trim_start == self.trim_start_frame
+            state.crop_rect == self.crop_rect
+            and state.trim_start == self.trim_start_frame
             and self.trim_frame_count == available_frames
         ):
             return False
 
-        self.crop_rect = next_crop_rect
-        self.set_trim_window(next_trim_start)
+        self.crop_rect = QRect(state.crop_rect)
+        self.set_trim_window(state.trim_start)
         self._activate_stage_roi_selection(None)
         return True
 
-    def _sample_cropped_gray_frames(self) -> list[np.ndarray]:
+    def apply_source_pipeline(self, auto_crop_enabled: bool, temporal_alignment_enabled: bool) -> bool:
+        return self.apply_source_pipeline_state(
+            self.calculate_source_pipeline(auto_crop_enabled, temporal_alignment_enabled)
+        )
+
+    def _sample_cropped_gray_frames(
+        self,
+        crop_rect: QRect | None = None,
+        progress_callback: Callable[[int, int], bool] | None = None,
+    ) -> list[np.ndarray]:
         capture = cv2.VideoCapture(str(self.path))
         gray_frames: list[np.ndarray] = []
+        active_crop_rect = crop_rect if crop_rect is not None else self.crop_rect
+        frame_count = max(1, self.info.frame_count)
         try:
-            while True:
+            for frame_index in range(frame_count):
                 ok, frame = capture.read()
                 if not ok:
                     break
-                gray_frames.append(cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY))
+                gray_frames.append(cv2.cvtColor(crop_frame(frame, active_crop_rect), cv2.COLOR_BGR2GRAY))
+                if progress_callback is not None and not progress_callback(frame_index + 1, frame_count):
+                    break
         finally:
             capture.release()
         return gray_frames
@@ -2543,6 +2609,7 @@ class ContrastWindow(QMainWindow):
         self._enhancement_generation = 0
         self._enhancement_frame_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
         self._segmentation_mask_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
+        self._source_pipeline_events: SimpleQueue[tuple[int, list[SourcePipelineState], Event]] = SimpleQueue()
         self._enhancement_progress_lock = Lock()
         self._enhancement_progress_values = [0.0, 0.0]
         self._enhancement_progress_totals = [1.0, 1.0]
@@ -2611,9 +2678,16 @@ class ContrastWindow(QMainWindow):
     def _apply_source_pipeline_stages(self) -> bool:
         auto_crop_enabled = self._has_enabled_stage("auto_crop")
         temporal_alignment_enabled = self._has_enabled_stage("temporal_alignment")
+        states = [
+            panel.calculate_source_pipeline(auto_crop_enabled, temporal_alignment_enabled)
+            for panel in self.panels
+        ]
+        return self._apply_source_pipeline_states(states)
+
+    def _apply_source_pipeline_states(self, states: list[SourcePipelineState]) -> bool:
         changed = False
-        for panel in self.panels:
-            changed = panel.apply_source_pipeline(auto_crop_enabled, temporal_alignment_enabled) or changed
+        for panel, state in zip(self.panels, states):
+            changed = panel.apply_source_pipeline_state(state) or changed
         if not changed:
             return False
 
@@ -3060,7 +3134,7 @@ class ContrastWindow(QMainWindow):
             self.pipeline_stage_drawers.insert(insert_index, drawer)
         self._sync_pipeline_stage_lists()
         self._refresh_pipeline_stage_ui()
-        if not self._loading_config:
+        if drawer.enable_button.isChecked() and not self._loading_config:
             self.on_pipeline_stages_changed()
 
     def _duplicate_pipeline_stage(self, drawer: StageDrawer) -> None:
@@ -3069,16 +3143,17 @@ class ContrastWindow(QMainWindow):
         self.pipeline_stage_drawers.insert(self.pipeline_stage_drawers.index(drawer) + 1, duplicate)
         self._sync_pipeline_stage_lists()
         self._refresh_pipeline_stage_ui()
-        self.on_pipeline_stages_changed()
 
     def _delete_pipeline_stage(self, drawer: StageDrawer) -> None:
+        was_enabled = drawer.enable_button.isChecked()
         self.pipeline_stage_drawers.remove(drawer)
         self.enhancement_layout.removeWidget(drawer)
         drawer.hide()
         drawer.setParent(None)
         self._sync_pipeline_stage_lists()
         self._refresh_pipeline_stage_ui()
-        self.on_pipeline_stages_changed()
+        if was_enabled:
+            self.on_pipeline_stages_changed()
 
     def _drawer_parameters(self, drawer: StageDrawer) -> EnhancementParameters:
         def value(name: str, default: int | float | bool | str) -> int | float | bool | str:
@@ -3902,10 +3977,6 @@ class ContrastWindow(QMainWindow):
         )
 
     def on_enhancement_settings_changed(self) -> None:
-        source_changed = self._apply_source_pipeline_stages()
-        if source_changed:
-            self.results.clear()
-            self.clear_plots_and_metrics()
         active_mode = str(self.enhancement_mode_combo.currentData())
         stages = self.enhancement_stages()
         use_deep_model = stages.denoise and active_mode != "classical"
@@ -3955,7 +4026,16 @@ class ContrastWindow(QMainWindow):
         )
 
     def _pipeline_has_active_stage(self) -> bool:
-        return self.enhancement_stages().any_enabled or self._has_enabled_stage("roi_residence_analysis")
+        return (
+            self.enhancement_stages().any_enabled
+            or self._has_enabled_stage("roi_residence_analysis")
+            or self._has_enabled_stage("auto_crop")
+            or self._has_enabled_stage("temporal_alignment")
+            or any(
+                panel.crop_rect != panel._full_frame_rect() or panel.trim_start_frame != 0
+                for panel in self.panels
+            )
+        )
 
     def _current_backend_id(self, stages: EnhancementStages) -> str:
         mode = str(self.enhancement_mode_combo.currentData())
@@ -4128,10 +4208,6 @@ class ContrastWindow(QMainWindow):
         )
 
     def on_pipeline_stages_changed(self) -> None:
-        source_changed = self._apply_source_pipeline_stages()
-        if source_changed:
-            self.results.clear()
-            self.clear_plots_and_metrics()
         stages = self.enhancement_stages()
         active_mode = str(self.enhancement_mode_combo.currentData())
         use_deep_model = stages.denoise and active_mode != "classical"
@@ -4150,10 +4226,7 @@ class ContrastWindow(QMainWindow):
             self.results.clear()
             self.clear_plots_and_metrics()
             self._update_stage_statuses()
-            if source_changed:
-                self.statusBar().showMessage("Source pipeline updated. Showing original videos.")
-            else:
-                self.statusBar().showMessage("Showing original videos.")
+            self.statusBar().showMessage("Showing original videos.")
 
     def reset_enhancement_pipeline(self) -> None:
         for check in self.pipeline_stage_checks:
@@ -4179,6 +4252,8 @@ class ContrastWindow(QMainWindow):
             noise_sigma=self.denoise_strength_spin.value(),
             batch_size=self.inference_batch_spin.value(),
             precision=str(self.inference_precision_combo.currentData()),
+            auto_crop=self._has_enabled_stage("auto_crop"),
+            temporal_alignment=self._has_enabled_stage("temporal_alignment"),
         )
         self._enhancement_pending_request = request
         if self._enhancement_cancel is not None:
@@ -4217,6 +4292,51 @@ class ContrastWindow(QMainWindow):
         self.enhancement_poll_timer.start()
 
     def _run_enhancement_request(self, request: EnhancementRequest, cancel_event: Event) -> bool:
+        source_stage_count = int(request.auto_crop) + int(request.temporal_alignment)
+
+        def calculate_source_panel(panel_index: int) -> SourcePipelineState:
+            panel = self.panels[panel_index]
+
+            def source_progress(stage_message: str, done: float, total: float) -> bool:
+                with self._enhancement_progress_lock:
+                    self._enhancement_stage_messages[panel_index] = stage_message
+                    self._enhancement_progress_values[panel_index] = done
+                    self._enhancement_progress_totals[panel_index] = max(total, 0.001)
+                    self._enhancement_message = "Preparing source pipeline..."
+                return not cancel_event.is_set()
+
+            return panel.calculate_source_pipeline(
+                request.auto_crop,
+                request.temporal_alignment,
+                source_progress,
+            )
+
+        source_states: list[SourcePipelineState | None] = [None] * len(self.panels)
+        with frame_parallel_opencv(), ThreadPoolExecutor(
+            max_workers=len(self.panels),
+            thread_name_prefix="source-pipeline",
+        ) as executor:
+            futures = {
+                executor.submit(calculate_source_panel, panel_index): panel_index
+                for panel_index in range(len(self.panels))
+            }
+            for future in as_completed(futures):
+                source_states[futures[future]] = future.result()
+                if cancel_event.is_set():
+                    return False
+
+        source_states_applied = Event()
+        self._source_pipeline_events.put(
+            (request.generation, [state for state in source_states if state is not None], source_states_applied)
+        )
+        while not source_states_applied.wait(0.05):
+            if cancel_event.is_set():
+                return False
+        if cancel_event.is_set():
+            return False
+        if not request.stages.any_enabled:
+            return True
+
         use_deep_model = request.stages.denoise and request.mode != "classical"
         denoiser_base_key = (
             f"{request.mode}:{request.precision}:batch{request.batch_size}"
@@ -4276,7 +4396,7 @@ class ContrastWindow(QMainWindow):
             for panel in self.panels
         ]
         with self._enhancement_progress_lock:
-            self._enhancement_progress_totals = [max(work, 0.001) for work in panel_work]
+            self._enhancement_progress_totals = [source_stage_count + max(work, 0.001) for work in panel_work]
             if denoisers:
                 worker_label = f" with {len(denoisers)} accelerator workers" if len(denoisers) > 1 else ""
                 self._enhancement_message = (
@@ -4297,8 +4417,8 @@ class ContrastWindow(QMainWindow):
 
             def progress_callback(done: float, panel_total: float) -> bool:
                 with self._enhancement_progress_lock:
-                    self._enhancement_progress_values[panel_index] = done
-                    self._enhancement_progress_totals[panel_index] = panel_total
+                    self._enhancement_progress_values[panel_index] = source_stage_count + done
+                    self._enhancement_progress_totals[panel_index] = source_stage_count + panel_total
                 return not cancel_event.is_set()
 
             def stage_progress_callback(stage_message: str, done: int, total: int) -> bool:
@@ -4353,6 +4473,20 @@ class ContrastWindow(QMainWindow):
 
     def _poll_enhancement(self) -> None:
         changed_panels: set[int] = set()
+        while True:
+            try:
+                generation, states, states_applied = self._source_pipeline_events.get_nowait()
+            except Empty:
+                break
+            try:
+                if generation == self._enhancement_generation:
+                    source_changed = self._apply_source_pipeline_states(states)
+                    if source_changed:
+                        self.results.clear()
+                        self.clear_plots_and_metrics()
+            finally:
+                states_applied.set()
+
         while True:
             try:
                 generation, panel_index, frame_index, encoded = self._segmentation_mask_events.get_nowait()

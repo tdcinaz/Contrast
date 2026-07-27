@@ -27,6 +27,21 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_disabled_pipeline_stage_changes_do_not_rebuild(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+
+        with patch.object(window, "rebuild_enhancement_pipeline") as rebuild:
+            window._add_pipeline_stage("local_contrast")
+            first_drawer = window.pipeline_stage_drawers[0]
+            window._duplicate_pipeline_stage(first_drawer)
+            window._delete_pipeline_stage(window.pipeline_stage_drawers[1])
+            rebuild.assert_not_called()
+
+            first_drawer.enable_button.setChecked(True)
+            rebuild.assert_called_once()
+
     def test_config_round_trip_restores_duplicate_stage_settings(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = ContrastWindow()
@@ -290,6 +305,7 @@ class SegmentationTests(unittest.TestCase):
         window = SimpleNamespace(
             _segmentation_mask_events=mask_events,
             _enhancement_frame_events=SimpleQueue(),
+            _source_pipeline_events=SimpleQueue(),
             _enhancement_generation=7,
             _enhancement_active_request=None,
             _enhancement_future=pending_future,
