@@ -1052,7 +1052,7 @@ class VideoDisplay(QLabel):
                 painter.drawPixmap(self._right_display_rect, right_scaled)
 
                 painter.setPen(QColor("#64748b"))
-                painter.drawText(left_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Original")
+                painter.drawText(left_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Source")
                 painter.drawText(right_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Enhanced")
             else:
                 full_slot = QRect(0, 0, self.width(), self.height())
@@ -2671,7 +2671,7 @@ class ContrastWindow(QMainWindow):
         self.frame_slider.setEnabled(enabled)
         self.frame_spin.setEnabled(enabled)
         self.speed_slider.setEnabled(enabled)
-        self.compare_view_check.setEnabled(enabled and len(self.panels) >= 2)
+        self.compare_view_check.setEnabled(enabled)
         self.overlay_mask_check.setEnabled(enabled and self._has_enabled_stage("segmentation"))
         self.open_pre_action.setEnabled(enabled and bool(self.pre_panel))
         self.open_post_action.setEnabled(enabled and bool(self.post_panel))
@@ -2721,10 +2721,7 @@ class ContrastWindow(QMainWindow):
         self.active_mode = MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE
         self.open_pre_action.setText(f"Open {self.pre_panel.label.lower()} video..." if self.pre_panel else "Open video 1...")
         self.open_post_action.setText(f"Open {self.post_panel.label.lower()} video..." if self.post_panel else "Open video 2...")
-        self.compare_view_check.blockSignals(True)
-        self.compare_view_check.setChecked(len(self.panels) > 1)
-        self.compare_view_check.blockSignals(False)
-        self.compare_view_check.setEnabled(len(self.panels) > 1)
+        self.compare_view_check.setEnabled(True)
         self.enhancement_progress.configure_panels([panel.label for panel in self.panels])
         self.video_stack.setCurrentWidget(self.video_row)
         self.results.clear()
@@ -2736,6 +2733,7 @@ class ContrastWindow(QMainWindow):
         self.clear_plots_and_metrics()
         self._update_stage_statuses()
         self._set_video_controls_enabled(True)
+        self.on_compare_view_toggled(self.compare_view_check.isChecked())
         if len(self.panels) == 1:
             self.pre_card.title.setText("Residence")
             self.post_card.title.setText("Comparison")
@@ -2870,8 +2868,9 @@ class ContrastWindow(QMainWindow):
         self.time_label = QLabel()
         self.time_label.setObjectName("timeLabel")
 
-        self.compare_view_check = QCheckBox("Side-by-side compare")
+        self.compare_view_check = QCheckBox("Show source")
         self.compare_view_check.setChecked(True)
+        self.compare_view_check.setToolTip("Show source beside enhanced output")
         self.compare_view_check.toggled.connect(self.on_compare_view_toggled)
 
         self.overlay_mask_check = QCheckBox("Mask overlay")
@@ -4155,14 +4154,12 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage("Video enhancement enabled." if enabled else "Video enhancement disabled.")
 
     def on_compare_view_toggled(self, enabled: bool) -> None:
-        if len(self.panels) < 2:
-            return
         for panel in self.panels:
             panel.set_comparison(enabled, self.current_frame_index)
         if enabled:
-            self.statusBar().showMessage("Side-by-side original vs enhanced comparison enabled.")
+            self.statusBar().showMessage("Showing source beside enhanced output.")
         else:
-            self.statusBar().showMessage("Single-view mode enabled.")
+            self.statusBar().showMessage("Showing enhanced output only.")
 
     def on_segmentation_overlay_toggled(self, enabled: bool) -> None:
         if not self.panels:
@@ -4992,6 +4989,7 @@ class ContrastWindow(QMainWindow):
                 for drawer in self.pipeline_stage_drawers
             ],
             "view": {
+                "show_source": self.compare_view_check.isChecked(),
                 "compare_enabled": self.compare_view_check.isChecked(),
                 "mask_overlay_enabled": self.overlay_mask_check.isChecked(),
                 "playback_speed": self.speed_slider.value(),
@@ -5141,7 +5139,8 @@ class ContrastWindow(QMainWindow):
 
             view = config.get("view", {})
             if isinstance(view, dict):
-                self.compare_view_check.setChecked(bool(view.get("compare_enabled", True)))
+                show_source = view.get("show_source", view.get("compare_enabled", True))
+                self.compare_view_check.setChecked(bool(show_source))
                 self.overlay_mask_check.setChecked(bool(view.get("mask_overlay_enabled", True)))
                 playback_speed = view.get("playback_speed", 100)
                 if isinstance(playback_speed, int):
