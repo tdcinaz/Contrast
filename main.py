@@ -16,7 +16,7 @@ from typing import Callable, Generator, Protocol, cast
 import cv2
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -2253,26 +2253,35 @@ class StageDrawer(QFrame):
         self.stage_title = title
 
         self.enable_check = QCheckBox()
+        self.stage_label = QLabel()
         self.grab_handle = QLabel("||")
         self.grab_handle.setObjectName("stageGrabHandle")
         self.grab_handle.setToolTip("Drag to reorder stage")
         self.expand_button = QToolButton()
-        self.expand_button.setText("Options")
-        self.expand_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.expand_button.setObjectName("stageExpandButton")
+        self.expand_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.expand_button.setArrowType(Qt.ArrowType.RightArrow)
         self.expand_button.setCheckable(True)
         self.expand_button.setChecked(False)
+        self.expand_button.setFixedSize(32, 32)
+        self.expand_button.setToolTip("Show stage options")
         self.set_stage_index(stage_index)
         self._drag_start_pos = QPoint()
         self._drag_from_handle = False
         self._is_dragging = False
         self._drag_enabled = True
 
-        header = QHBoxLayout()
+        self.header = QWidget()
+        self.header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.header.setToolTip("Show or hide stage options")
+        self.header.installEventFilter(self)
+        self.stage_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        header = QHBoxLayout(self.header)
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
         header.addWidget(self.grab_handle)
-        header.addWidget(self.enable_check, 1)
+        header.addWidget(self.enable_check)
+        header.addWidget(self.stage_label, 1)
         header.addWidget(self.expand_button)
 
         self.content = QWidget()
@@ -2289,12 +2298,23 @@ class StageDrawer(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(6)
-        layout.addLayout(header)
+        layout.addWidget(self.header)
         layout.addWidget(self.status_label)
         layout.addWidget(self.content)
 
         self.enable_check.stateChanged.connect(self.enabledChanged.emit)
         self.expand_button.toggled.connect(self._set_expanded)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            watched is self.header
+            and event.type() == QEvent.Type.MouseButtonRelease
+            and isinstance(event, QMouseEvent)
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.expand_button.toggle()
+            return True
+        return super().eventFilter(watched, event)
 
     def _is_on_grab_handle(self, point: QPoint) -> bool:
         widget = self.childAt(point)
@@ -2342,7 +2362,7 @@ class StageDrawer(QFrame):
         self.content.setVisible(expanded)
 
     def set_stage_index(self, stage_index: int) -> None:
-        self.enable_check.setText(f"{stage_index}. {self.stage_title}")
+        self.stage_label.setText(f"{stage_index}. {self.stage_title}")
 
     def set_reorder_enabled(self, drag_enabled: bool) -> None:
         self._drag_enabled = drag_enabled
