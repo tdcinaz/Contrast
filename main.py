@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -105,6 +106,14 @@ class VideoInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class PipelineStage:
+    key: str
+    enabled: bool
+    parameters: EnhancementParameters | None = None
+    noise_sigma: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class EnhancementStages:
     gain_stabilization: bool = False
     brightness_stabilization: bool = False
@@ -128,9 +137,12 @@ class EnhancementStages:
         "final_smoothing",
         "segmentation",
     )
+    instances: tuple[PipelineStage, ...] = ()
 
     @property
     def any_enabled(self) -> bool:
+        if self.instances:
+            return any(stage.enabled for stage in self.instances)
         return any(
             (
                 self.gain_stabilization,
@@ -148,7 +160,20 @@ class EnhancementStages:
 
     @property
     def enabled_stage_order(self) -> tuple[str, ...]:
+        if self.instances:
+            return tuple(stage.key for stage in self.instances if stage.enabled)
         return tuple(stage for stage in self.stage_order if bool(getattr(self, stage, False)))
+
+    def enabled_stage_instances(
+        self,
+        default_parameters: EnhancementParameters,
+    ) -> tuple[PipelineStage, ...]:
+        if self.instances:
+            return tuple(stage for stage in self.instances if stage.enabled)
+        return tuple(
+            PipelineStage(key=stage_key, enabled=True, parameters=default_parameters)
+            for stage_key in self.enabled_stage_order
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1344,8 +1369,13 @@ class VideoPanel(QFrame):
         parameters: EnhancementParameters,
     ) -> tuple[tuple[str, tuple[object, ...]], ...]:
         return tuple(
-            self._stage_token(stage_key, backend_id, noise_sigma, parameters)
-            for stage_key in stages.enabled_stage_order
+            self._stage_token(
+                stage.key,
+                backend_id,
+                stage.noise_sigma if stage.noise_sigma is not None else noise_sigma,
+                stage.parameters or parameters,
+            )
+            for stage in stages.enabled_stage_instances(parameters)
         )
 
     def _source_stage_token(self) -> tuple[str, tuple[object, ...]]:
@@ -1542,6 +1572,14 @@ class VideoPanel(QFrame):
     ) -> bool:
         backend_id = denoiser.backend_id if denoiser is not None else "classical"
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
+        enabled_stages = stages.enabled_stage_instances(parameters)
+        stage_parameters_by_prefix: dict[tuple[tuple[str, tuple[object, ...]], ...], EnhancementParameters] = {}
+        prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        stage_noise_by_prefix: dict[tuple[tuple[str, tuple[object, ...]], ...], int] = {}
+        for stage, token in zip(enabled_stages, sequence_key):
+            prefix += (token,)
+            stage_parameters_by_prefix[prefix] = stage.parameters or parameters
+            stage_noise_by_prefix[prefix] = stage.noise_sigma if stage.noise_sigma is not None else noise_sigma
         if sequence_key in self.encoded_frame_cache:
             encoded_frames = self.encoded_frame_cache[sequence_key]
             segmentation_masks = self._segmentation_masks_for_sequence(sequence_key)
@@ -1696,6 +1734,8 @@ class VideoPanel(QFrame):
         def run_stage(stage_index: int) -> None:
             token, stage_prefix = missing_stages[stage_index]
             stage_key = token[0]
+            stage_parameters = stage_parameters_by_prefix[stage_prefix]
+            stage_noise_sigma = stage_noise_by_prefix[stage_prefix]
             stage_name = self._stage_display_name(stage_key)
             input_queue = queues[stage_index]
             output_queue = queues[stage_index + 1]
@@ -1714,7 +1754,7 @@ class VideoPanel(QFrame):
 
             def apply_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
                 started_at = perf_counter()
-                transformed = self._apply_frame_stage(stage_key, frame, parameters)
+                transformed = self._apply_frame_stage(stage_key, frame, stage_parameters)
                 return transformed, perf_counter() - started_at
 
             def apply_temporal(
@@ -1727,7 +1767,7 @@ class VideoPanel(QFrame):
                     previous,
                     current,
                     following,
-                    parameters.temporal_motion_sigma,
+                    stage_parameters.temporal_motion_sigma,
                 )
                 return transformed, perf_counter() - started_at
 
@@ -1795,7 +1835,7 @@ class VideoPanel(QFrame):
 
                         def denoise_frames() -> tuple[list[np.ndarray], float]:
                             started_at = perf_counter()
-                            result = denoiser.denoise_batch(denoise_input, noise_sigma)
+                            result = denoiser.denoise_batch(denoise_input, stage_noise_sigma)
                             return result, perf_counter() - started_at
 
                         denoised_batch, duration = frame_executor.submit(denoise_frames).result()
@@ -1862,7 +1902,7 @@ class VideoPanel(QFrame):
                                 break
                 elif stage_key == "segmentation":
                     encoded_masks = segmentation_outputs.setdefault(stage_prefix, [])
-                    segmentation_mode = str(parameters.segmentation_mode)
+                    segmentation_mode = str(stage_parameters.segmentation_mode)
                     if segmentation_mode == "temporal_change":
                         stage_frames: list[tuple[int, np.ndarray]] = []
                         while True:
@@ -1882,10 +1922,10 @@ class VideoPanel(QFrame):
                                 self.temporal_change_map_cache[input_prefix] = temporal_change
                             temporal_mask = segment_temporal_change_map(
                                 temporal_change,
-                                parameters.segmentation_change_threshold,
-                                parameters.segmentation_level_tolerance,
-                                parameters.segmentation_min_area,
-                                parameters.segmentation_block_size,
+                                stage_parameters.segmentation_change_threshold,
+                                stage_parameters.segmentation_level_tolerance,
+                                stage_parameters.segmentation_min_area,
+                                stage_parameters.segmentation_block_size,
                             )
                             encoded_ok, encoded_mask = cv2.imencode(".png", temporal_mask)
                             duration = perf_counter() - started_at
@@ -1904,10 +1944,10 @@ class VideoPanel(QFrame):
                             started_at = perf_counter()
                             mask = segment_dark_contrast(
                                 frame,
-                                parameters.segmentation_block_size,
-                                parameters.segmentation_sensitivity,
-                                parameters.segmentation_level_tolerance,
-                                parameters.segmentation_min_area,
+                                stage_parameters.segmentation_block_size,
+                                stage_parameters.segmentation_sensitivity,
+                                stage_parameters.segmentation_level_tolerance,
+                                stage_parameters.segmentation_min_area,
                             )
                             encoded_ok, encoded_mask = cv2.imencode(".png", mask)
                             if not encoded_ok:
@@ -1952,9 +1992,9 @@ class VideoPanel(QFrame):
                         roi_outputs[stage_prefix] = detect_aneurysm_roi(
                             [frame for _, frame in stage_frames],
                             self.info.fps,
-                            soften_mask=bool(parameters.roi_softening_enabled),
-                            soften_radius_ratio=float(parameters.roi_softening_radius_ratio),
-                            soften_threshold=float(parameters.roi_softening_threshold),
+                            soften_mask=bool(stage_parameters.roi_softening_enabled),
+                            soften_radius_ratio=float(stage_parameters.roi_softening_radius_ratio),
+                            soften_threshold=float(stage_parameters.roi_softening_threshold),
                         )
                         active_seconds += perf_counter() - started_at
                         for frame_index, frame in stage_frames:
@@ -2288,6 +2328,7 @@ class StageDrawer(QFrame):
     dragStarted = Signal(object, QPoint)
     dragMoved = Signal(QPoint)
     dragFinished = Signal(QPoint)
+    optionsRequested = Signal(object, QPoint)
 
     def __init__(self, stage_key: str, title: str, stage_index: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2315,6 +2356,11 @@ class StageDrawer(QFrame):
         self.expand_button.setChecked(False)
         self.expand_button.setFixedSize(32, 32)
         self.expand_button.setToolTip("Show stage options")
+        self.options_button = QToolButton()
+        self.options_button.setObjectName("stageOptionsButton")
+        self.options_button.setText("...")
+        self.options_button.setFixedSize(32, 32)
+        self.options_button.setToolTip("Stage actions")
         self._set_enabled_icon(False)
         self.set_stage_index(stage_index)
         self._drag_start_pos = QPoint()
@@ -2334,6 +2380,7 @@ class StageDrawer(QFrame):
         header.addWidget(self.grab_handle)
         header.addWidget(self.enable_button)
         header.addWidget(self.stage_label, 1)
+        header.addWidget(self.options_button)
         header.addWidget(self.expand_button)
 
         self.content = QWidget()
@@ -2358,6 +2405,12 @@ class StageDrawer(QFrame):
         self.enable_button.toggled.connect(self._set_enabled_icon)
         self.enable_button.toggled.connect(lambda enabled: self.enabledChanged.emit(int(enabled)))
         self.expand_button.toggled.connect(self._set_expanded)
+        self.options_button.clicked.connect(
+            lambda: self.optionsRequested.emit(
+                self,
+                self.options_button.mapToGlobal(self.options_button.rect().bottomLeft()),
+            )
+        )
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (
@@ -2374,7 +2427,7 @@ class StageDrawer(QFrame):
     def _is_header_control_at(self, point: QPoint) -> bool:
         widget = self.header.childAt(point)
         while widget is not None:
-            if widget in (self.grab_handle, self.enable_button, self.expand_button):
+            if widget in (self.grab_handle, self.enable_button, self.options_button, self.expand_button):
                 return True
             widget = widget.parentWidget()
         return False
@@ -2543,8 +2596,8 @@ class ContrastWindow(QMainWindow):
         self.play_interval_ms = self._play_interval_ms()
 
     def _apply_source_pipeline_stages(self) -> bool:
-        auto_crop_enabled = self.auto_crop_stage_check.isChecked()
-        temporal_alignment_enabled = self.temporal_alignment_stage_check.isChecked()
+        auto_crop_enabled = self._has_enabled_stage("auto_crop")
+        temporal_alignment_enabled = self._has_enabled_stage("temporal_alignment")
         changed = False
         for panel in self.panels:
             changed = panel.apply_source_pipeline(auto_crop_enabled, temporal_alignment_enabled) or changed
@@ -2766,21 +2819,28 @@ class ContrastWindow(QMainWindow):
         self._dragged_pipeline_order: list[StageDrawer] | None = None
         self._stage_drag_offset_y = 0
         self._stage_drag_x = 0
-        default_enabled_checks = {
-            self.auto_crop_stage_check,
-            self.temporal_alignment_stage_check,
-        }
         for check in self.pipeline_stage_checks:
-            check.setChecked(check in default_enabled_checks)
+            check.setChecked(False)
             check.toggled.connect(self.on_pipeline_stages_changed)
         self._build_stage_drawer_controls()
+        self._name_stage_parameter_widgets()
         for drawer in self.pipeline_stage_drawers:
             drawer.reorderRequested.connect(self._reorder_pipeline_stage_by_key)
             drawer.dragStarted.connect(self._begin_pipeline_stage_drag)
             drawer.dragMoved.connect(self._move_pipeline_stage_drag)
             drawer.dragFinished.connect(self._finish_pipeline_stage_drag)
-        for drawer in self.pipeline_stage_drawers:
-            controls_layout.addWidget(drawer)
+            drawer.optionsRequested.connect(self._show_stage_options)
+
+        self.stage_drawer_templates = {drawer.stage_key: drawer for drawer in self.pipeline_stage_drawers}
+        self.pipeline_stage_drawers = []
+        self._sync_pipeline_stage_lists()
+
+        self.add_stage_button = QToolButton()
+        self.add_stage_button.setObjectName("addStageButton")
+        self.add_stage_button.setText("+")
+        self.add_stage_button.setFixedSize(32, 32)
+        self.add_stage_button.setToolTip("Add pipeline stage")
+        self.add_stage_button.clicked.connect(self._show_add_stage_menu)
 
         self._refresh_pipeline_stage_ui()
         controls_layout.addStretch()
@@ -2825,6 +2885,250 @@ class ContrastWindow(QMainWindow):
             drawer.expand_button.toggled.connect(self._update_pipeline_column_width)
         return controls_scroll
 
+    def _name_stage_parameter_widgets(self) -> None:
+        widget_names = {
+            "denoise_strength_label": "denoiseStrengthLabel",
+            "enhancement_mode_combo": "denoiseMode",
+            "denoise_strength_spin": "denoiseStrength",
+            "inference_batch_spin": "denoiseBatchSize",
+            "inference_precision_combo": "denoisePrecision",
+            "gain_auto_target_check": "gainUseAutoTarget",
+            "gain_target_spin": "gainTargetMedian",
+            "gain_min_spin": "gainMinimum",
+            "gain_max_spin": "gainMaximum",
+            "roi_soften_check": "roiSoftenEnabled",
+            "roi_radius_spin": "roiSofteningRadius",
+            "roi_threshold_spin": "roiSofteningThreshold",
+            "scanline_clip_spin": "scanlineBiasClip",
+            "scanline_sigma_spin": "scanlineSigmaY",
+            "bilateral_diameter_spin": "bilateralDiameter",
+            "bilateral_sigma_color_spin": "bilateralSigmaColor",
+            "bilateral_sigma_space_spin": "bilateralSigmaSpace",
+            "temporal_sigma_spin": "temporalMotionSigma",
+            "clahe_clip_spin": "claheClipLimit",
+            "clahe_tile_spin": "claheTileSize",
+            "adjustments_brightness_spin": "adjustmentsBrightness",
+            "adjustments_contrast_spin": "adjustmentsContrast",
+            "adjustments_sharpen_spin": "adjustmentsSharpen",
+            "adjustments_gamma_spin": "adjustmentsGamma",
+            "smoothing_sigma_spin": "smoothingSigma",
+            "segmentation_mode_combo": "segmentationMode",
+            "segmentation_block_spin": "segmentationBlockSize",
+            "segmentation_sensitivity_spin": "segmentationSensitivity",
+            "segmentation_change_threshold_spin": "segmentationChangeThreshold",
+            "segmentation_tolerance_spin": "segmentationTolerance",
+            "segmentation_area_spin": "segmentationMinimumArea",
+        }
+        for attribute, object_name in widget_names.items():
+            getattr(self, attribute).setObjectName(object_name)
+
+    def _clone_stage_widget(self, widget: QWidget) -> QWidget | None:
+        if isinstance(widget, QSlider):
+            return None
+        if isinstance(widget, QCheckBox):
+            clone = QCheckBox(widget.text())
+            clone.setChecked(widget.isChecked())
+        elif isinstance(widget, QComboBox):
+            clone = QComboBox()
+            for index in range(widget.count()):
+                clone.addItem(widget.itemText(index), widget.itemData(index))
+            clone.setCurrentIndex(widget.currentIndex())
+        elif isinstance(widget, QDoubleSpinBox):
+            clone = QDoubleSpinBox()
+            clone.setDecimals(widget.decimals())
+            clone.setRange(widget.minimum(), widget.maximum())
+            clone.setSingleStep(widget.singleStep())
+            clone.setSuffix(widget.suffix())
+            clone.setValue(widget.value())
+            clone.setButtonSymbols(widget.buttonSymbols())
+        elif isinstance(widget, QSpinBox):
+            clone = QSpinBox()
+            clone.setRange(widget.minimum(), widget.maximum())
+            clone.setSingleStep(widget.singleStep())
+            clone.setSuffix(widget.suffix())
+            clone.setValue(widget.value())
+            clone.setButtonSymbols(widget.buttonSymbols())
+        elif isinstance(widget, QLabel):
+            clone = QLabel(widget.text())
+            clone.setWordWrap(widget.wordWrap())
+        elif isinstance(widget, QPushButton):
+            clone = QPushButton(widget.text())
+        else:
+            return None
+        clone.setObjectName(widget.objectName())
+        clone.setToolTip(widget.toolTip())
+        clone.setEnabled(widget.isEnabled())
+        return clone
+
+    def _clone_stage_layout(self, source: QVBoxLayout | QHBoxLayout, target: QVBoxLayout | QHBoxLayout) -> None:
+        target.setContentsMargins(source.contentsMargins())
+        target.setSpacing(source.spacing())
+        for index in range(source.count()):
+            item = source.itemAt(index)
+            child_layout = item.layout()
+            if isinstance(child_layout, QHBoxLayout):
+                clone_layout = QHBoxLayout()
+                self._clone_stage_layout(child_layout, clone_layout)
+                target.addLayout(clone_layout)
+            elif isinstance(child_layout, QVBoxLayout):
+                clone_layout = QVBoxLayout()
+                self._clone_stage_layout(child_layout, clone_layout)
+                target.addLayout(clone_layout)
+            elif item.widget() is not None:
+                clone = self._clone_stage_widget(item.widget())
+                if clone is not None:
+                    target.addWidget(clone)
+
+    def _configure_dynamic_stage_drawer(self, drawer: StageDrawer) -> None:
+        for check in drawer.findChildren(QCheckBox):
+            check.toggled.connect(self.on_enhancement_settings_changed)
+        for combo in drawer.findChildren(QComboBox):
+            combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
+        for spin in [*drawer.findChildren(QSpinBox), *drawer.findChildren(QDoubleSpinBox)]:
+            spin.valueChanged.connect(self.on_enhancement_settings_changed)
+        for button in drawer.findChildren(QPushButton):
+            if button.text() == "Refresh ROI extraction":
+                button.clicked.connect(self.redetect_aneurysms)
+            elif button.text() == "Export CSV":
+                button.clicked.connect(self.export_csv)
+        gain_auto = drawer.findChild(QCheckBox, "gainUseAutoTarget")
+        gain_target = drawer.findChild(QSpinBox, "gainTargetMedian")
+        if gain_auto is not None and gain_target is not None:
+            gain_auto.toggled.connect(lambda checked: gain_target.setEnabled(not checked))
+            gain_target.setEnabled(not gain_auto.isChecked())
+        roi_soften = drawer.findChild(QCheckBox, "roiSoftenEnabled")
+        roi_radius = drawer.findChild(QDoubleSpinBox, "roiSofteningRadius")
+        roi_threshold = drawer.findChild(QDoubleSpinBox, "roiSofteningThreshold")
+        if roi_soften is not None and roi_radius is not None and roi_threshold is not None:
+            roi_soften.toggled.connect(roi_radius.setEnabled)
+            roi_soften.toggled.connect(roi_threshold.setEnabled)
+            roi_radius.setEnabled(roi_soften.isChecked())
+            roi_threshold.setEnabled(roi_soften.isChecked())
+        self._add_sliders_to_parameter_layout(drawer.content_layout)
+        drawer.enable_button.toggled.connect(self.on_pipeline_stages_changed)
+        drawer.dragStarted.connect(self._begin_pipeline_stage_drag)
+        drawer.dragMoved.connect(self._move_pipeline_stage_drag)
+        drawer.dragFinished.connect(self._finish_pipeline_stage_drag)
+        drawer.optionsRequested.connect(self._show_stage_options)
+        drawer.expand_button.toggled.connect(self._update_pipeline_column_width)
+
+    def _copy_stage_drawer(self, source: StageDrawer) -> StageDrawer:
+        drawer = StageDrawer(source.stage_key, source.stage_title, 0)
+        self._clone_stage_layout(source.content_layout, drawer.content_layout)
+        self._configure_dynamic_stage_drawer(drawer)
+        return drawer
+
+    def _show_add_stage_menu(self) -> None:
+        menu = QMenu(self)
+        for key, drawer in self.stage_drawer_templates.items():
+            action = menu.addAction(drawer.stage_title)
+            action.triggered.connect(lambda _checked=False, stage_key=key: self._add_pipeline_stage(stage_key))
+        self._stage_menu = menu
+        menu.popup(self.add_stage_button.mapToGlobal(self.add_stage_button.rect().bottomLeft()))
+
+    def _show_stage_options(self, drawer: StageDrawer, position: QPoint) -> None:
+        menu = QMenu(self)
+        duplicate_action = menu.addAction("Duplicate")
+        duplicate_action.triggered.connect(lambda: self._duplicate_pipeline_stage(drawer))
+        delete_action = menu.addAction("Delete")
+        delete_action.triggered.connect(lambda: self._delete_pipeline_stage(drawer))
+        self._stage_menu = menu
+        menu.popup(position)
+
+    def _add_pipeline_stage(self, stage_key: str, after: StageDrawer | None = None) -> None:
+        template = self.stage_drawer_templates[stage_key]
+        drawer = template if template not in self.pipeline_stage_drawers else self._copy_stage_drawer(template)
+        if drawer not in self.pipeline_stage_drawers:
+            drawer.setParent(self.enhancement_layout.parentWidget())
+            insert_index = len(self.pipeline_stage_drawers)
+            if after is not None:
+                insert_index = self.pipeline_stage_drawers.index(after) + 1
+            self.pipeline_stage_drawers.insert(insert_index, drawer)
+        self._sync_pipeline_stage_lists()
+        self._refresh_pipeline_stage_ui()
+        self.on_pipeline_stages_changed()
+
+    def _duplicate_pipeline_stage(self, drawer: StageDrawer) -> None:
+        duplicate = self._copy_stage_drawer(drawer)
+        duplicate.enable_button.setChecked(False)
+        self.pipeline_stage_drawers.insert(self.pipeline_stage_drawers.index(drawer) + 1, duplicate)
+        self._sync_pipeline_stage_lists()
+        self._refresh_pipeline_stage_ui()
+        self.on_pipeline_stages_changed()
+
+    def _delete_pipeline_stage(self, drawer: StageDrawer) -> None:
+        self.pipeline_stage_drawers.remove(drawer)
+        self.enhancement_layout.removeWidget(drawer)
+        drawer.hide()
+        drawer.setParent(None)
+        self._sync_pipeline_stage_lists()
+        self._refresh_pipeline_stage_ui()
+        self.on_pipeline_stages_changed()
+
+    def _drawer_parameters(self, drawer: StageDrawer) -> EnhancementParameters:
+        def value(name: str, default: int | float | bool | str) -> int | float | bool | str:
+            widget = drawer.findChild(QWidget, name)
+            if isinstance(widget, QComboBox):
+                return widget.currentData()
+            if isinstance(widget, QCheckBox):
+                return widget.isChecked()
+            if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                return widget.value()
+            return default
+
+        gain_min = float(value("gainMinimum", 0.70))
+        gain_max = float(value("gainMaximum", 1.45))
+        return EnhancementParameters(
+            gain_use_auto_target=bool(value("gainUseAutoTarget", True)),
+            gain_target_median=int(value("gainTargetMedian", 128)),
+            gain_min=min(gain_min, gain_max),
+            gain_max=max(gain_min, gain_max),
+            roi_softening_enabled=bool(value("roiSoftenEnabled", False)),
+            roi_softening_radius_ratio=float(value("roiSofteningRadius", 0.12)),
+            roi_softening_threshold=float(value("roiSofteningThreshold", 0.10)),
+            scanline_bias_clip=float(value("scanlineBiasClip", 6.0)),
+            scanline_sigma_y=float(value("scanlineSigmaY", 2.0)),
+            bilateral_diameter=int(value("bilateralDiameter", 7)),
+            bilateral_sigma_color=float(value("bilateralSigmaColor", 18.0)),
+            bilateral_sigma_space=float(value("bilateralSigmaSpace", 4.0)),
+            temporal_motion_sigma=float(value("temporalMotionSigma", 12.0)),
+            clahe_clip_limit=float(value("claheClipLimit", 1.0)),
+            clahe_tile_size=int(value("claheTileSize", 6)),
+            adjustments_brightness_offset=int(value("adjustmentsBrightness", 0)),
+            adjustments_contrast_gain=float(value("adjustmentsContrast", 1.0)),
+            adjustments_sharpen_amount=float(value("adjustmentsSharpen", 0.0)),
+            adjustments_gamma=float(value("adjustmentsGamma", 1.0)),
+            smoothing_sigma_x=float(value("smoothingSigma", 0.55)),
+            segmentation_mode=str(value("segmentationMode", "dark_contrast")),
+            segmentation_block_size=int(value("segmentationBlockSize", 51)),
+            segmentation_sensitivity=float(value("segmentationSensitivity", 7.0)),
+            segmentation_change_threshold=float(value("segmentationChangeThreshold", 12.0)),
+            segmentation_level_tolerance=int(value("segmentationTolerance", 12)),
+            segmentation_min_area=int(value("segmentationMinimumArea", 80)),
+        )
+
+    def _sync_active_denoise_controls(self) -> None:
+        for drawer in self._stage_drawers("denoise"):
+            mode = drawer.findChild(QComboBox, "denoiseMode")
+            strength_label = drawer.findChild(QLabel, "denoiseStrengthLabel")
+            strength = drawer.findChild(QSpinBox, "denoiseStrength")
+            batch_size = drawer.findChild(QSpinBox, "denoiseBatchSize")
+            precision = drawer.findChild(QComboBox, "denoisePrecision")
+            active_mode = str(mode.currentData()) if mode is not None else "classical"
+            stage_enabled = drawer.enable_button.isChecked()
+            uses_ffdnet = stage_enabled and active_mode.startswith("ffdnet")
+            uses_deep_model = stage_enabled and active_mode != "classical"
+            if strength_label is not None:
+                strength_label.setEnabled(uses_ffdnet)
+            if strength is not None:
+                strength.setEnabled(uses_ffdnet)
+                self._sync_parameter_slider_enabled(strength)
+            if batch_size is not None:
+                batch_size.setEnabled(uses_deep_model)
+                self._sync_parameter_slider_enabled(batch_size)
+            if precision is not None:
+                precision.setEnabled(uses_deep_model)
+
     def _pipeline_scrollbar_reserve_width(self) -> int:
         scrollbar = self.pipeline_controls_scroll.verticalScrollBar()
         style_width = self.style().pixelMetric(
@@ -2854,7 +3158,10 @@ class ContrastWindow(QMainWindow):
             return
 
         self._sync_pipeline_scroll_gutter()
-        drawer_width = max(drawer.minimumSizeHint().width() for drawer in self.pipeline_stage_drawers)
+        drawer_width = max(
+            self.add_stage_button.minimumSizeHint().width(),
+            *(drawer.minimumSizeHint().width() for drawer in self.pipeline_stage_drawers),
+        )
         margins = self.enhancement_layout.contentsMargins()
         base_right = getattr(self, "_pipeline_controls_base_right_margin", margins.right())
         reserve_width = self._pipeline_scrollbar_reserve_width()
@@ -3333,8 +3640,8 @@ class ContrastWindow(QMainWindow):
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
             QFrame#videoPanel, QFrame#plotPanel { background: #111827; border: 1px solid #253044; border-radius: 8px; }
             QFrame#stageDrawer { background: #0f172a; border: 1px solid #273449; border-radius: 8px; }
-            QToolButton#stageEnableButton, QToolButton#stageExpandButton { border: 1px solid transparent; border-radius: 6px; icon-size: 16px; padding: 0; }
-            QToolButton#stageEnableButton:hover, QToolButton#stageExpandButton:hover { background: #1c2637; border-color: #334155; }
+            QToolButton#stageEnableButton, QToolButton#stageExpandButton, QToolButton#stageOptionsButton { border: 1px solid transparent; border-radius: 6px; icon-size: 16px; padding: 0; }
+            QToolButton#stageEnableButton:hover, QToolButton#stageExpandButton:hover, QToolButton#stageOptionsButton:hover { background: #1c2637; border-color: #334155; }
             QToolButton#stageEnableButton:checked { background: #134e4a; border-color: #14b8a6; }
             QLabel#stageGrabHandle { color: #9fb0c6; font-weight: 700; }
             QLabel#stageGrabHandle:disabled { color: #475569; }
@@ -3479,8 +3786,19 @@ class ContrastWindow(QMainWindow):
     def _missing_stage_roi_labels(self) -> list[str]:
         return [panel.label for panel in self.panels if not panel.has_stage_roi_mask()]
 
+    def _stage_drawers(self, stage_key: str) -> list[StageDrawer]:
+        return [drawer for drawer in self.pipeline_stage_drawers if drawer.stage_key == stage_key]
+
+    def _has_enabled_stage(self, stage_key: str) -> bool:
+        return any(drawer.enable_button.isChecked() for drawer in self._stage_drawers(stage_key))
+
     def _analysis_requirement_failure(self) -> str | None:
-        if not self.roi_stage_check.isChecked():
+        roi_extraction_enabled = (
+            self._has_enabled_stage("roi_extraction")
+            if hasattr(self, "pipeline_stage_drawers")
+            else self.roi_stage_check.isChecked()
+        )
+        if not roi_extraction_enabled:
             return "ROI residence analysis failed: enable upstream aneurysm ROI extraction."
         missing_masks = self._missing_stage_roi_labels()
         if missing_masks:
@@ -3489,30 +3807,41 @@ class ContrastWindow(QMainWindow):
         return None
 
     def _update_stage_statuses(self) -> None:
-        if not self.roi_stage_check.isChecked():
+        roi_drawers = self._stage_drawers("roi_extraction")
+        analysis_drawers = self._stage_drawers("roi_residence_analysis")
+        analysis_enabled = self._has_enabled_stage("roi_residence_analysis")
+        if not self._has_enabled_stage("roi_extraction"):
             extraction_message = "Disabled. Enable this stage to extract aneurysm ROI masks from the current enhanced video."
-            self.roi_stage_drawer.set_status(extraction_message, self.analysis_stage_check.isChecked())
+            for drawer in roi_drawers:
+                drawer.set_status(extraction_message, analysis_enabled)
         elif self._enhancement_future is not None:
-            self.roi_stage_drawer.set_status("Running ROI extraction on the current enhanced video...", False)
+            for drawer in roi_drawers:
+                drawer.set_status("Running ROI extraction on the current enhanced video...", False)
         else:
             missing_masks = self._missing_stage_roi_labels()
             if missing_masks:
                 labels = ", ".join(missing_masks)
-                self.roi_stage_drawer.set_status(f"Failed for {labels}. Adjust upstream stages or ROI extraction parameters.", True)
+                for drawer in roi_drawers:
+                    drawer.set_status(f"Failed for {labels}. Adjust upstream stages or ROI extraction parameters.", True)
             else:
-                self.roi_stage_drawer.set_status("ROI masks ready for downstream analysis.", False)
+                for drawer in roi_drawers:
+                    drawer.set_status("ROI masks ready for downstream analysis.", False)
 
-        if not self.analysis_stage_check.isChecked():
-            self.analysis_stage_drawer.set_status(None)
+        if not analysis_enabled:
+            for drawer in analysis_drawers:
+                drawer.set_status(None)
             return
         failure = self._analysis_requirement_failure()
         if failure is not None:
-            self.analysis_stage_drawer.set_status(failure, True)
+            for drawer in analysis_drawers:
+                drawer.set_status(failure, True)
             return
         if self._enhancement_future is not None:
-            self.analysis_stage_drawer.set_status("Waiting for upstream ROI extraction to finish.", False)
+            for drawer in analysis_drawers:
+                drawer.set_status("Waiting for upstream ROI extraction to finish.", False)
             return
-        self.analysis_stage_drawer.set_status("Ready to analyze the current ROI masks.", False)
+        for drawer in analysis_drawers:
+            drawer.set_status("Ready to analyze the current ROI masks.", False)
 
     def on_roi_changed(self) -> None:
         self.results.clear()
@@ -3520,7 +3849,7 @@ class ContrastWindow(QMainWindow):
         self._update_stage_statuses()
         ready = all(panel.roi() and panel.roi_mask() is not None for panel in self.panels)
         if ready:
-            if self.analysis_stage_check.isChecked() and self._enhancement_future is None:
+            if self._has_enabled_stage("roi_residence_analysis") and self._enhancement_future is None:
                 if self.run_analysis():
                     return
             self.statusBar().showMessage(
@@ -3531,7 +3860,7 @@ class ContrastWindow(QMainWindow):
 
     def redetect_aneurysms(self) -> None:
         self.pause()
-        if not self.roi_stage_check.isChecked():
+        if not self._has_enabled_stage("roi_extraction"):
             self._update_stage_statuses()
             self.statusBar().showMessage("Enable the Aneurysm ROI extraction stage before refreshing ROI masks.")
             return
@@ -3573,6 +3902,7 @@ class ContrastWindow(QMainWindow):
         self._sync_parameter_slider_enabled(self.denoise_strength_spin)
         self._sync_parameter_slider_enabled(self.inference_batch_spin)
         self.inference_precision_combo.setEnabled(use_deep_model)
+        self._sync_active_denoise_controls()
         if self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
         else:
@@ -3581,22 +3911,36 @@ class ContrastWindow(QMainWindow):
             self.statusBar().showMessage("Enhancement settings updated. Enable one or more stages to preview.")
 
     def enhancement_stages(self) -> EnhancementStages:
+        instances = tuple(
+            PipelineStage(
+                key=drawer.stage_key,
+                enabled=drawer.enable_button.isChecked(),
+                parameters=self._drawer_parameters(drawer),
+                noise_sigma=(
+                    drawer.findChild(QSpinBox, "denoiseStrength").value()
+                    if drawer.findChild(QSpinBox, "denoiseStrength") is not None
+                    else None
+                ),
+            )
+            for drawer in self.frame_pipeline_stage_drawers
+        )
         return EnhancementStages(
-            gain_stabilization=self.gain_stage_check.isChecked(),
-            brightness_stabilization=self.brightness_stage_check.isChecked(),
-            roi_extraction=self.roi_stage_check.isChecked(),
-            scanline_correction=self.scanline_stage_check.isChecked(),
-            denoise=self.denoise_stage_check.isChecked(),
-            temporal_filter=self.temporal_stage_check.isChecked(),
-            local_contrast=self.contrast_stage_check.isChecked(),
-            image_adjustments=self.adjustments_stage_check.isChecked(),
-            final_smoothing=self.smoothing_stage_check.isChecked(),
-            segmentation=self.segmentation_stage_check.isChecked(),
-            stage_order=tuple(drawer.stage_key for drawer in self.frame_pipeline_stage_drawers),
+            gain_stabilization=self._has_enabled_stage("gain_stabilization"),
+            brightness_stabilization=self._has_enabled_stage("brightness_stabilization"),
+            roi_extraction=self._has_enabled_stage("roi_extraction"),
+            scanline_correction=self._has_enabled_stage("scanline_correction"),
+            denoise=self._has_enabled_stage("denoise"),
+            temporal_filter=self._has_enabled_stage("temporal_filter"),
+            local_contrast=self._has_enabled_stage("local_contrast"),
+            image_adjustments=self._has_enabled_stage("image_adjustments"),
+            final_smoothing=self._has_enabled_stage("final_smoothing"),
+            segmentation=self._has_enabled_stage("segmentation"),
+            stage_order=tuple(stage.key for stage in instances),
+            instances=instances,
         )
 
     def _pipeline_has_active_stage(self) -> bool:
-        return self.enhancement_stages().any_enabled or self.analysis_stage_check.isChecked()
+        return self.enhancement_stages().any_enabled or self._has_enabled_stage("roi_residence_analysis")
 
     def _current_backend_id(self, stages: EnhancementStages) -> str:
         mode = str(self.enhancement_mode_combo.currentData())
@@ -3608,12 +3952,7 @@ class ContrastWindow(QMainWindow):
         return f"ffdnet-native-{precision}"
 
     def _is_fixed_pipeline_stage(self, drawer: StageDrawer) -> bool:
-        return drawer.stage_key in {
-            "auto_crop",
-            "temporal_alignment",
-            "brightness_stabilization",
-            "roi_residence_analysis",
-        }
+        return False
 
     def _sync_pipeline_stage_lists(self) -> None:
         self.source_pipeline_stage_drawers = [
@@ -3628,7 +3967,7 @@ class ContrastWindow(QMainWindow):
         ]
         self.source_pipeline_stage_checks = [item.enable_button for item in self.source_pipeline_stage_drawers]
         self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
-        self.pipeline_stage_checks = [*self.source_pipeline_stage_checks, *self.frame_pipeline_stage_checks, self.analysis_stage_check]
+        self.pipeline_stage_checks = [drawer.enable_button for drawer in self.pipeline_stage_drawers]
 
     def _reorder_pipeline_stage_by_key(self, source_key: str, target_key: str) -> None:
         if source_key == target_key:
@@ -3686,8 +4025,9 @@ class ContrastWindow(QMainWindow):
         if not movable_drawers:
             return
 
-        top = self.brightness_stage_drawer.geometry().bottom() + self.enhancement_layout.spacing()
-        bottom = self.analysis_stage_drawer.geometry().top() - self.enhancement_layout.spacing() - drawer.height()
+        other_drawers = [item for item in order if item is not drawer]
+        top = min(item.geometry().top() for item in other_drawers)
+        bottom = max(item.geometry().bottom() for item in other_drawers) - drawer.height()
         drawer.move(self._stage_drag_x, max(top, min(cursor_y - self._stage_drag_offset_y, bottom)))
 
         target = min(movable_drawers, key=lambda item: abs(item.geometry().center().y() - cursor_y))
@@ -3699,7 +4039,7 @@ class ContrastWindow(QMainWindow):
             insertion_index -= 1
         order.insert(insertion_index, drawer)
 
-        next_drawer = next((item for item in order[insertion_index + 1 :] if item is not drawer), self.analysis_stage_drawer)
+        next_drawer = next((item for item in order[insertion_index + 1 :] if item is not drawer), self.add_stage_button)
         self.enhancement_layout.removeWidget(placeholder)
         self.enhancement_layout.insertWidget(self.enhancement_layout.indexOf(next_drawer), placeholder)
 
@@ -3726,6 +4066,7 @@ class ContrastWindow(QMainWindow):
     def _refresh_pipeline_stage_ui(self) -> None:
         for drawer in self.pipeline_stage_drawers:
             self.enhancement_layout.removeWidget(drawer)
+        self.enhancement_layout.removeWidget(self.add_stage_button)
         insert_index = self.enhancement_layout.count()
         stretch_index = self.enhancement_layout.count() - 1
         if stretch_index >= 0 and self.enhancement_layout.itemAt(stretch_index).spacerItem() is not None:
@@ -3734,6 +4075,8 @@ class ContrastWindow(QMainWindow):
             drawer.set_stage_index(offset + 1)
             drawer.set_reorder_enabled(not self._is_fixed_pipeline_stage(drawer))
             self.enhancement_layout.insertWidget(insert_index + offset, drawer)
+        self.enhancement_layout.insertWidget(insert_index + len(self.pipeline_stage_drawers), self.add_stage_button)
+        self._update_pipeline_column_width()
 
     def enhancement_parameters(self) -> EnhancementParameters:
         gain_min = self.gain_min_spin.value()
@@ -3783,6 +4126,7 @@ class ContrastWindow(QMainWindow):
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
         self.inference_precision_combo.setEnabled(use_deep_model)
+        self._sync_active_denoise_controls()
         if self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
         else:
@@ -4076,7 +4420,7 @@ class ContrastWindow(QMainWindow):
             for panel in self.panels:
                 panel.seek(self.current_frame_index)
             self._update_stage_statuses()
-            if self.analysis_stage_check.isChecked() and self.run_analysis():
+            if self._has_enabled_stage("roi_residence_analysis") and self.run_analysis():
                 return
             failure = self._analysis_requirement_failure()
             self.statusBar().showMessage(failure if failure is not None else "Video enhancement complete.")
@@ -4101,7 +4445,7 @@ class ContrastWindow(QMainWindow):
     def on_analysis_threshold_changed(self) -> None:
         if self.results:
             self.refresh_analysis_from_existing()
-        elif self.analysis_stage_check.isChecked() and self._enhancement_future is None:
+        elif self._has_enabled_stage("roi_residence_analysis") and self._enhancement_future is None:
             self.run_analysis()
 
     def run_analysis(self) -> bool:
