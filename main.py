@@ -113,6 +113,7 @@ class EnhancementStages:
     temporal_filter: bool = False
     local_contrast: bool = False
     final_smoothing: bool = False
+    segmentation: bool = False
     stage_order: tuple[str, ...] = (
         "gain_stabilization",
         "scanline_correction",
@@ -120,6 +121,7 @@ class EnhancementStages:
         "temporal_filter",
         "local_contrast",
         "final_smoothing",
+        "segmentation",
     )
 
     @property
@@ -132,6 +134,7 @@ class EnhancementStages:
                 self.temporal_filter,
                 self.local_contrast,
                 self.final_smoothing,
+                self.segmentation,
             )
         )
 
@@ -155,6 +158,9 @@ class EnhancementParameters:
     clahe_clip_limit: float = 1.0
     clahe_tile_size: int = 6
     smoothing_sigma_x: float = 0.55
+    segmentation_block_size: int = 51
+    segmentation_sensitivity: float = 7.0
+    segmentation_min_area: int = 80
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +434,52 @@ def smooth_final_frame(gray: np.ndarray, sigma_x: float) -> np.ndarray:
     return cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma_x)
 
 
+def segment_dark_contrast(
+    gray: np.ndarray,
+    block_size: int,
+    sensitivity: float,
+    minimum_area: int,
+) -> np.ndarray:
+    source = np.clip(gray, 0, 255).astype(np.uint8)
+    block_size = max(3, int(block_size) | 1)
+    mask = cv2.adaptiveThreshold(
+        source,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        block_size,
+        sensitivity,
+    )
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    filtered = np.zeros_like(mask)
+    for component in range(1, component_count):
+        if int(stats[component, cv2.CC_STAT_AREA]) >= minimum_area:
+            filtered[labels == component] = 255
+    return filtered
+
+
+def overlay_segmentation_mask(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    color: tuple[int, int, int] = (40, 210, 255),
+    opacity: float = 0.42,
+) -> np.ndarray:
+    result = frame.copy()
+    selected = mask > 0
+    if not np.any(selected):
+        return result
+    overlay_color = np.asarray(color, dtype=np.float32)
+    result[selected] = np.clip(
+        result[selected].astype(np.float32) * (1.0 - opacity) + overlay_color * opacity,
+        0,
+        255,
+    ).astype(np.uint8)
+    return result
+
+
 def reference_mean(gray: np.ndarray, roi: QRect) -> float:
     frame_height, frame_width = gray.shape
     pad_x = max(30, roi.width() // 2)
@@ -639,11 +691,14 @@ class VideoPanel(QFrame):
         self.current_frame_index = -1
         self.enhance_display = False
         self.comparison_display = True
+        self.segmentation_overlay_display = True
         self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
         self.enhanced_frames: list[np.ndarray] | None = None
+        self.segmentation_masks: list[np.ndarray] | None = None
         self.source_gray_frames: list[np.ndarray] | None = None
         self.stage_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.encoded_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
+        self.segmentation_mask_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.active_sequence_key: tuple[tuple[str, tuple[object, ...]], ...] | None = None
         self.stage_duration_per_frame: dict[tuple[str, tuple[object, ...]], float] = {}
 
@@ -722,6 +777,15 @@ class VideoPanel(QFrame):
             )
         if stage_key == "final_smoothing":
             return (stage_key, (round(float(parameters.smoothing_sigma_x), 4),))
+        if stage_key == "segmentation":
+            return (
+                stage_key,
+                (
+                    int(parameters.segmentation_block_size),
+                    round(float(parameters.segmentation_sensitivity), 4),
+                    int(parameters.segmentation_min_area),
+                ),
+            )
         return (stage_key, tuple())
 
     def _sequence_key(
@@ -742,6 +806,15 @@ class VideoPanel(QFrame):
     def _encode_stage_token(self) -> tuple[str, tuple[object, ...]]:
         return ("encode_enhanced", tuple())
 
+    def _segmentation_masks_for_sequence(
+        self,
+        sequence_key: tuple[tuple[str, tuple[object, ...]], ...],
+    ) -> list[np.ndarray] | None:
+        for index, token in enumerate(sequence_key):
+            if token[0] == "segmentation":
+                return self.segmentation_mask_cache.get(sequence_key[: index + 1])
+        return None
+
     def _default_stage_seconds_per_frame(self, stage_token: tuple[str, tuple[object, ...]]) -> float:
         stage_key = stage_token[0]
         if stage_key == "source_decode":
@@ -759,6 +832,8 @@ class VideoPanel(QFrame):
             return 0.0028
         if stage_key == "final_smoothing":
             return 0.0010
+        if stage_key == "segmentation":
+            return 0.0035
         if stage_key == "encode_enhanced":
             return 0.0018
         return 0.0020
@@ -780,6 +855,8 @@ class VideoPanel(QFrame):
             return 0.0038
         if stage_key == "final_smoothing":
             return 0.0015
+        if stage_key == "segmentation":
+            return 0.0050
         if stage_key == "encode_enhanced":
             return 0.0025
         return 0.0030
@@ -830,6 +907,7 @@ class VideoPanel(QFrame):
             "temporal_filter": "Motion-aware temporal filtering",
             "local_contrast": "Local contrast (CLAHE)",
             "final_smoothing": "Final Gaussian smoothing",
+            "segmentation": "Dark contrast segmentation",
         }
         return names.get(stage_key, stage_key.replace("_", " ").title())
 
@@ -871,6 +949,7 @@ class VideoPanel(QFrame):
         progress_callback: Callable[[float, float], bool] | None = None,
         stage_progress_callback: Callable[[str, int, int], bool] | None = None,
         encoded_frame_callback: Callable[[int, np.ndarray], None] | None = None,
+        segmentation_mask_callback: Callable[[int, np.ndarray], None] | None = None,
         activate_result: bool = True,
         cancel_callback: Callable[[], bool] | None = None,
         frame_executor: AdaptiveFrameExecutor | None = None,
@@ -879,13 +958,18 @@ class VideoPanel(QFrame):
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
         if sequence_key in self.encoded_frame_cache:
             encoded_frames = self.encoded_frame_cache[sequence_key]
-            if encoded_frame_callback is not None:
+            segmentation_masks = self._segmentation_masks_for_sequence(sequence_key)
+            if encoded_frame_callback is not None or segmentation_mask_callback is not None:
                 for index, encoded in enumerate(encoded_frames):
                     if cancel_callback is not None and cancel_callback():
                         return False
-                    encoded_frame_callback(index, encoded)
+                    if segmentation_mask_callback is not None and segmentation_masks is not None:
+                        segmentation_mask_callback(index, segmentation_masks[index])
+                    if encoded_frame_callback is not None:
+                        encoded_frame_callback(index, encoded)
             if activate_result:
                 self.enhanced_frames = encoded_frames
+            self.segmentation_masks = segmentation_masks
             self.active_sequence_key = sequence_key
             return True
 
@@ -900,6 +984,7 @@ class VideoPanel(QFrame):
                     progress_callback,
                     stage_progress_callback,
                     encoded_frame_callback,
+                    segmentation_mask_callback,
                     activate_result,
                     cancel_callback,
                     owned_executor,
@@ -953,6 +1038,7 @@ class VideoPanel(QFrame):
         queues = [Queue[object](maxsize=frame_executor.max_pending) for _ in range(len(missing_stages) + 1)]
         source_output: list[np.ndarray] = []
         stage_outputs: list[list[np.ndarray]] = [[] for _ in missing_stages]
+        segmentation_outputs: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         encoded_frames: list[np.ndarray] = []
 
         def enqueue(queue: Queue[object], item: object) -> bool:
@@ -1015,7 +1101,7 @@ class VideoPanel(QFrame):
         stage_work_offset = 1 if source_missing else 0
 
         def run_stage(stage_index: int) -> None:
-            token, _ = missing_stages[stage_index]
+            token, stage_prefix = missing_stages[stage_index]
             stage_key = token[0]
             stage_name = self._stage_display_name(stage_key)
             input_queue = queues[stage_index]
@@ -1138,6 +1224,45 @@ class VideoPanel(QFrame):
                         batch.append(cast(tuple[int, np.ndarray], item))
                         if len(batch) >= batch_size:
                             flush_batch()
+                elif stage_key == "segmentation":
+                    encoded_masks = segmentation_outputs.setdefault(stage_prefix, [])
+                    pending_masks: deque[tuple[int, np.ndarray, Future[tuple[np.ndarray, float]]]] = deque()
+
+                    def segment_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
+                        started_at = perf_counter()
+                        mask = segment_dark_contrast(
+                            frame,
+                            parameters.segmentation_block_size,
+                            parameters.segmentation_sensitivity,
+                            parameters.segmentation_min_area,
+                        )
+                        encoded_ok, encoded_mask = cv2.imencode(".png", mask)
+                        if not encoded_ok:
+                            raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
+                        return encoded_mask, perf_counter() - started_at
+
+                    def drain_mask() -> None:
+                        nonlocal active_seconds
+                        frame_index, frame, future = pending_masks.popleft()
+                        encoded_mask, duration = future.result()
+                        active_seconds += duration
+                        encoded_masks.append(encoded_mask)
+                        if segmentation_mask_callback is not None:
+                            segmentation_mask_callback(frame_index, encoded_mask)
+                        emit(frame_index, frame)
+
+                    while True:
+                        item = input_queue.get()
+                        if item is STREAM_END:
+                            break
+                        if cancelled.is_set():
+                            continue
+                        frame_index, frame = cast(tuple[int, np.ndarray], item)
+                        pending_masks.append((frame_index, frame, frame_executor.submit(segment_frame, frame)))
+                        if len(pending_masks) >= frame_executor.max_workers:
+                            drain_mask()
+                    while pending_masks:
+                        drain_mask()
                 else:
                     while True:
                         item = input_queue.get()
@@ -1221,10 +1346,12 @@ class VideoPanel(QFrame):
             self.stage_frame_cache[tuple()] = source_output
         for (_, stage_prefix), output in zip(missing_stages, stage_outputs):
             self.stage_frame_cache[stage_prefix] = output
+        self.segmentation_mask_cache.update(segmentation_outputs)
         self.encoded_frame_cache[sequence_key] = encoded_frames
 
         if activate_result:
             self.enhanced_frames = self.encoded_frame_cache[sequence_key]
+        self.segmentation_masks = self._segmentation_masks_for_sequence(sequence_key)
         self.active_sequence_key = sequence_key
         return True
 
@@ -1245,6 +1372,15 @@ class VideoPanel(QFrame):
             enhanced = cv2.imdecode(self.enhanced_frames[self.current_frame_index], cv2.IMREAD_GRAYSCALE)
             if enhanced is not None:
                 enhanced_frame = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+                can_overlay = (
+                    self.segmentation_overlay_display
+                    and self.segmentation_masks is not None
+                    and self.current_frame_index < len(self.segmentation_masks)
+                )
+                if can_overlay:
+                    mask = cv2.imdecode(self.segmentation_masks[self.current_frame_index], cv2.IMREAD_GRAYSCALE)
+                    if mask is not None:
+                        enhanced_frame = overlay_segmentation_mask(enhanced_frame, mask)
         self.display.set_frames(frame, enhanced_frame)
 
     def read_next(self, playback: bool = False) -> bool:
@@ -1297,11 +1433,17 @@ class VideoPanel(QFrame):
         self.display.set_comparison_enabled(enabled)
         self.seek(frame_index)
 
+    def set_segmentation_overlay(self, enabled: bool, frame_index: int) -> None:
+        self.segmentation_overlay_display = enabled
+        self.seek(frame_index)
+
     def clear_enhancement_cache(self) -> None:
         self.enhanced_frames = None
+        self.segmentation_masks = None
         self.source_gray_frames = None
         self.stage_frame_cache.clear()
         self.encoded_frame_cache.clear()
+        self.segmentation_mask_cache.clear()
         self.active_sequence_key = None
         self.stage_duration_per_frame.clear()
 
@@ -1484,6 +1626,7 @@ class ContrastWindow(QMainWindow):
         self._enhancement_pending_request: EnhancementRequest | None = None
         self._enhancement_generation = 0
         self._enhancement_frame_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
+        self._segmentation_mask_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
         self._enhancement_progress_lock = Lock()
         self._enhancement_progress_values = [0.0, 0.0]
         self._enhancement_progress_totals = [1.0, 1.0]
@@ -1567,6 +1710,12 @@ class ContrastWindow(QMainWindow):
         self.compare_view_check.setChecked(True)
         self.compare_view_check.toggled.connect(self.on_compare_view_toggled)
 
+        self.overlay_mask_check = QCheckBox("Mask overlay")
+        self.overlay_mask_check.setChecked(True)
+        self.overlay_mask_check.setEnabled(False)
+        self.overlay_mask_check.setToolTip("Show segmentation masks over enhanced video")
+        self.overlay_mask_check.toggled.connect(self.on_segmentation_overlay_toggled)
+
         video_row = QWidget()
         video_layout = QHBoxLayout(video_row)
         video_layout.setContentsMargins(0, 0, 0, 0)
@@ -1589,6 +1738,7 @@ class ContrastWindow(QMainWindow):
         playback_layout.addWidget(self.speed_label)
         playback_layout.addWidget(self.time_label)
         playback_layout.addWidget(self.compare_view_check)
+        playback_layout.addWidget(self.overlay_mask_check)
 
         controls_panel = self._build_controls_panel()
         self.enhancement_progress = EnhancementProgressPanel()
@@ -1646,7 +1796,7 @@ class ContrastWindow(QMainWindow):
         hint.setObjectName("hintLabel")
         analysis_layout.addWidget(hint)
 
-        pipeline_label = QLabel("Enhancement pipeline (applied in this order, top to bottom)")
+        pipeline_label = QLabel("Live processing pipeline (applied in this order, top to bottom)")
         pipeline_label.setObjectName("pipelineLabel")
         enhancement_layout.addWidget(pipeline_label)
         self.enhancement_layout = enhancement_layout
@@ -1656,12 +1806,14 @@ class ContrastWindow(QMainWindow):
         self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 4)
         self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 5)
         self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 6)
+        self.segmentation_stage_drawer = StageDrawer("segmentation", "Dark contrast segmentation", 7)
         self.gain_stage_check = self.gain_stage_drawer.enable_check
         self.scanline_stage_check = self.scanline_stage_drawer.enable_check
         self.denoise_stage_check = self.denoise_stage_drawer.enable_check
         self.temporal_stage_check = self.temporal_stage_drawer.enable_check
         self.contrast_stage_check = self.contrast_stage_drawer.enable_check
         self.smoothing_stage_check = self.smoothing_stage_drawer.enable_check
+        self.segmentation_stage_check = self.segmentation_stage_drawer.enable_check
         self.pipeline_stage_checks = [
             self.gain_stage_check,
             self.scanline_stage_check,
@@ -1669,6 +1821,7 @@ class ContrastWindow(QMainWindow):
             self.temporal_stage_check,
             self.contrast_stage_check,
             self.smoothing_stage_check,
+            self.segmentation_stage_check,
         ]
         self.pipeline_stage_drawers = [
             self.gain_stage_drawer,
@@ -1677,6 +1830,7 @@ class ContrastWindow(QMainWindow):
             self.temporal_stage_drawer,
             self.contrast_stage_drawer,
             self.smoothing_stage_drawer,
+            self.segmentation_stage_drawer,
         ]
         for check in self.pipeline_stage_checks:
             check.setChecked(False)
@@ -1925,6 +2079,35 @@ class ContrastWindow(QMainWindow):
         smoothing_row.addWidget(self.smoothing_sigma_spin)
         self.smoothing_stage_drawer.content_layout.addLayout(smoothing_row)
 
+        segmentation_block_row = QHBoxLayout()
+        segmentation_block_row.addWidget(QLabel("Adaptive neighborhood"))
+        self.segmentation_block_spin = QSpinBox()
+        self.segmentation_block_spin.setRange(3, 151)
+        self.segmentation_block_spin.setSingleStep(2)
+        self.segmentation_block_spin.setValue(51)
+        self.segmentation_block_spin.setToolTip("Local neighborhood used to distinguish dark contrast")
+        segmentation_block_row.addWidget(self.segmentation_block_spin)
+        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_block_row)
+
+        segmentation_sensitivity_row = QHBoxLayout()
+        segmentation_sensitivity_row.addWidget(QLabel("Sensitivity"))
+        self.segmentation_sensitivity_spin = QDoubleSpinBox()
+        self.segmentation_sensitivity_spin.setRange(0.0, 30.0)
+        self.segmentation_sensitivity_spin.setSingleStep(0.5)
+        self.segmentation_sensitivity_spin.setDecimals(1)
+        self.segmentation_sensitivity_spin.setValue(7.0)
+        segmentation_sensitivity_row.addWidget(self.segmentation_sensitivity_spin)
+        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_sensitivity_row)
+
+        segmentation_area_row = QHBoxLayout()
+        segmentation_area_row.addWidget(QLabel("Minimum component area"))
+        self.segmentation_area_spin = QSpinBox()
+        self.segmentation_area_spin.setRange(1, 10000)
+        self.segmentation_area_spin.setValue(80)
+        self.segmentation_area_spin.setSuffix(" px")
+        segmentation_area_row.addWidget(self.segmentation_area_spin)
+        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_area_row)
+
         self.gain_auto_target_check.toggled.connect(self._on_gain_auto_target_toggled)
         for spin in [
             self.gain_target_spin,
@@ -1939,6 +2122,9 @@ class ContrastWindow(QMainWindow):
             self.clahe_clip_spin,
             self.clahe_tile_spin,
             self.smoothing_sigma_spin,
+            self.segmentation_block_spin,
+            self.segmentation_sensitivity_spin,
+            self.segmentation_area_spin,
         ]:
             spin.valueChanged.connect(self.on_enhancement_settings_changed)
 
@@ -2129,11 +2315,19 @@ class ContrastWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Single-view mode enabled.")
 
+    def on_segmentation_overlay_toggled(self, enabled: bool) -> None:
+        for panel in self.panels:
+            panel.set_segmentation_overlay(enabled, self.current_frame_index)
+        self.statusBar().showMessage(
+            "Segmentation mask overlay visible." if enabled else "Segmentation mask overlay hidden."
+        )
+
     def on_enhancement_settings_changed(self) -> None:
         active_mode = str(self.enhancement_mode_combo.currentData())
         stages = self.enhancement_stages()
         use_deep_model = stages.denoise and active_mode != "classical"
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
+        self.overlay_mask_check.setEnabled(stages.segmentation)
         self.denoise_strength_label.setEnabled(uses_ffdnet)
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
@@ -2152,6 +2346,7 @@ class ContrastWindow(QMainWindow):
             temporal_filter=self.temporal_stage_check.isChecked(),
             local_contrast=self.contrast_stage_check.isChecked(),
             final_smoothing=self.smoothing_stage_check.isChecked(),
+            segmentation=self.segmentation_stage_check.isChecked(),
             stage_order=tuple(drawer.stage_key for drawer in self.pipeline_stage_drawers),
         )
 
@@ -2198,6 +2393,9 @@ class ContrastWindow(QMainWindow):
             clahe_clip_limit=self.clahe_clip_spin.value(),
             clahe_tile_size=self.clahe_tile_spin.value(),
             smoothing_sigma_x=self.smoothing_sigma_spin.value(),
+            segmentation_block_size=self.segmentation_block_spin.value(),
+            segmentation_sensitivity=self.segmentation_sensitivity_spin.value(),
+            segmentation_min_area=self.segmentation_area_spin.value(),
         )
 
     def on_pipeline_stages_changed(self) -> None:
@@ -2205,6 +2403,7 @@ class ContrastWindow(QMainWindow):
         active_mode = str(self.enhancement_mode_combo.currentData())
         use_deep_model = stages.denoise and active_mode != "classical"
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
+        self.overlay_mask_check.setEnabled(stages.segmentation)
         self.denoise_strength_label.setEnabled(uses_ffdnet)
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
@@ -2259,6 +2458,7 @@ class ContrastWindow(QMainWindow):
             self._enhancement_message = "Preparing enhanced videos..."
         for panel in self.panels:
             panel.enhanced_frames = []
+            panel.segmentation_masks = [] if request.stages.segmentation else None
             panel.enhance_display = True
         self._set_playback_limit(0)
         for panel in self.panels:
@@ -2367,6 +2567,9 @@ class ContrastWindow(QMainWindow):
             def encoded_frame_callback(frame_index: int, encoded: np.ndarray) -> None:
                 self._enhancement_frame_events.put((request.generation, panel_index, frame_index, encoded))
 
+            def segmentation_mask_callback(frame_index: int, encoded: np.ndarray) -> None:
+                self._segmentation_mask_events.put((request.generation, panel_index, frame_index, encoded))
+
             prepared = panel.prepare_enhanced_frames(
                 panel_denoisers[panel_index],
                 request.noise_sigma,
@@ -2376,6 +2579,7 @@ class ContrastWindow(QMainWindow):
                 progress_callback,
                 stage_progress_callback,
                 encoded_frame_callback,
+                segmentation_mask_callback,
                 False,
                 cancel_event.is_set,
                 frame_executor,
@@ -2407,6 +2611,20 @@ class ContrastWindow(QMainWindow):
 
     def _poll_enhancement(self) -> None:
         changed_panels: set[int] = set()
+        while True:
+            try:
+                generation, panel_index, frame_index, encoded = self._segmentation_mask_events.get_nowait()
+            except Empty:
+                break
+            if generation != self._enhancement_generation:
+                continue
+            masks = self.panels[panel_index].segmentation_masks
+            if masks is None:
+                continue
+            if frame_index == len(masks):
+                masks.append(encoded)
+                changed_panels.add(panel_index)
+
         while True:
             try:
                 generation, panel_index, frame_index, encoded = self._enhancement_frame_events.get_nowait()

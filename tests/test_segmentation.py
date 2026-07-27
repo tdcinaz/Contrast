@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+import unittest
+from concurrent.futures import Future
+from queue import SimpleQueue
+from types import SimpleNamespace
+
+import cv2
+import numpy as np
+
+from main import ContrastWindow, overlay_segmentation_mask, segment_dark_contrast
+
+
+class SegmentationTests(unittest.TestCase):
+    def test_segments_dark_region_and_removes_small_components(self) -> None:
+        frame = np.full((160, 160), 180, dtype=np.uint8)
+        cv2.circle(frame, (80, 80), 18, 60, thickness=-1)
+        cv2.circle(frame, (20, 20), 2, 60, thickness=-1)
+
+        mask = segment_dark_contrast(frame, block_size=51, sensitivity=7.0, minimum_area=80)
+
+        self.assertEqual(mask[80, 80], 255)
+        self.assertEqual(mask[20, 20], 0)
+        self.assertEqual(mask.dtype, np.uint8)
+
+    def test_overlay_changes_only_masked_pixels_without_mutating_input(self) -> None:
+        frame = np.full((4, 4, 3), 100, dtype=np.uint8)
+        original = frame.copy()
+        mask = np.zeros((4, 4), dtype=np.uint8)
+        mask[1:3, 1:3] = 255
+
+        overlaid = overlay_segmentation_mask(frame, mask, color=(40, 210, 255), opacity=0.5)
+
+        np.testing.assert_array_equal(frame, original)
+        np.testing.assert_array_equal(overlaid[0, 0], original[0, 0])
+        np.testing.assert_array_equal(overlaid[1, 1], np.array([70, 155, 177], dtype=np.uint8))
+
+    def test_poll_attaches_mask_before_pipeline_future_completes(self) -> None:
+        encoded_mask = np.array([1, 2, 3], dtype=np.uint8)
+        seeks: list[int] = []
+        panel = SimpleNamespace(
+            enhanced_frames=[np.array([4, 5, 6], dtype=np.uint8)],
+            segmentation_masks=[],
+            seek=seeks.append,
+        )
+        mask_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
+        mask_events.put((7, 0, 0, encoded_mask))
+        pending_future: Future[bool] = Future()
+        playback_limits: list[int] = []
+        window = SimpleNamespace(
+            _segmentation_mask_events=mask_events,
+            _enhancement_frame_events=SimpleQueue(),
+            _enhancement_generation=7,
+            _enhancement_active_request=None,
+            _enhancement_future=pending_future,
+            panels=[panel],
+            current_frame_index=0,
+            _set_playback_limit=playback_limits.append,
+        )
+
+        ContrastWindow._poll_enhancement(window)
+
+        self.assertFalse(pending_future.done())
+        self.assertIs(panel.segmentation_masks[0], encoded_mask)
+        self.assertEqual(seeks, [0])
+        self.assertEqual(playback_limits, [0])
+
+
+if __name__ == "__main__":
+    unittest.main()
