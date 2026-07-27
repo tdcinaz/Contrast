@@ -2571,8 +2571,9 @@ class ContrastWindow(QMainWindow):
         controls_panel = self._build_controls_panel()
         self.enhancement_progress = EnhancementProgressPanel()
         left_column = QWidget()
-        left_column.setMaximumWidth(430)
-        left_column.setMinimumWidth(390)
+        self.pipeline_left_column = left_column
+        self.pipeline_controls_scroll = controls_panel
+        left_column.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
         left_layout = QVBoxLayout(left_column)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
@@ -2589,9 +2590,12 @@ class ContrastWindow(QMainWindow):
         right_layout.addWidget(plot_panel, 2)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter = splitter
         splitter.addWidget(left_column)
         splitter.addWidget(right_column)
         splitter.setSizes([420, 1080])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -2600,10 +2604,10 @@ class ContrastWindow(QMainWindow):
         layout.addWidget(splitter)
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
+        QTimer.singleShot(0, self._update_pipeline_column_width)
 
     def _build_controls_panel(self) -> QWidget:
         controls = QWidget()
-        controls.setMaximumWidth(410)
         controls.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding)
 
         controls_layout = QVBoxLayout(controls)
@@ -2740,9 +2744,20 @@ class ContrastWindow(QMainWindow):
         controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        controls_scroll.setMaximumWidth(430)
-        controls_scroll.setMinimumWidth(390)
+        for drawer in self.pipeline_stage_drawers:
+            drawer.expand_button.toggled.connect(self._update_pipeline_column_width)
         return controls_scroll
+
+    def _update_pipeline_column_width(self) -> None:
+        if not hasattr(self, "pipeline_controls_scroll"):
+            return
+
+        drawer_width = max(drawer.minimumSizeHint().width() for drawer in self.pipeline_stage_drawers)
+        margins = self.enhancement_layout.contentsMargins()
+        scrollbar_width = self.pipeline_controls_scroll.verticalScrollBar().sizeHint().width()
+        required_width = drawer_width + margins.left() + margins.right() + scrollbar_width
+        self.pipeline_controls_scroll.setMinimumWidth(required_width)
+        self.pipeline_left_column.setMinimumWidth(required_width)
 
     def _build_plot_panel(self) -> QWidget:
         plot_group = QFrame()
