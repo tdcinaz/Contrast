@@ -454,26 +454,28 @@ def segment_dark_contrast(
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    filtered = np.zeros_like(mask)
+    brightness_map = np.zeros_like(mask)
     for component in range(1, component_count):
         if int(stats[component, cv2.CC_STAT_AREA]) >= minimum_area:
-            filtered[labels == component] = 255
-    return filtered
+            component_pixels = labels == component
+            component_brightness = int(np.median(source[component_pixels]))
+            brightness_map[component_pixels] = max(1, component_brightness)
+    return brightness_map
 
 
 def overlay_segmentation_mask(
     frame: np.ndarray,
     mask: np.ndarray,
-    color: tuple[int, int, int] = (40, 210, 255),
     opacity: float = 0.42,
 ) -> np.ndarray:
     result = frame.copy()
     selected = mask > 0
     if not np.any(selected):
         return result
-    overlay_color = np.asarray(color, dtype=np.float32)
+    overlay_colors = cv2.applyColorMap(mask, cv2.COLORMAP_TURBO)
     result[selected] = np.clip(
-        result[selected].astype(np.float32) * (1.0 - opacity) + overlay_color * opacity,
+        result[selected].astype(np.float32) * (1.0 - opacity)
+        + overlay_colors[selected].astype(np.float32) * opacity,
         0,
         255,
     ).astype(np.uint8)
@@ -907,7 +909,7 @@ class VideoPanel(QFrame):
             "temporal_filter": "Motion-aware temporal filtering",
             "local_contrast": "Local contrast (CLAHE)",
             "final_smoothing": "Final Gaussian smoothing",
-            "segmentation": "Dark contrast segmentation",
+            "segmentation": "Brightness-coded contrast segmentation",
         }
         return names.get(stage_key, stage_key.replace("_", " ").title())
 
@@ -1806,7 +1808,11 @@ class ContrastWindow(QMainWindow):
         self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 4)
         self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 5)
         self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 6)
-        self.segmentation_stage_drawer = StageDrawer("segmentation", "Dark contrast segmentation", 7)
+        self.segmentation_stage_drawer = StageDrawer(
+            "segmentation",
+            "Brightness-coded contrast segmentation",
+            7,
+        )
         self.gain_stage_check = self.gain_stage_drawer.enable_check
         self.scanline_stage_check = self.scanline_stage_drawer.enable_check
         self.denoise_stage_check = self.denoise_stage_drawer.enable_check

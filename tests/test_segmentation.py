@@ -12,14 +12,16 @@ from main import ContrastWindow, overlay_segmentation_mask, segment_dark_contras
 
 
 class SegmentationTests(unittest.TestCase):
-    def test_segments_dark_region_and_removes_small_components(self) -> None:
+    def test_preserves_component_brightness_and_removes_small_components(self) -> None:
         frame = np.full((160, 160), 180, dtype=np.uint8)
-        cv2.circle(frame, (80, 80), 18, 60, thickness=-1)
+        cv2.circle(frame, (55, 80), 18, 45, thickness=-1)
+        cv2.circle(frame, (105, 80), 18, 95, thickness=-1)
         cv2.circle(frame, (20, 20), 2, 60, thickness=-1)
 
         mask = segment_dark_contrast(frame, block_size=51, sensitivity=7.0, minimum_area=80)
 
-        self.assertEqual(mask[80, 80], 255)
+        self.assertEqual(mask[80, 55], 45)
+        self.assertEqual(mask[80, 105], 95)
         self.assertEqual(mask[20, 20], 0)
         self.assertEqual(mask.dtype, np.uint8)
 
@@ -27,13 +29,14 @@ class SegmentationTests(unittest.TestCase):
         frame = np.full((4, 4, 3), 100, dtype=np.uint8)
         original = frame.copy()
         mask = np.zeros((4, 4), dtype=np.uint8)
-        mask[1:3, 1:3] = 255
+        mask[1, 1] = 45
+        mask[2, 2] = 95
 
-        overlaid = overlay_segmentation_mask(frame, mask, color=(40, 210, 255), opacity=0.5)
+        overlaid = overlay_segmentation_mask(frame, mask, opacity=0.5)
 
         np.testing.assert_array_equal(frame, original)
         np.testing.assert_array_equal(overlaid[0, 0], original[0, 0])
-        np.testing.assert_array_equal(overlaid[1, 1], np.array([70, 155, 177], dtype=np.uint8))
+        self.assertFalse(np.array_equal(overlaid[1, 1], overlaid[2, 2]))
 
     def test_poll_attaches_mask_before_pipeline_future_completes(self) -> None:
         encoded_mask = np.array([1, 2, 3], dtype=np.uint8)
