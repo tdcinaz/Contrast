@@ -1129,7 +1129,9 @@ class VideoPanel(QFrame):
         self.color = color
         self.path = path
         self.info = probe_video(path)
-        self.crop_rect = detect_fluoroscope_crop(path, self.info)
+        self.crop_rect = QRect(0, 0, self.info.width, self.info.height)
+        self._auto_crop_rect_cache: QRect | None = None
+        self._trim_start_cache: dict[tuple[int, int, int, int], int] = {}
         self.capture = cv2.VideoCapture(str(path))
         self.trim_start_frame = 0
         self.trim_frame_count = self.info.frame_count
@@ -1175,9 +1177,48 @@ class VideoPanel(QFrame):
         layout.addWidget(self.display, 1)
 
         self.setObjectName("videoPanel")
-        gray_frames = self._sample_cropped_gray_frames()
-        self.set_trim_window(detect_pre_injection_trim_start(gray_frames, self.info.fps))
+        self.set_trim_window(0)
         self.seek(0)
+
+    def _full_frame_rect(self) -> QRect:
+        return QRect(0, 0, self.info.width, self.info.height)
+
+    def _crop_rect_key(self, crop_rect: QRect) -> tuple[int, int, int, int]:
+        return crop_rect.x(), crop_rect.y(), crop_rect.width(), crop_rect.height()
+
+    def apply_source_pipeline(self, auto_crop_enabled: bool, temporal_alignment_enabled: bool) -> bool:
+        full_rect = self._full_frame_rect()
+        next_crop_rect = full_rect
+        if auto_crop_enabled:
+            if self._auto_crop_rect_cache is None:
+                self._auto_crop_rect_cache = detect_fluoroscope_crop(self.path, self.info)
+            next_crop_rect = QRect(self._auto_crop_rect_cache)
+
+        next_trim_start = 0
+        if temporal_alignment_enabled:
+            crop_key = self._crop_rect_key(next_crop_rect)
+            cached_trim_start = self._trim_start_cache.get(crop_key)
+            if cached_trim_start is None:
+                previous_crop = QRect(self.crop_rect)
+                self.crop_rect = QRect(next_crop_rect)
+                gray_frames = self._sample_cropped_gray_frames()
+                self.crop_rect = previous_crop
+                cached_trim_start = detect_pre_injection_trim_start(gray_frames, self.info.fps)
+                self._trim_start_cache[crop_key] = cached_trim_start
+            next_trim_start = cached_trim_start
+
+        available_frames = max(1, self.info.frame_count - next_trim_start)
+        if (
+            next_crop_rect == self.crop_rect
+            and next_trim_start == self.trim_start_frame
+            and self.trim_frame_count == available_frames
+        ):
+            return False
+
+        self.crop_rect = next_crop_rect
+        self.set_trim_window(next_trim_start)
+        self._activate_stage_roi_selection(None)
+        return True
 
     def _sample_cropped_gray_frames(self) -> list[np.ndarray]:
         capture = cv2.VideoCapture(str(self.path))
@@ -2099,11 +2140,12 @@ class VideoPanel(QFrame):
         self.capture.release()
         self.path = path
         self.info = probe_video(path)
-        self.crop_rect = detect_fluoroscope_crop(path, self.info)
+        self.crop_rect = self._full_frame_rect()
+        self._auto_crop_rect_cache = None
+        self._trim_start_cache.clear()
         self.capture = cv2.VideoCapture(str(path))
         self.path_label.setText(path.name)
-        gray_frames = self._sample_cropped_gray_frames()
-        self.set_trim_window(detect_pre_injection_trim_start(gray_frames, self.info.fps))
+        self.set_trim_window(0)
         self.meta_label.setText(self._metadata_text())
         self._activate_stage_roi_selection(None)
         self.display.set_comparison_enabled(self.comparison_display)
@@ -2468,6 +2510,7 @@ class ContrastWindow(QMainWindow):
 
         self._build_actions()
         self._build_ui()
+        self._apply_source_pipeline_stages()
         self._apply_style()
         self.on_enhancement_settings_changed()
         self.set_display_enhancement(False)
@@ -2498,6 +2541,22 @@ class ContrastWindow(QMainWindow):
         self.max_frame = self.source_max_frame
         self.fps = min(panel.info.fps for panel in self.panels)
         self.play_interval_ms = self._play_interval_ms()
+
+    def _apply_source_pipeline_stages(self) -> bool:
+        auto_crop_enabled = self.auto_crop_stage_check.isChecked()
+        temporal_alignment_enabled = self.temporal_alignment_stage_check.isChecked()
+        changed = False
+        for panel in self.panels:
+            changed = panel.apply_source_pipeline(auto_crop_enabled, temporal_alignment_enabled) or changed
+        if not changed:
+            return False
+
+        self._sync_trimmed_video_window()
+        self._set_playback_limit(self.source_max_frame)
+        target_frame = max(0, min(self.current_frame_index, self.max_frame))
+        self.current_frame_index = -1
+        self.set_frame_index(target_frame)
+        return True
 
     def _build_ui(self) -> None:
         self.play_button = QPushButton()
@@ -2622,29 +2681,41 @@ class ContrastWindow(QMainWindow):
         pipeline_label.setObjectName("pipelineLabel")
         controls_layout.addWidget(pipeline_label)
         self.enhancement_layout = controls_layout
+        self.auto_crop_stage_drawer = StageDrawer(
+            "auto_crop",
+            "Auto-crop fluoroscope field",
+            1,
+        )
+        self.temporal_alignment_stage_drawer = StageDrawer(
+            "temporal_alignment",
+            "Temporal alignment (trim onset)",
+            2,
+        )
         self.brightness_stage_drawer = StageDrawer(
             "brightness_stabilization",
             "Gain / brightness stabilization",
-            1,
+            3,
         )
-        self.roi_stage_drawer = StageDrawer("roi_extraction", "Aneurysm ROI extraction", 2)
-        self.gain_stage_drawer = StageDrawer("gain_stabilization", "Median gain normalization", 3)
-        self.scanline_stage_drawer = StageDrawer("scanline_correction", "Scanline correction", 4)
-        self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 5)
-        self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 6)
-        self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 7)
-        self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 8)
-        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 9)
+        self.roi_stage_drawer = StageDrawer("roi_extraction", "Aneurysm ROI extraction", 4)
+        self.gain_stage_drawer = StageDrawer("gain_stabilization", "Median gain normalization", 5)
+        self.scanline_stage_drawer = StageDrawer("scanline_correction", "Scanline correction", 6)
+        self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 7)
+        self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 8)
+        self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 9)
+        self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 10)
+        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 11)
         self.segmentation_stage_drawer = StageDrawer(
             "segmentation",
             "Brightness-coded contrast segmentation",
-            10,
+            12,
         )
         self.analysis_stage_drawer = StageDrawer(
             "roi_residence_analysis",
             "ROI residence analysis",
-            11,
+            13,
         )
+        self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
+        self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
         self.gain_stage_check = self.gain_stage_drawer.enable_button
         self.brightness_stage_check = self.brightness_stage_drawer.enable_button
         self.roi_stage_check = self.roi_stage_drawer.enable_button
@@ -2656,6 +2727,10 @@ class ContrastWindow(QMainWindow):
         self.smoothing_stage_check = self.smoothing_stage_drawer.enable_button
         self.segmentation_stage_check = self.segmentation_stage_drawer.enable_button
         self.analysis_stage_check = self.analysis_stage_drawer.enable_button
+        self.source_pipeline_stage_checks = [
+            self.auto_crop_stage_check,
+            self.temporal_alignment_stage_check,
+        ]
         self.frame_pipeline_stage_checks = [
             self.brightness_stage_check,
             self.roi_stage_check,
@@ -2668,7 +2743,15 @@ class ContrastWindow(QMainWindow):
             self.smoothing_stage_check,
             self.segmentation_stage_check,
         ]
-        self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
+        self.pipeline_stage_checks = [
+            *self.source_pipeline_stage_checks,
+            *self.frame_pipeline_stage_checks,
+            self.analysis_stage_check,
+        ]
+        self.source_pipeline_stage_drawers = [
+            self.auto_crop_stage_drawer,
+            self.temporal_alignment_stage_drawer,
+        ]
         self.frame_pipeline_stage_drawers = [
             self.brightness_stage_drawer,
             self.roi_stage_drawer,
@@ -2681,14 +2764,22 @@ class ContrastWindow(QMainWindow):
             self.smoothing_stage_drawer,
             self.segmentation_stage_drawer,
         ]
-        self.pipeline_stage_drawers = [*self.frame_pipeline_stage_drawers, self.analysis_stage_drawer]
+        self.pipeline_stage_drawers = [
+            *self.source_pipeline_stage_drawers,
+            *self.frame_pipeline_stage_drawers,
+            self.analysis_stage_drawer,
+        ]
         self._dragged_stage_drawer: StageDrawer | None = None
         self._stage_drag_placeholder: QWidget | None = None
         self._dragged_pipeline_order: list[StageDrawer] | None = None
         self._stage_drag_offset_y = 0
         self._stage_drag_x = 0
+        default_enabled_checks = {
+            self.auto_crop_stage_check,
+            self.temporal_alignment_stage_check,
+        }
         for check in self.pipeline_stage_checks:
-            check.setChecked(False)
+            check.setChecked(check in default_enabled_checks)
             check.toggled.connect(self.on_pipeline_stages_changed)
         self._build_stage_drawer_controls()
         for drawer in self.pipeline_stage_drawers:
@@ -2886,6 +2977,20 @@ class ContrastWindow(QMainWindow):
         self.gain_max_spin.setValue(1.45)
         gain_max_row.addWidget(self.gain_max_spin)
         self.gain_stage_drawer.content_layout.addLayout(gain_max_row)
+
+        auto_crop_hint = QLabel(
+            "Detects the active fluoroscope field and applies a centered aligned crop before downstream processing."
+        )
+        auto_crop_hint.setObjectName("subtleLabel")
+        auto_crop_hint.setWordWrap(True)
+        self.auto_crop_stage_drawer.content_layout.addWidget(auto_crop_hint)
+
+        temporal_alignment_hint = QLabel(
+            "Finds contrast onset and trims each video to start slightly before injection for timeline alignment."
+        )
+        temporal_alignment_hint.setObjectName("subtleLabel")
+        temporal_alignment_hint.setWordWrap(True)
+        self.temporal_alignment_stage_drawer.content_layout.addWidget(temporal_alignment_hint)
 
         brightness_hint = QLabel(
             "Corrects frame-wide gain and brightness jitter from robust, temporally stable image probes."
@@ -3279,7 +3384,8 @@ class ContrastWindow(QMainWindow):
             return
 
         self.results.clear()
-        self._sync_trimmed_video_window()
+        if not self._apply_source_pipeline_stages():
+            self._sync_trimmed_video_window()
         self.frame_slider.setRange(0, self.max_frame)
         self.frame_spin.setRange(0, self.max_frame)
         self.set_frame_index(0)
@@ -3463,6 +3569,10 @@ class ContrastWindow(QMainWindow):
         )
 
     def on_enhancement_settings_changed(self) -> None:
+        source_changed = self._apply_source_pipeline_stages()
+        if source_changed:
+            self.results.clear()
+            self.clear_plots_and_metrics()
         active_mode = str(self.enhancement_mode_combo.currentData())
         stages = self.enhancement_stages()
         use_deep_model = stages.denoise and active_mode != "classical"
@@ -3508,6 +3618,29 @@ class ContrastWindow(QMainWindow):
             return f"{mode.removesuffix('-ngc')}-ngc-26.06-{precision}-batch{self.inference_batch_spin.value()}"
         return f"ffdnet-native-{precision}"
 
+    def _is_fixed_pipeline_stage(self, drawer: StageDrawer) -> bool:
+        return drawer.stage_key in {
+            "auto_crop",
+            "temporal_alignment",
+            "brightness_stabilization",
+            "roi_residence_analysis",
+        }
+
+    def _sync_pipeline_stage_lists(self) -> None:
+        self.source_pipeline_stage_drawers = [
+            drawer
+            for drawer in self.pipeline_stage_drawers
+            if drawer.stage_key in {"auto_crop", "temporal_alignment"}
+        ]
+        self.frame_pipeline_stage_drawers = [
+            drawer
+            for drawer in self.pipeline_stage_drawers
+            if drawer.stage_key not in {"auto_crop", "temporal_alignment", "roi_residence_analysis"}
+        ]
+        self.source_pipeline_stage_checks = [item.enable_button for item in self.source_pipeline_stage_drawers]
+        self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
+        self.pipeline_stage_checks = [*self.source_pipeline_stage_checks, *self.frame_pipeline_stage_checks, self.analysis_stage_check]
+
     def _reorder_pipeline_stage_by_key(self, source_key: str, target_key: str) -> None:
         if source_key == target_key:
             return
@@ -3518,23 +3651,21 @@ class ContrastWindow(QMainWindow):
 
         source_drawer = self.pipeline_stage_drawers[source_index]
         target_drawer = self.pipeline_stage_drawers[target_index]
-        if source_drawer in (self.brightness_stage_drawer, self.analysis_stage_drawer):
+        if self._is_fixed_pipeline_stage(source_drawer):
             return
-        if target_drawer in (self.brightness_stage_drawer, self.analysis_stage_drawer):
+        if self._is_fixed_pipeline_stage(target_drawer):
             return
 
         moving_drawer = self.pipeline_stage_drawers.pop(source_index)
         if source_index < target_index:
             target_index -= 1
         self.pipeline_stage_drawers.insert(target_index, moving_drawer)
-        self.frame_pipeline_stage_drawers = self.pipeline_stage_drawers[:-1]
-        self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
-        self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
+        self._sync_pipeline_stage_lists()
         self._refresh_pipeline_stage_ui()
         self.on_enhancement_settings_changed()
 
     def _begin_pipeline_stage_drag(self, drawer: StageDrawer, global_position: QPoint) -> None:
-        if drawer in (self.brightness_stage_drawer, self.analysis_stage_drawer):
+        if self._is_fixed_pipeline_stage(drawer):
             return
         self._dragged_stage_drawer = drawer
         self._dragged_pipeline_order = list(self.pipeline_stage_drawers)
@@ -3561,7 +3692,7 @@ class ContrastWindow(QMainWindow):
         movable_drawers = [
             stage_drawer
             for stage_drawer in order
-            if stage_drawer not in (drawer, self.brightness_stage_drawer, self.analysis_stage_drawer)
+            if stage_drawer is not drawer and not self._is_fixed_pipeline_stage(stage_drawer)
         ]
         if not movable_drawers:
             return
@@ -3596,9 +3727,7 @@ class ContrastWindow(QMainWindow):
         placeholder.deleteLater()
         self.enhancement_layout.insertWidget(placeholder_index, drawer)
         self.pipeline_stage_drawers = order
-        self.frame_pipeline_stage_drawers = self.pipeline_stage_drawers[:-1]
-        self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
-        self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
+        self._sync_pipeline_stage_lists()
         self._dragged_stage_drawer = None
         self._stage_drag_placeholder = None
         self._dragged_pipeline_order = None
@@ -3613,10 +3742,7 @@ class ContrastWindow(QMainWindow):
             insert_index = self.enhancement_layout.count()
         for offset, drawer in enumerate(self.pipeline_stage_drawers):
             drawer.set_stage_index(offset + 1)
-            is_fixed_first_stage = drawer is self.brightness_stage_drawer
-            is_fixed_last_stage = drawer is self.analysis_stage_drawer
-            is_movable = not is_fixed_first_stage and not is_fixed_last_stage
-            drawer.set_reorder_enabled(is_movable)
+            drawer.set_reorder_enabled(not self._is_fixed_pipeline_stage(drawer))
             self.enhancement_layout.insertWidget(insert_index + offset, drawer)
 
     def enhancement_parameters(self) -> EnhancementParameters:
@@ -3654,6 +3780,10 @@ class ContrastWindow(QMainWindow):
         )
 
     def on_pipeline_stages_changed(self) -> None:
+        source_changed = self._apply_source_pipeline_stages()
+        if source_changed:
+            self.results.clear()
+            self.clear_plots_and_metrics()
         stages = self.enhancement_stages()
         active_mode = str(self.enhancement_mode_combo.currentData())
         use_deep_model = stages.denoise and active_mode != "classical"
@@ -3671,7 +3801,10 @@ class ContrastWindow(QMainWindow):
             self.results.clear()
             self.clear_plots_and_metrics()
             self._update_stage_statuses()
-            self.statusBar().showMessage("Showing original videos.")
+            if source_changed:
+                self.statusBar().showMessage("Source pipeline updated. Showing original videos.")
+            else:
+                self.statusBar().showMessage("Showing original videos.")
 
     def reset_enhancement_pipeline(self) -> None:
         for check in self.pipeline_stage_checks:
