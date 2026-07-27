@@ -4,6 +4,7 @@ import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from queue import SimpleQueue
+from threading import Event
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +16,9 @@ from PySide6.QtWidgets import QApplication, QDoubleSpinBox
 import main
 from main import (
     ContrastWindow,
+    EnhancementParameters,
+    EnhancementRequest,
+    EnhancementStages,
     VideoPanel,
     analyze_gray_frames,
     compute_temporal_change_map,
@@ -27,6 +31,43 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_current_source_pipeline_skips_source_preparation(self) -> None:
+        request = EnhancementRequest(
+            generation=1,
+            mode="classical",
+            model_label="Classical",
+            stages=EnhancementStages(),
+            parameters=EnhancementParameters(),
+            noise_sigma=10,
+            batch_size=4,
+            precision="fp16",
+            auto_crop=True,
+            temporal_alignment=True,
+            source_pipeline_current=True,
+        )
+        window = SimpleNamespace(panels=[])
+
+        self.assertTrue(ContrastWindow._run_enhancement_request(window, request, Event()))
+
+    def test_rebuild_marks_applied_source_pipeline_current(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window._add_pipeline_stage("auto_crop")
+        window._add_pipeline_stage("temporal_alignment")
+        for drawer in window.pipeline_stage_drawers:
+            drawer.enable_button.blockSignals(True)
+            drawer.enable_button.setChecked(True)
+            drawer.enable_button.blockSignals(False)
+        for panel in window.panels:
+            panel.source_pipeline_configuration = (True, True)
+
+        with patch.object(window, "_start_enhancement_request") as start_request:
+            window.rebuild_enhancement_pipeline()
+
+        request = start_request.call_args.args[0]
+        self.assertTrue(request.source_pipeline_current)
+
     def test_disabled_pipeline_stage_changes_do_not_rebuild(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = ContrastWindow()
