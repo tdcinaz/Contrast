@@ -112,6 +112,7 @@ class EnhancementStages:
     denoise: bool = False
     temporal_filter: bool = False
     local_contrast: bool = False
+    image_adjustments: bool = False
     final_smoothing: bool = False
     segmentation: bool = False
     stage_order: tuple[str, ...] = (
@@ -120,6 +121,7 @@ class EnhancementStages:
         "denoise",
         "temporal_filter",
         "local_contrast",
+        "image_adjustments",
         "final_smoothing",
         "segmentation",
     )
@@ -133,6 +135,7 @@ class EnhancementStages:
                 self.denoise,
                 self.temporal_filter,
                 self.local_contrast,
+                self.image_adjustments,
                 self.final_smoothing,
                 self.segmentation,
             )
@@ -157,6 +160,10 @@ class EnhancementParameters:
     temporal_motion_sigma: float = 12.0
     clahe_clip_limit: float = 1.0
     clahe_tile_size: int = 6
+    adjustments_brightness_offset: int = 0
+    adjustments_contrast_gain: float = 1.0
+    adjustments_sharpen_amount: float = 0.0
+    adjustments_gamma: float = 1.0
     smoothing_sigma_x: float = 0.55
     segmentation_block_size: int = 51
     segmentation_sensitivity: float = 7.0
@@ -433,6 +440,29 @@ def enhance_local_contrast(gray: np.ndarray, clip_limit: float, tile_size: int) 
 
 def smooth_final_frame(gray: np.ndarray, sigma_x: float) -> np.ndarray:
     return cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma_x)
+
+
+def apply_image_adjustments(
+    gray: np.ndarray,
+    brightness_offset: int,
+    contrast_gain: float,
+    sharpen_amount: float,
+    gamma: float,
+) -> np.ndarray:
+    adjusted = gray.astype(np.float32)
+    adjusted = adjusted * float(contrast_gain) + float(brightness_offset)
+
+    safe_gamma = max(0.1, float(gamma))
+    if abs(safe_gamma - 1.0) > 1e-4:
+        normalized = np.clip(adjusted, 0, 255) / 255.0
+        adjusted = np.power(normalized, 1.0 / safe_gamma).astype(np.float32) * 255.0
+
+    amount = max(0.0, float(sharpen_amount))
+    if amount > 1e-4:
+        blurred = cv2.GaussianBlur(adjusted, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        adjusted = cv2.addWeighted(adjusted, 1.0 + amount, blurred, -amount, 0.0)
+
+    return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
 def segment_dark_contrast(
@@ -797,6 +827,16 @@ class VideoPanel(QFrame):
                     int(parameters.clahe_tile_size),
                 ),
             )
+        if stage_key == "image_adjustments":
+            return (
+                stage_key,
+                (
+                    int(parameters.adjustments_brightness_offset),
+                    round(float(parameters.adjustments_contrast_gain), 4),
+                    round(float(parameters.adjustments_sharpen_amount), 4),
+                    round(float(parameters.adjustments_gamma), 4),
+                ),
+            )
         if stage_key == "final_smoothing":
             return (stage_key, (round(float(parameters.smoothing_sigma_x), 4),))
         if stage_key == "segmentation":
@@ -853,6 +893,8 @@ class VideoPanel(QFrame):
             return 0.0022
         if stage_key == "local_contrast":
             return 0.0028
+        if stage_key == "image_adjustments":
+            return 0.0016
         if stage_key == "final_smoothing":
             return 0.0010
         if stage_key == "segmentation":
@@ -876,6 +918,8 @@ class VideoPanel(QFrame):
             return 0.0030
         if stage_key == "local_contrast":
             return 0.0038
+        if stage_key == "image_adjustments":
+            return 0.0026
         if stage_key == "final_smoothing":
             return 0.0015
         if stage_key == "segmentation":
@@ -929,6 +973,7 @@ class VideoPanel(QFrame):
             "denoise": "Spatial denoising",
             "temporal_filter": "Motion-aware temporal filtering",
             "local_contrast": "Local contrast (CLAHE)",
+            "image_adjustments": "Image adjustments",
             "final_smoothing": "Final Gaussian smoothing",
             "segmentation": "Brightness-coded contrast segmentation",
         }
@@ -957,6 +1002,14 @@ class VideoPanel(QFrame):
                 np.clip(frame, 0, 255).astype(np.uint8),
                 parameters.clahe_clip_limit,
                 parameters.clahe_tile_size,
+            )
+        if stage_key == "image_adjustments":
+            return apply_image_adjustments(
+                np.clip(frame, 0, 255).astype(np.uint8),
+                parameters.adjustments_brightness_offset,
+                parameters.adjustments_contrast_gain,
+                parameters.adjustments_sharpen_amount,
+                parameters.adjustments_gamma,
             )
         if stage_key == "final_smoothing":
             return smooth_final_frame(np.clip(frame, 0, 255).astype(np.uint8), parameters.smoothing_sigma_x)
@@ -1829,17 +1882,19 @@ class ContrastWindow(QMainWindow):
         self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 3)
         self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 4)
         self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 5)
-        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 6)
+        self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 6)
+        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 7)
         self.segmentation_stage_drawer = StageDrawer(
             "segmentation",
             "Brightness-coded contrast segmentation",
-            7,
+            8,
         )
         self.gain_stage_check = self.gain_stage_drawer.enable_check
         self.scanline_stage_check = self.scanline_stage_drawer.enable_check
         self.denoise_stage_check = self.denoise_stage_drawer.enable_check
         self.temporal_stage_check = self.temporal_stage_drawer.enable_check
         self.contrast_stage_check = self.contrast_stage_drawer.enable_check
+        self.adjustments_stage_check = self.adjustments_stage_drawer.enable_check
         self.smoothing_stage_check = self.smoothing_stage_drawer.enable_check
         self.segmentation_stage_check = self.segmentation_stage_drawer.enable_check
         self.pipeline_stage_checks = [
@@ -1848,6 +1903,7 @@ class ContrastWindow(QMainWindow):
             self.denoise_stage_check,
             self.temporal_stage_check,
             self.contrast_stage_check,
+            self.adjustments_stage_check,
             self.smoothing_stage_check,
             self.segmentation_stage_check,
         ]
@@ -1857,6 +1913,7 @@ class ContrastWindow(QMainWindow):
             self.denoise_stage_drawer,
             self.temporal_stage_drawer,
             self.contrast_stage_drawer,
+            self.adjustments_stage_drawer,
             self.smoothing_stage_drawer,
             self.segmentation_stage_drawer,
         ]
@@ -2097,6 +2154,45 @@ class ContrastWindow(QMainWindow):
         clahe_tile_row.addWidget(self.clahe_tile_spin)
         self.contrast_stage_drawer.content_layout.addLayout(clahe_tile_row)
 
+        adjustments_brightness_row = QHBoxLayout()
+        adjustments_brightness_row.addWidget(QLabel("Brightness offset"))
+        self.adjustments_brightness_spin = QSpinBox()
+        self.adjustments_brightness_spin.setRange(-128, 128)
+        self.adjustments_brightness_spin.setValue(0)
+        self.adjustments_brightness_spin.setSuffix(" levels")
+        adjustments_brightness_row.addWidget(self.adjustments_brightness_spin)
+        self.adjustments_stage_drawer.content_layout.addLayout(adjustments_brightness_row)
+
+        adjustments_contrast_row = QHBoxLayout()
+        adjustments_contrast_row.addWidget(QLabel("Contrast gain"))
+        self.adjustments_contrast_spin = QDoubleSpinBox()
+        self.adjustments_contrast_spin.setRange(0.30, 3.00)
+        self.adjustments_contrast_spin.setSingleStep(0.05)
+        self.adjustments_contrast_spin.setDecimals(2)
+        self.adjustments_contrast_spin.setValue(1.00)
+        adjustments_contrast_row.addWidget(self.adjustments_contrast_spin)
+        self.adjustments_stage_drawer.content_layout.addLayout(adjustments_contrast_row)
+
+        adjustments_sharpen_row = QHBoxLayout()
+        adjustments_sharpen_row.addWidget(QLabel("Sharpen amount"))
+        self.adjustments_sharpen_spin = QDoubleSpinBox()
+        self.adjustments_sharpen_spin.setRange(0.00, 3.00)
+        self.adjustments_sharpen_spin.setSingleStep(0.05)
+        self.adjustments_sharpen_spin.setDecimals(2)
+        self.adjustments_sharpen_spin.setValue(0.00)
+        adjustments_sharpen_row.addWidget(self.adjustments_sharpen_spin)
+        self.adjustments_stage_drawer.content_layout.addLayout(adjustments_sharpen_row)
+
+        adjustments_gamma_row = QHBoxLayout()
+        adjustments_gamma_row.addWidget(QLabel("Gamma"))
+        self.adjustments_gamma_spin = QDoubleSpinBox()
+        self.adjustments_gamma_spin.setRange(0.30, 3.00)
+        self.adjustments_gamma_spin.setSingleStep(0.05)
+        self.adjustments_gamma_spin.setDecimals(2)
+        self.adjustments_gamma_spin.setValue(1.00)
+        adjustments_gamma_row.addWidget(self.adjustments_gamma_spin)
+        self.adjustments_stage_drawer.content_layout.addLayout(adjustments_gamma_row)
+
         smoothing_row = QHBoxLayout()
         smoothing_row.addWidget(QLabel("Gaussian sigma"))
         self.smoothing_sigma_spin = QDoubleSpinBox()
@@ -2161,6 +2257,10 @@ class ContrastWindow(QMainWindow):
             self.temporal_sigma_spin,
             self.clahe_clip_spin,
             self.clahe_tile_spin,
+            self.adjustments_brightness_spin,
+            self.adjustments_contrast_spin,
+            self.adjustments_sharpen_spin,
+            self.adjustments_gamma_spin,
             self.smoothing_sigma_spin,
             self.segmentation_block_spin,
             self.segmentation_sensitivity_spin,
@@ -2386,6 +2486,7 @@ class ContrastWindow(QMainWindow):
             denoise=self.denoise_stage_check.isChecked(),
             temporal_filter=self.temporal_stage_check.isChecked(),
             local_contrast=self.contrast_stage_check.isChecked(),
+            image_adjustments=self.adjustments_stage_check.isChecked(),
             final_smoothing=self.smoothing_stage_check.isChecked(),
             segmentation=self.segmentation_stage_check.isChecked(),
             stage_order=tuple(drawer.stage_key for drawer in self.pipeline_stage_drawers),
@@ -2433,6 +2534,10 @@ class ContrastWindow(QMainWindow):
             temporal_motion_sigma=self.temporal_sigma_spin.value(),
             clahe_clip_limit=self.clahe_clip_spin.value(),
             clahe_tile_size=self.clahe_tile_spin.value(),
+            adjustments_brightness_offset=self.adjustments_brightness_spin.value(),
+            adjustments_contrast_gain=self.adjustments_contrast_spin.value(),
+            adjustments_sharpen_amount=self.adjustments_sharpen_spin.value(),
+            adjustments_gamma=self.adjustments_gamma_spin.value(),
             smoothing_sigma_x=self.smoothing_sigma_spin.value(),
             segmentation_block_size=self.segmentation_block_spin.value(),
             segmentation_sensitivity=self.segmentation_sensitivity_spin.value(),
