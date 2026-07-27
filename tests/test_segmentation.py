@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from concurrent.futures import Future
+from pathlib import Path
 from queue import SimpleQueue
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import numpy as np
 from main import (
     ContrastWindow,
     VideoPanel,
+    analyze_gray_frames,
     compute_temporal_change_map,
     detect_aneurysm_roi,
     overlay_segmentation_mask,
@@ -44,7 +46,34 @@ class SegmentationTests(unittest.TestCase):
         self.assertTrue(roi.contains(82, 125))
         self.assertFalse(roi.contains(65, 55))
         self.assertFalse(roi.contains(180, 88))
-        self.assertAlmostEqual(roi.width(), roi.height(), delta=4)
+        self.assertLess(abs(roi.width() - roi.height()), 12)
+
+    def test_analysis_uses_roi_mask_instead_of_full_bounding_box(self) -> None:
+        detection_frames: list[np.ndarray] = []
+        for index in range(8):
+            frame = np.full((96, 96), 180, dtype=np.uint8)
+            level = 178 if index < 3 else 60
+            cv2.circle(frame, (48, 48), 14, level, thickness=-1)
+            detection_frames.append(frame)
+
+        roi = detect_aneurysm_roi(detection_frames, fps=10.0)
+
+        self.assertIsNotNone(roi)
+        assert roi is not None
+        analysis_frame = np.full((96, 96), 180, dtype=np.uint8)
+        cv2.circle(analysis_frame, (48, 48), 14, 60, thickness=-1)
+        result = analyze_gray_frames(
+            "Pre-deployment",
+            Path("synthetic.mov"),
+            10.0,
+            roi.rect,
+            roi.mask,
+            [analysis_frame],
+            0.5,
+            False,
+        )
+
+        self.assertAlmostEqual(result.mean_intensity[0], 60.0, delta=1.0)
 
     def test_preserves_component_brightness_and_removes_small_components(self) -> None:
         frame = np.full((160, 160), 180, dtype=np.uint8)

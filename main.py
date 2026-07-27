@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -206,6 +206,34 @@ class AnalysisResult:
     residence_time: float | None
     peak_signal: float
     auc: float
+
+
+@dataclass(frozen=True, slots=True)
+class ROISelection:
+    rect: QRect
+    mask: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        rect = QRect(self.rect).normalized()
+        object.__setattr__(self, "rect", rect)
+        if self.mask is not None:
+            expected_shape = (rect.height(), rect.width())
+            if self.mask.shape != expected_shape:
+                raise ValueError(f"ROI mask shape {self.mask.shape} does not match ROI rect {expected_shape}")
+            object.__setattr__(self, "mask", self.mask.astype(bool, copy=True))
+
+    def contains(self, x: int, y: int) -> bool:
+        if not self.rect.contains(x, y):
+            return False
+        if self.mask is None:
+            return True
+        return bool(self.mask[y - self.rect.y(), x - self.rect.x()])
+
+    def width(self) -> int:
+        return self.rect.width()
+
+    def height(self) -> int:
+        return self.rect.height()
 
 
 def format_seconds(value: float | None) -> str:
@@ -640,7 +668,7 @@ def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
     return np.percentile(stack, 90.0, axis=0) - np.percentile(stack, 10.0, axis=0)
 
 
-def detect_aneurysm_roi(gray_frames: list[np.ndarray], fps: float) -> QRect | None:
+def detect_aneurysm_roi(gray_frames: list[np.ndarray], fps: float) -> ROISelection | None:
     if len(gray_frames) < 3:
         return None
 
@@ -682,7 +710,7 @@ def detect_aneurysm_roi(gray_frames: list[np.ndarray], fps: float) -> QRect | No
             for percentile in (45.0, 60.0, 75.0, 87.5, 95.0, 97.0, 99.0)
         }
     )
-    best_candidate: tuple[float, float, float, float] | None = None
+    best_candidate: tuple[float, np.ndarray] | None = None
     open_kernel = np.ones((3, 3), dtype=np.uint8)
     close_kernel = np.ones((5, 5), dtype=np.uint8)
 
@@ -713,18 +741,20 @@ def detect_aneurysm_roi(gray_frames: list[np.ndarray], fps: float) -> QRect | No
             edge_factor = 0.65 if edge_margin <= 1 else 1.0
             score = response * math.sqrt(area) * circularity**2 * (0.5 + fill_fraction) * edge_factor
             if best_candidate is None or score > best_candidate[0]:
-                (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
-                best_candidate = (score, float(center_x), float(center_y), float(radius))
+                best_candidate = (score, contour.copy())
 
     if best_candidate is None:
         return None
 
-    _, center_x, center_y, radius = best_candidate
-    roi_size = max(8, round(radius * 2.3))
-    roi_size = min(roi_size, width, height)
-    roi_x = max(0, min(width - roi_size, round(center_x - roi_size / 2)))
-    roi_y = max(0, min(height - roi_size, round(center_y - roi_size / 2)))
-    return QRect(roi_x, roi_y, roi_size, roi_size)
+    _, contour = best_candidate
+    roi_x, roi_y, roi_width, roi_height = cv2.boundingRect(contour)
+    roi = QRect(int(roi_x), int(roi_y), int(roi_width), int(roi_height))
+    local_contour = contour.copy()
+    local_contour[:, 0, 0] -= roi_x
+    local_contour[:, 0, 1] -= roi_y
+    roi_mask = np.zeros((roi_height, roi_width), dtype=np.uint8)
+    cv2.drawContours(roi_mask, [local_contour], -1, 1, thickness=-1)
+    return ROISelection(roi, roi_mask.astype(bool))
 
 
 def segment_temporal_change_map(
@@ -809,7 +839,7 @@ def overlay_segmentation_mask(
     return result
 
 
-def reference_mean(gray: np.ndarray, roi: QRect) -> float:
+def reference_mean(gray: np.ndarray, roi: QRect, roi_mask: np.ndarray | None = None) -> float:
     frame_height, frame_width = gray.shape
     pad_x = max(30, roi.width() // 2)
     pad_y = max(30, roi.height() // 2)
@@ -824,14 +854,29 @@ def reference_mean(gray: np.ndarray, roi: QRect) -> float:
     roi_top = max(0, roi.top() - top)
     roi_bottom = min(reference.shape[0], roi.bottom() - top + 1)
     mask = np.ones(reference.shape, dtype=bool)
-    mask[roi_top:roi_bottom, roi_left:roi_right] = False
+    if roi_mask is None:
+        mask[roi_top:roi_bottom, roi_left:roi_right] = False
+    else:
+        mask_slice = roi_mask[: roi_bottom - roi_top, : roi_right - roi_left]
+        mask[roi_top:roi_bottom, roi_left:roi_right] = ~mask_slice
     pixels = reference[mask]
 
     if pixels.size < 200:
         mask = np.ones(gray.shape, dtype=bool)
-        mask[roi.y() : roi.y() + roi.height(), roi.x() : roi.x() + roi.width()] = False
+        if roi_mask is None:
+            mask[roi.y() : roi.y() + roi.height(), roi.x() : roi.x() + roi.width()] = False
+        else:
+            mask[roi.y() : roi.y() + roi.height(), roi.x() : roi.x() + roi.width()] = ~roi_mask
         pixels = gray[mask]
     return float(np.median(pixels)) if pixels.size else float(np.median(gray))
+
+
+def roi_mean(gray: np.ndarray, roi: QRect, roi_mask: np.ndarray | None = None) -> float:
+    roi_pixels = gray[roi.y() : roi.y() + roi.height(), roi.x() : roi.x() + roi.width()]
+    if roi_mask is None:
+        return float(np.mean(roi_pixels))
+    selected = roi_pixels[roi_mask]
+    return float(np.mean(selected)) if selected.size else float(np.mean(roi_pixels))
 
 
 class VideoDisplay(QLabel):
@@ -846,6 +891,7 @@ class VideoDisplay(QLabel):
         self._right_pixmap = QPixmap()
         self._comparison_enabled = True
         self._roi: QRect | None = None
+        self._roi_mask: np.ndarray | None = None
         self._drag_origin: QPoint | None = None
         self._display_rect = QRect()
         self._right_display_rect = QRect()
@@ -883,12 +929,17 @@ class VideoDisplay(QLabel):
     def roi(self) -> QRect | None:
         return QRect(self._roi) if self._roi and self._roi.isValid() else None
 
+    def roi_mask(self) -> np.ndarray | None:
+        return None if self._roi_mask is None else self._roi_mask.copy()
+
     def clear_roi(self) -> None:
         self._roi = None
+        self._roi_mask = None
         self.update()
 
-    def set_roi(self, roi: QRect | None) -> None:
+    def set_roi(self, roi: QRect | None, mask: np.ndarray | None = None) -> None:
         self._roi = QRect(roi) if roi is not None and roi.isValid() else None
+        self._roi_mask = None if self._roi is None or mask is None else mask.astype(bool, copy=True)
         self.update()
         self.roiChanged.emit(QRect(self._roi) if self._roi is not None else QRect())
 
@@ -953,7 +1004,26 @@ class VideoDisplay(QLabel):
             pen = QPen(self.roi_color, 2)
             painter.setPen(pen)
             painter.setBrush(QColor(self.roi_color.red(), self.roi_color.green(), self.roi_color.blue(), 35))
-            painter.drawRect(display_roi)
+            if self._roi_mask is None:
+                painter.drawRect(display_roi)
+            else:
+                contours, _ = cv2.findContours(self._roi_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                drew_contour = False
+                for contour in contours:
+                    if len(contour) < 3:
+                        continue
+                    polygon = QPolygon(
+                        [
+                            self._frame_to_display_point(
+                                QPoint(self._roi.x() + int(point[0][0]), self._roi.y() + int(point[0][1]))
+                            )
+                            for point in contour
+                        ]
+                    )
+                    painter.drawPolygon(polygon)
+                    drew_contour = True
+                if not drew_contour:
+                    painter.drawRect(display_roi)
 
             painter.setPen(QColor("#f8fafc"))
             painter.drawText(display_roi.adjusted(6, 4, -6, -4), Qt.AlignmentFlag.AlignTop, "ROI")
@@ -965,6 +1035,7 @@ class VideoDisplay(QLabel):
         if not self._display_rect.contains(point):
             return
         self._drag_origin = point
+        self._roi_mask = None
         frame_point = self._display_to_frame_point(point)
         self._roi = QRect(frame_point, frame_point)
         self.update()
@@ -1007,6 +1078,15 @@ class VideoDisplay(QLabel):
             round(self._display_rect.top() + rect.top() * y_scale),
             round(rect.width() * x_scale),
             round(rect.height() * y_scale),
+        )
+
+    def _frame_to_display_point(self, point: QPoint) -> QPoint:
+        width, height = self.frame_size
+        x_scale = self._display_rect.width() / max(1, width)
+        y_scale = self._display_rect.height() / max(1, height)
+        return QPoint(
+            round(self._display_rect.left() + point.x() * x_scale),
+            round(self._display_rect.top() + point.y() * y_scale),
         )
 
 
@@ -1896,13 +1976,19 @@ class VideoPanel(QFrame):
     def roi(self) -> QRect | None:
         return self.display.roi()
 
+    def roi_mask(self) -> np.ndarray | None:
+        return self.display.roi_mask()
+
     def auto_detect_aneurysm(self, gray_frames: list[np.ndarray] | None = None) -> QRect | None:
         source_frames = gray_frames if gray_frames is not None else self._sample_cropped_gray_frames()
         start = self.trim_start_frame
         end = min(len(source_frames), start + self.playback_frame_count)
         roi = detect_aneurysm_roi(source_frames[start:end], self.info.fps)
-        self.display.set_roi(roi)
-        return roi
+        if roi is None:
+            self.display.set_roi(None)
+            return None
+        self.display.set_roi(roi.rect, roi.mask)
+        return roi.rect
 
     def set_video(self, path: Path) -> None:
         self.capture.release()
@@ -3412,6 +3498,7 @@ class ContrastWindow(QMainWindow):
                 panel.path,
                 panel.info.fps,
                 panel.roi(),
+                panel.roi_mask(),
                 gray_frames,
                 threshold,
                 gain_corrected,
@@ -3538,19 +3625,17 @@ def analyze_gray_frames(
     path: Path,
     fps: float,
     roi: QRect,
+    roi_mask: np.ndarray | None,
     gray_frames: list[np.ndarray],
     threshold_fraction: float,
     gain_corrected: bool,
 ) -> AnalysisResult:
-    x, y = roi.x(), roi.y()
-    width, height = roi.width(), roi.height()
     means: list[float] = []
     references: list[float] = []
 
     for gray in gray_frames:
-        roi_pixels = gray[y : y + height, x : x + width]
-        means.append(float(np.mean(roi_pixels)))
-        references.append(reference_mean(gray, roi))
+        means.append(roi_mean(gray, roi, roi_mask))
+        references.append(reference_mean(gray, roi, roi_mask))
 
     roi_intensity = np.asarray(means, dtype=float)
     reference_intensity = np.asarray(references, dtype=float)
