@@ -249,6 +249,46 @@ def smooth_temporal_signal(values: np.ndarray, fps: float) -> np.ndarray:
     ).ravel()
 
 
+def _contrast_frame_signal(gray: np.ndarray) -> float:
+    height, width = gray.shape
+    center = gray[height // 4 : height * 3 // 4, width // 4 : width * 3 // 4]
+    if center.size == 0:
+        center = gray
+    return float(0.6 * np.mean(center) + 0.4 * np.percentile(center, 30))
+
+
+def detect_pre_injection_trim_start(gray_frames: list[np.ndarray], fps: float) -> int:
+    if len(gray_frames) < 3:
+        return 0
+
+    target_median = float(np.median([np.median(gray) for gray in gray_frames]))
+    stabilized_frames = [stabilize_frame_gain(gray, target_median, 0.70, 1.45) for gray in gray_frames]
+    signals = np.asarray([_contrast_frame_signal(gray) for gray in stabilized_frames], dtype=float)
+    smoothed = smooth_temporal_signal(signals, fps)
+    baseline_window = min(len(smoothed), max(3, round(fps * 1.5)))
+    baseline = float(np.median(smoothed[:baseline_window]))
+    baseline_noise = float(np.median(np.abs(smoothed[:baseline_window] - baseline)))
+    sustain_window = max(3, round(fps * 0.35))
+    drop_threshold = max(2.0, baseline_noise * 6.0)
+    threshold = baseline - drop_threshold
+
+    onset_index = None
+    search_end = max(baseline_window, len(smoothed) - sustain_window + 1)
+    for index in range(baseline_window, search_end):
+        if np.all(smoothed[index : index + sustain_window] <= threshold):
+            onset_index = index
+            break
+
+    if onset_index is None:
+        gradient = np.diff(smoothed)
+        if len(gradient) > baseline_window:
+            onset_index = int(np.argmin(gradient[baseline_window:]) + baseline_window + 1)
+        else:
+            onset_index = baseline_window
+
+    return max(0, onset_index - round(fps * 0.5))
+
+
 def _detect_aligned_field_crop(gray_frames: list[np.ndarray]) -> QRect | None:
     height, width = gray_frames[0].shape
     temporal_level = np.percentile(np.stack(gray_frames, axis=0), 75, axis=0).astype(np.uint8)
@@ -376,13 +416,15 @@ def crop_frame(frame: np.ndarray, crop_rect: QRect) -> np.ndarray:
     return frame[y:y2, x:x2]
 
 
-def estimate_video_median(path: Path, crop_rect: QRect, frame_count: int) -> float:
+def estimate_video_median(path: Path, crop_rect: QRect, start_frame: int, frame_count: int) -> float:
     capture = cv2.VideoCapture(str(path))
     try:
         medians: list[float] = []
+        if frame_count <= 0:
+            return 128.0
         sample_indexes = np.unique(np.linspace(0, max(0, frame_count - 1), num=min(24, max(1, frame_count)), dtype=int))
         for frame_index in sample_indexes:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame + int(frame_index))
             ok, frame = capture.read()
             if ok:
                 gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
@@ -739,12 +781,14 @@ class VideoPanel(QFrame):
         self.info = probe_video(path)
         self.crop_rect = detect_fluoroscope_crop(path, self.info)
         self.capture = cv2.VideoCapture(str(path))
+        self.trim_start_frame = 0
+        self.trim_frame_count = self.info.frame_count
         self.current_frame: np.ndarray | None = None
         self.current_frame_index = -1
         self.enhance_display = False
         self.comparison_display = True
         self.segmentation_overlay_display = True
-        self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
+        self.target_median = 128.0
         self.enhanced_frames: list[np.ndarray] | None = None
         self.segmentation_masks: list[np.ndarray] | None = None
         self.source_gray_frames: list[np.ndarray] | None = None
@@ -778,7 +822,40 @@ class VideoPanel(QFrame):
         layout.addWidget(self.display, 1)
 
         self.setObjectName("videoPanel")
+        self.set_trim_window(detect_pre_injection_trim_start(self._sample_cropped_gray_frames(), self.info.fps))
         self.seek(0)
+
+    def _sample_cropped_gray_frames(self) -> list[np.ndarray]:
+        capture = cv2.VideoCapture(str(self.path))
+        gray_frames: list[np.ndarray] = []
+        try:
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                gray_frames.append(cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY))
+        finally:
+            capture.release()
+        return gray_frames
+
+    def set_trim_window(self, start_frame: int, frame_count: int | None = None) -> None:
+        max_start = max(0, self.info.frame_count - 1)
+        self.trim_start_frame = max(0, min(start_frame, max_start))
+        available_frames = max(1, self.info.frame_count - self.trim_start_frame)
+        self.trim_frame_count = max(1, min(frame_count if frame_count is not None else available_frames, available_frames))
+        self.capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame)
+        self.target_median = estimate_video_median(self.path, self.crop_rect, self.trim_start_frame, self.trim_frame_count)
+        self.current_frame_index = -1
+        self.clear_enhancement_cache()
+        self.meta_label.setText(self._metadata_text())
+
+    @property
+    def playback_frame_count(self) -> int:
+        return self.trim_frame_count
+
+    @property
+    def playback_duration(self) -> float:
+        return self.playback_frame_count / self.info.fps if self.info.fps else 0.0
 
     def _stage_token(
         self,
@@ -953,7 +1030,7 @@ class VideoPanel(QFrame):
         parameters: EnhancementParameters,
     ) -> float:
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
-        frame_count = self.info.frame_count
+        frame_count = self.playback_frame_count
         work_units = 0.0
         if self.source_gray_frames is None:
             work_units += self._estimated_stage_duration(self._source_stage_token(), frame_count)
@@ -1066,7 +1143,7 @@ class VideoPanel(QFrame):
                     owned_executor,
                 )
 
-        frame_count = self.info.frame_count
+        frame_count = self.playback_frame_count
         source_missing = self.source_gray_frames is None
         start_prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
         missing_stages: list[
@@ -1149,6 +1226,7 @@ class VideoPanel(QFrame):
             if not capture.isOpened():
                 close_queue(queues[0])
                 raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
+            capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame)
             active_seconds = 0.0
             try:
                 for index in range(frame_count):
@@ -1435,9 +1513,10 @@ class VideoPanel(QFrame):
     def _metadata_text(self) -> str:
         crop_width = self.crop_rect.width()
         crop_height = self.crop_rect.height()
+        trimmed_duration = self.playback_duration
         if crop_width != self.info.width or crop_height != self.info.height:
-            return f"{crop_width}x{crop_height} (auto-cropped) | {self.info.fps:.1f} fps | {self.info.duration:.1f} s"
-        return f"{self.info.width}x{self.info.height} | {self.info.fps:.1f} fps | {self.info.duration:.1f} s"
+            return f"{crop_width}x{crop_height} (auto-cropped) | {self.info.fps:.1f} fps | {trimmed_duration:.1f} s trimmed"
+        return f"{self.info.width}x{self.info.height} | {self.info.fps:.1f} fps | {trimmed_duration:.1f} s trimmed"
 
     def _display_frame(self, frame: np.ndarray, apply_enhancement: bool | None = None) -> None:
         self.current_frame = frame
@@ -1461,7 +1540,7 @@ class VideoPanel(QFrame):
         self.display.set_frames(frame, enhanced_frame)
 
     def read_next(self, playback: bool = False) -> bool:
-        if self.current_frame_index >= self.info.frame_count - 1:
+        if self.current_frame_index >= self.playback_frame_count - 1:
             return False
         ok, frame = self.capture.read()
         if ok:
@@ -1470,13 +1549,13 @@ class VideoPanel(QFrame):
         return ok
 
     def seek(self, frame_index: int) -> bool:
-        frame_index = max(0, min(frame_index, self.info.frame_count - 1))
+        frame_index = max(0, min(frame_index, self.playback_frame_count - 1))
         if frame_index == self.current_frame_index and self.current_frame is not None:
             self._display_frame(self.current_frame)
             return True
         if frame_index == self.current_frame_index + 1:
             return self.read_next()
-        self.capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        self.capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame + frame_index)
         ok, frame = self.capture.read()
         if ok:
             self.current_frame_index = frame_index
@@ -1492,10 +1571,8 @@ class VideoPanel(QFrame):
         self.info = probe_video(path)
         self.crop_rect = detect_fluoroscope_crop(path, self.info)
         self.capture = cv2.VideoCapture(str(path))
-        self.current_frame_index = -1
-        self.target_median = estimate_video_median(path, self.crop_rect, self.info.frame_count)
-        self.clear_enhancement_cache()
         self.path_label.setText(path.name)
+        self.set_trim_window(detect_pre_injection_trim_start(self._sample_cropped_gray_frames(), self.info.fps))
         self.meta_label.setText(self._metadata_text())
         self.display.clear_roi()
         self.display.set_comparison_enabled(self.comparison_display)
@@ -1719,11 +1796,12 @@ class ContrastWindow(QMainWindow):
         for panel in self.panels:
             panel.roiChanged.connect(self.on_roi_changed)
 
-        self.source_max_frame = min(panel.info.frame_count for panel in self.panels) - 1
-        self.max_frame = self.source_max_frame
+        self.source_max_frame = 0
+        self.max_frame = 0
         self.fps = min(panel.info.fps for panel in self.panels)
         self.playback_speed = 1.0
         self.play_interval_ms = self._play_interval_ms()
+        self._sync_trimmed_video_window()
 
         self._build_actions()
         self._build_ui()
@@ -1747,6 +1825,15 @@ class ContrastWindow(QMainWindow):
         file_menu.addAction(self.open_post_action)
         file_menu.addSeparator()
         file_menu.addAction(self.export_action)
+
+    def _sync_trimmed_video_window(self) -> None:
+        common_frame_count = min(panel.playback_frame_count for panel in self.panels)
+        for panel in self.panels:
+            panel.set_trim_window(panel.trim_start_frame, common_frame_count)
+        self.source_max_frame = max(0, common_frame_count - 1)
+        self.max_frame = self.source_max_frame
+        self.fps = min(panel.info.fps for panel in self.panels)
+        self.play_interval_ms = self._play_interval_ms()
 
     def _build_ui(self) -> None:
         self.play_button = QPushButton("Play")
@@ -2327,10 +2414,7 @@ class ContrastWindow(QMainWindow):
             return
 
         self.results.clear()
-        self.source_max_frame = min(item.info.frame_count for item in self.panels) - 1
-        self.max_frame = self.source_max_frame
-        self.fps = min(item.info.fps for item in self.panels)
-        self.play_interval_ms = self._play_interval_ms()
+        self._sync_trimmed_video_window()
         self.frame_slider.setRange(0, self.max_frame)
         self.frame_spin.setRange(0, self.max_frame)
         self.set_frame_index(0)
@@ -2870,7 +2954,7 @@ class ContrastWindow(QMainWindow):
 
         self.pause()
         threshold = self.threshold_spin.value()
-        progress = QProgressDialog("Measuring ROI intensity...", "Cancel", 0, sum(panel.info.frame_count for panel in self.panels), self)
+        progress = QProgressDialog("Measuring ROI intensity...", "Cancel", 0, sum(panel.playback_frame_count for panel in self.panels), self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(250)
         progress.setValue(0)
@@ -2885,13 +2969,15 @@ class ContrastWindow(QMainWindow):
                     panel.path,
                     panel.info,
                     panel.crop_rect,
+                    panel.trim_start_frame,
+                    panel.playback_frame_count,
                     panel.roi(),
                     threshold,
                     self.gain_correct_check.isChecked(),
                     progress,
                     completed,
                 )
-                completed += panel.info.frame_count
+                completed += panel.playback_frame_count
                 progress.setValue(completed)
                 if progress.wasCanceled():
                     self.statusBar().showMessage("Analysis canceled.")
@@ -3019,6 +3105,8 @@ def analyze_video(
     path: Path,
     info: VideoInfo,
     crop_rect: QRect,
+    start_frame: int,
+    frame_count: int,
     roi: QRect,
     threshold_fraction: float,
     gain_corrected: bool,
@@ -3035,7 +3123,8 @@ def analyze_video(
     references: list[float] = []
 
     try:
-        for frame_index in range(info.frame_count):
+        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        for frame_index in range(frame_count):
             ok, frame = capture.read()
             if not ok:
                 break

@@ -5,7 +5,7 @@ import unittest
 import cv2
 import numpy as np
 
-from main import _detect_aligned_field_crop, _detect_pillarbox_crop
+from main import _detect_aligned_field_crop, _detect_pillarbox_crop, detect_pre_injection_trim_start
 
 
 class AutoCropTests(unittest.TestCase):
@@ -29,6 +29,21 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertIsNone(_detect_aligned_field_crop(frames))
         self.assertEqual(_detect_pillarbox_crop(frames, 400, 200).getRect(), (78, 0, 244, 200))
+
+    def test_detects_trim_start_half_second_before_contrast_onset(self) -> None:
+        frames: list[np.ndarray] = []
+        for index in range(60):
+            frame = np.full((240, 320), 150 + index // 2, dtype=np.uint8)
+            if index >= 30:
+                cv2.circle(frame, (160, 120), 52, 85 + index // 2, thickness=-1)
+            else:
+                cv2.circle(frame, (160, 120), 52, 148 + index // 2, thickness=-1)
+            frames.append(frame)
+
+        trim_start = detect_pre_injection_trim_start(frames, fps=10.0)
+
+        self.assertGreaterEqual(trim_start, 24)
+        self.assertLessEqual(trim_start, 26)
 
 
 if __name__ == "__main__":
