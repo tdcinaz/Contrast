@@ -3260,8 +3260,10 @@ class ContrastWindow(QMainWindow):
 
         self._sync_pipeline_scroll_gutter()
         drawer_width = max(
-            self.add_stage_button.minimumSizeHint().width(),
-            *(drawer.minimumSizeHint().width() for drawer in self.pipeline_stage_drawers),
+            [
+                self.add_stage_button.minimumSizeHint().width(),
+                *(drawer.minimumSizeHint().width() for drawer in self.pipeline_stage_drawers),
+            ]
         )
         margins = self.enhancement_layout.contentsMargins()
         base_right = getattr(self, "_pipeline_controls_base_right_margin", margins.right())
