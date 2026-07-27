@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -2252,10 +2252,17 @@ class StageDrawer(QFrame):
         self.stage_key = stage_key
         self.stage_title = title
 
-        self.enable_check = QCheckBox()
+        self.enable_button = QToolButton()
+        self.enable_button.setObjectName("stageEnableButton")
+        self.enable_button.setCheckable(True)
+        self.enable_button.setFixedSize(32, 32)
+        self.enable_button.setToolTip("Enable stage")
         self.stage_label = QLabel()
+        self.stage_label.setObjectName("stageLabel")
         self.grab_handle = QLabel("||")
         self.grab_handle.setObjectName("stageGrabHandle")
+        self.grab_handle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.grab_handle.setFixedSize(24, 32)
         self.grab_handle.setToolTip("Drag to reorder stage")
         self.expand_button = QToolButton()
         self.expand_button.setObjectName("stageExpandButton")
@@ -2265,6 +2272,7 @@ class StageDrawer(QFrame):
         self.expand_button.setChecked(False)
         self.expand_button.setFixedSize(32, 32)
         self.expand_button.setToolTip("Show stage options")
+        self._set_enabled_icon(False)
         self.set_stage_index(stage_index)
         self._drag_start_pos = QPoint()
         self._drag_from_handle = False
@@ -2279,21 +2287,23 @@ class StageDrawer(QFrame):
         header = QHBoxLayout(self.header)
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
+        header.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.grab_handle)
-        header.addWidget(self.enable_check)
+        header.addWidget(self.enable_button)
         header.addWidget(self.stage_label, 1)
         header.addWidget(self.expand_button)
 
         self.content = QWidget()
         self.content.setVisible(False)
         self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(12, 4, 8, 8)
+        self.content_layout.setContentsMargins(72, 4, 8, 8)
         self.content_layout.setSpacing(6)
 
         self.status_label = QLabel()
         self.status_label.setVisible(False)
         self.status_label.setWordWrap(True)
         self.status_label.setObjectName("stageStatusLabel")
+        self.status_label.setContentsMargins(72, 0, 0, 0)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -2302,7 +2312,8 @@ class StageDrawer(QFrame):
         layout.addWidget(self.status_label)
         layout.addWidget(self.content)
 
-        self.enable_check.stateChanged.connect(self.enabledChanged.emit)
+        self.enable_button.toggled.connect(self._set_enabled_icon)
+        self.enable_button.toggled.connect(lambda enabled: self.enabledChanged.emit(int(enabled)))
         self.expand_button.toggled.connect(self._set_expanded)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
@@ -2311,10 +2322,38 @@ class StageDrawer(QFrame):
             and event.type() == QEvent.Type.MouseButtonRelease
             and isinstance(event, QMouseEvent)
             and event.button() == Qt.MouseButton.LeftButton
+            and not self._is_header_control_at(event.position().toPoint())
         ):
             self.expand_button.toggle()
             return True
         return super().eventFilter(watched, event)
+
+    def _is_header_control_at(self, point: QPoint) -> bool:
+        widget = self.header.childAt(point)
+        while widget is not None:
+            if widget in (self.grab_handle, self.enable_button, self.expand_button):
+                return True
+            widget = widget.parentWidget()
+        return False
+
+    def _set_enabled_icon(self, enabled: bool) -> None:
+        color = QColor("#14b8a6" if enabled else "#64748b")
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(color)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QRectF(5, 5, 22, 22))
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        painter.setBrush(Qt.GlobalColor.transparent)
+        painter.drawEllipse(QRectF(9, 9, 14, 14))
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.setPen(QPen(color, 5.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(16, 4, 16, 14)
+        painter.end()
+        self.enable_button.setIcon(QIcon(pixmap))
+        self.enable_button.setToolTip("Disable stage" if enabled else "Enable stage")
 
     def _is_on_grab_handle(self, point: QPoint) -> bool:
         widget = self.childAt(point)
@@ -2362,7 +2401,7 @@ class StageDrawer(QFrame):
         self.content.setVisible(expanded)
 
     def set_stage_index(self, stage_index: int) -> None:
-        self.stage_label.setText(f"{stage_index}. {self.stage_title}")
+        self.stage_label.setText(self.stage_title)
 
     def set_reorder_enabled(self, drag_enabled: bool) -> None:
         self._drag_enabled = drag_enabled
@@ -2605,17 +2644,17 @@ class ContrastWindow(QMainWindow):
             "ROI residence analysis",
             11,
         )
-        self.gain_stage_check = self.gain_stage_drawer.enable_check
-        self.brightness_stage_check = self.brightness_stage_drawer.enable_check
-        self.roi_stage_check = self.roi_stage_drawer.enable_check
-        self.scanline_stage_check = self.scanline_stage_drawer.enable_check
-        self.denoise_stage_check = self.denoise_stage_drawer.enable_check
-        self.temporal_stage_check = self.temporal_stage_drawer.enable_check
-        self.contrast_stage_check = self.contrast_stage_drawer.enable_check
-        self.adjustments_stage_check = self.adjustments_stage_drawer.enable_check
-        self.smoothing_stage_check = self.smoothing_stage_drawer.enable_check
-        self.segmentation_stage_check = self.segmentation_stage_drawer.enable_check
-        self.analysis_stage_check = self.analysis_stage_drawer.enable_check
+        self.gain_stage_check = self.gain_stage_drawer.enable_button
+        self.brightness_stage_check = self.brightness_stage_drawer.enable_button
+        self.roi_stage_check = self.roi_stage_drawer.enable_button
+        self.scanline_stage_check = self.scanline_stage_drawer.enable_button
+        self.denoise_stage_check = self.denoise_stage_drawer.enable_button
+        self.temporal_stage_check = self.temporal_stage_drawer.enable_button
+        self.contrast_stage_check = self.contrast_stage_drawer.enable_button
+        self.adjustments_stage_check = self.adjustments_stage_drawer.enable_button
+        self.smoothing_stage_check = self.smoothing_stage_drawer.enable_button
+        self.segmentation_stage_check = self.segmentation_stage_drawer.enable_button
+        self.analysis_stage_check = self.analysis_stage_drawer.enable_button
         self.frame_pipeline_stage_checks = [
             self.brightness_stage_check,
             self.roi_stage_check,
@@ -2649,7 +2688,7 @@ class ContrastWindow(QMainWindow):
         self._stage_drag_x = 0
         for check in self.pipeline_stage_checks:
             check.setChecked(False)
-            check.stateChanged.connect(self.on_pipeline_stages_changed)
+            check.toggled.connect(self.on_pipeline_stages_changed)
         self._build_stage_drawer_controls()
         for drawer in self.pipeline_stage_drawers:
             drawer.reorderRequested.connect(self._reorder_pipeline_stage_by_key)
@@ -3101,8 +3140,12 @@ class ContrastWindow(QMainWindow):
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
             QFrame#videoPanel, QFrame#plotPanel { background: #111827; border: 1px solid #253044; border-radius: 8px; }
             QFrame#stageDrawer { background: #0f172a; border: 1px solid #273449; border-radius: 8px; }
-            QLabel#stageGrabHandle { color: #9fb0c6; font-weight: 700; min-width: 16px; }
+            QToolButton#stageEnableButton, QToolButton#stageExpandButton { border: 1px solid transparent; border-radius: 6px; icon-size: 16px; padding: 0; }
+            QToolButton#stageEnableButton:hover, QToolButton#stageExpandButton:hover { background: #1c2637; border-color: #334155; }
+            QToolButton#stageEnableButton:checked { background: #134e4a; border-color: #14b8a6; }
+            QLabel#stageGrabHandle { color: #9fb0c6; font-weight: 700; }
             QLabel#stageGrabHandle:disabled { color: #475569; }
+            QLabel#stageLabel { color: #f8fafc; font-weight: 700; }
             QLabel#panelTitle { font-size: 16px; font-weight: 700; color: #f8fafc; }
             QLabel#pipelineLabel { color: #e2e8f0; font-weight: 700; padding-top: 4px; }
             QLabel#subtleLabel, QLabel#hintLabel { color: #9fb0c6; }
@@ -3387,7 +3430,7 @@ class ContrastWindow(QMainWindow):
             target_index -= 1
         self.pipeline_stage_drawers.insert(target_index, moving_drawer)
         self.frame_pipeline_stage_drawers = self.pipeline_stage_drawers[:-1]
-        self.frame_pipeline_stage_checks = [item.enable_check for item in self.frame_pipeline_stage_drawers]
+        self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
         self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
         self._refresh_pipeline_stage_ui()
         self.on_enhancement_settings_changed()
@@ -3456,7 +3499,7 @@ class ContrastWindow(QMainWindow):
         self.enhancement_layout.insertWidget(placeholder_index, drawer)
         self.pipeline_stage_drawers = order
         self.frame_pipeline_stage_drawers = self.pipeline_stage_drawers[:-1]
-        self.frame_pipeline_stage_checks = [item.enable_check for item in self.frame_pipeline_stage_drawers]
+        self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
         self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
         self._dragged_stage_drawer = None
         self._stage_drag_placeholder = None
