@@ -20,6 +20,7 @@ from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, Qt, QTimer, S
 from PySide6.QtGui import QAction, QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -2717,6 +2718,7 @@ class ContrastWindow(QMainWindow):
         self.threshold_spin.setDecimals(2)
         self.threshold_spin.valueChanged.connect(self.on_analysis_threshold_changed)
         threshold_row.addWidget(self.threshold_spin)
+        self._add_parameter_slider(threshold_row, self.threshold_spin)
         self.analysis_stage_drawer.content_layout.addLayout(threshold_row)
 
         self.export_button = QPushButton("Export CSV")
@@ -2769,6 +2771,7 @@ class ContrastWindow(QMainWindow):
         return plot_group
 
     def _build_stage_drawer_controls(self) -> None:
+        self._parameter_slider_pairs: list[tuple[QSpinBox | QDoubleSpinBox, QSlider]] = []
         enhancement_mode_row = QHBoxLayout()
         enhancement_mode_row.addWidget(QLabel("Enhancement model"))
         self.enhancement_mode_combo = QComboBox()
@@ -2792,20 +2795,23 @@ class ContrastWindow(QMainWindow):
         denoise_strength_row.addWidget(self.denoise_strength_spin)
         self.denoise_stage_drawer.content_layout.addLayout(denoise_strength_row)
 
-        inference_row = QHBoxLayout()
-        inference_row.addWidget(QLabel("Batch frames"))
+        inference_batch_row = QHBoxLayout()
+        inference_batch_row.addWidget(QLabel("Batch frames"))
         self.inference_batch_spin = QSpinBox()
         self.inference_batch_spin.setRange(1, 16)
         self.inference_batch_spin.setValue(4)
         self.inference_batch_spin.setToolTip("More frames improve GPU throughput but use more GPU and shared memory")
-        inference_row.addWidget(self.inference_batch_spin)
-        inference_row.addWidget(QLabel("Precision"))
+        inference_batch_row.addWidget(self.inference_batch_spin)
+        self.denoise_stage_drawer.content_layout.addLayout(inference_batch_row)
+
+        inference_precision_row = QHBoxLayout()
+        inference_precision_row.addWidget(QLabel("Precision"))
         self.inference_precision_combo = QComboBox()
         self.inference_precision_combo.addItem("FP16", "fp16")
         self.inference_precision_combo.addItem("FP32", "fp32")
         self.inference_precision_combo.setToolTip("FP16 is faster; FP32 is useful for numerical comparisons")
-        inference_row.addWidget(self.inference_precision_combo)
-        self.denoise_stage_drawer.content_layout.addLayout(inference_row)
+        inference_precision_row.addWidget(self.inference_precision_combo)
+        self.denoise_stage_drawer.content_layout.addLayout(inference_precision_row)
 
         gain_auto_row = QHBoxLayout()
         self.gain_auto_target_check = QCheckBox("Use per-video auto target median")
@@ -2823,23 +2829,25 @@ class ContrastWindow(QMainWindow):
         gain_target_row.addWidget(self.gain_target_spin)
         self.gain_stage_drawer.content_layout.addLayout(gain_target_row)
 
-        gain_bounds_row = QHBoxLayout()
-        gain_bounds_row.addWidget(QLabel("Gain clamp"))
+        gain_min_row = QHBoxLayout()
+        gain_min_row.addWidget(QLabel("Minimum gain clamp"))
         self.gain_min_spin = QDoubleSpinBox()
         self.gain_min_spin.setRange(0.10, 2.00)
         self.gain_min_spin.setSingleStep(0.05)
         self.gain_min_spin.setDecimals(2)
         self.gain_min_spin.setValue(0.70)
-        self.gain_min_spin.setPrefix("min ")
+        gain_min_row.addWidget(self.gain_min_spin)
+        self.gain_stage_drawer.content_layout.addLayout(gain_min_row)
+
+        gain_max_row = QHBoxLayout()
+        gain_max_row.addWidget(QLabel("Maximum gain clamp"))
         self.gain_max_spin = QDoubleSpinBox()
         self.gain_max_spin.setRange(0.10, 2.00)
         self.gain_max_spin.setSingleStep(0.05)
         self.gain_max_spin.setDecimals(2)
         self.gain_max_spin.setValue(1.45)
-        self.gain_max_spin.setPrefix("max ")
-        gain_bounds_row.addWidget(self.gain_min_spin)
-        gain_bounds_row.addWidget(self.gain_max_spin)
-        self.gain_stage_drawer.content_layout.addLayout(gain_bounds_row)
+        gain_max_row.addWidget(self.gain_max_spin)
+        self.gain_stage_drawer.content_layout.addLayout(gain_max_row)
 
         brightness_hint = QLabel(
             "Corrects frame-wide gain and brightness jitter from robust, temporally stable image probes."
@@ -2919,22 +2927,25 @@ class ContrastWindow(QMainWindow):
         denoise_d_row.addWidget(self.bilateral_diameter_spin)
         self.denoise_stage_drawer.content_layout.addLayout(denoise_d_row)
 
-        denoise_sigma_row = QHBoxLayout()
-        denoise_sigma_row.addWidget(QLabel("Classical sigma color"))
+        denoise_sigma_color_row = QHBoxLayout()
+        denoise_sigma_color_row.addWidget(QLabel("Classical sigma color"))
         self.bilateral_sigma_color_spin = QDoubleSpinBox()
         self.bilateral_sigma_color_spin.setRange(1.0, 120.0)
         self.bilateral_sigma_color_spin.setSingleStep(1.0)
         self.bilateral_sigma_color_spin.setDecimals(1)
         self.bilateral_sigma_color_spin.setValue(18.0)
-        denoise_sigma_row.addWidget(self.bilateral_sigma_color_spin)
-        denoise_sigma_row.addWidget(QLabel("sigma space"))
+        denoise_sigma_color_row.addWidget(self.bilateral_sigma_color_spin)
+        self.denoise_stage_drawer.content_layout.addLayout(denoise_sigma_color_row)
+
+        denoise_sigma_space_row = QHBoxLayout()
+        denoise_sigma_space_row.addWidget(QLabel("Classical sigma space"))
         self.bilateral_sigma_space_spin = QDoubleSpinBox()
         self.bilateral_sigma_space_spin.setRange(1.0, 80.0)
         self.bilateral_sigma_space_spin.setSingleStep(1.0)
         self.bilateral_sigma_space_spin.setDecimals(1)
         self.bilateral_sigma_space_spin.setValue(4.0)
-        denoise_sigma_row.addWidget(self.bilateral_sigma_space_spin)
-        self.denoise_stage_drawer.content_layout.addLayout(denoise_sigma_row)
+        denoise_sigma_space_row.addWidget(self.bilateral_sigma_space_spin)
+        self.denoise_stage_drawer.content_layout.addLayout(denoise_sigma_space_row)
 
         temporal_row = QHBoxLayout()
         temporal_row.addWidget(QLabel("Motion sensitivity sigma"))
@@ -3081,6 +3092,9 @@ class ContrastWindow(QMainWindow):
         segmentation_area_row.addWidget(self.segmentation_area_spin)
         self.segmentation_stage_drawer.content_layout.addLayout(segmentation_area_row)
 
+        for drawer in self.frame_pipeline_stage_drawers:
+            self._add_sliders_to_parameter_layout(drawer.content_layout)
+
         self.gain_auto_target_check.toggled.connect(self._on_gain_auto_target_toggled)
         self.roi_soften_check.toggled.connect(self._on_roi_soften_toggled)
         self.segmentation_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
@@ -3111,13 +3125,60 @@ class ContrastWindow(QMainWindow):
         ]:
             spin.valueChanged.connect(self.on_enhancement_settings_changed)
 
+    def _add_sliders_to_parameter_layout(self, layout: QHBoxLayout | QVBoxLayout) -> None:
+        parameter_spins: list[tuple[QHBoxLayout | QVBoxLayout, QSpinBox | QDoubleSpinBox]] = []
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            child_layout = item.layout()
+            if isinstance(child_layout, (QHBoxLayout, QVBoxLayout)):
+                self._add_sliders_to_parameter_layout(child_layout)
+            widget = item.widget()
+            if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                parameter_spins.append((layout, widget))
+
+        for parameter_layout, spin in parameter_spins:
+            self._add_parameter_slider(parameter_layout, spin)
+
+    def _add_parameter_slider(
+        self,
+        layout: QHBoxLayout | QVBoxLayout,
+        spin: QSpinBox | QDoubleSpinBox,
+    ) -> None:
+        scale = 10**spin.decimals() if isinstance(spin, QDoubleSpinBox) else 1
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(round(spin.minimum() * scale), round(spin.maximum() * scale))
+        slider.setSingleStep(max(1, round(spin.singleStep() * scale)))
+        slider.setPageStep(max(slider.singleStep(), (slider.maximum() - slider.minimum()) // 10))
+        slider.setValue(round(spin.value() * scale))
+        slider.setMinimumWidth(80)
+        slider.setEnabled(spin.isEnabled())
+        slider.setToolTip("Adjust value")
+
+        spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spin.setMinimumWidth(86)
+        spin.setToolTip(f"{spin.toolTip()} Enter an exact value.".strip())
+
+        slider.valueChanged.connect(lambda value: spin.setValue(value / scale))
+        spin.valueChanged.connect(lambda value: slider.setValue(round(value * scale)))
+        layout.insertWidget(layout.indexOf(spin), slider, 1)
+        self._parameter_slider_pairs.append((spin, slider))
+
+    def _sync_parameter_slider_enabled(self, spin: QSpinBox | QDoubleSpinBox) -> None:
+        for parameter_spin, slider in self._parameter_slider_pairs:
+            if parameter_spin is spin:
+                slider.setEnabled(spin.isEnabled())
+                return
+
     def _on_gain_auto_target_toggled(self, checked: bool) -> None:
         self.gain_target_spin.setEnabled(not checked)
+        self._sync_parameter_slider_enabled(self.gain_target_spin)
         self.on_enhancement_settings_changed()
 
     def _on_roi_soften_toggled(self, checked: bool) -> None:
         self.roi_radius_spin.setEnabled(checked)
         self.roi_threshold_spin.setEnabled(checked)
+        self._sync_parameter_slider_enabled(self.roi_radius_spin)
+        self._sync_parameter_slider_enabled(self.roi_threshold_spin)
         self.on_enhancement_settings_changed()
 
     def _apply_style(self) -> None:
@@ -3375,6 +3436,8 @@ class ContrastWindow(QMainWindow):
         self.denoise_strength_label.setEnabled(uses_ffdnet)
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
         self.inference_batch_spin.setEnabled(use_deep_model)
+        self._sync_parameter_slider_enabled(self.denoise_strength_spin)
+        self._sync_parameter_slider_enabled(self.inference_batch_spin)
         self.inference_precision_combo.setEnabled(use_deep_model)
         if self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
