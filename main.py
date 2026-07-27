@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QAction, QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -2241,7 +2241,10 @@ class EnhancementProgressPanel(QFrame):
 
 class StageDrawer(QFrame):
     enabledChanged = Signal(int)
-    moveRequested = Signal(int)
+    reorderRequested = Signal(str, str)
+    dragStarted = Signal(object, QPoint)
+    dragMoved = Signal(QPoint)
+    dragFinished = Signal(QPoint)
 
     def __init__(self, stage_key: str, title: str, stage_index: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2250,6 +2253,9 @@ class StageDrawer(QFrame):
         self.stage_title = title
 
         self.enable_check = QCheckBox()
+        self.grab_handle = QLabel("||")
+        self.grab_handle.setObjectName("stageGrabHandle")
+        self.grab_handle.setToolTip("Drag to reorder stage")
         self.expand_button = QToolButton()
         self.expand_button.setText("Options")
         self.expand_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -2257,21 +2263,16 @@ class StageDrawer(QFrame):
         self.expand_button.setCheckable(True)
         self.expand_button.setChecked(False)
         self.set_stage_index(stage_index)
-
-        self.move_up_button = QToolButton()
-        self.move_up_button.setArrowType(Qt.ArrowType.UpArrow)
-        self.move_up_button.setToolTip("Move stage up")
-        self.move_down_button = QToolButton()
-        self.move_down_button.setArrowType(Qt.ArrowType.DownArrow)
-        self.move_down_button.setToolTip("Move stage down")
+        self._drag_start_pos = QPoint()
+        self._drag_from_handle = False
+        self._is_dragging = False
+        self._drag_enabled = True
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
-        header.addWidget(self.enable_check)
-        header.addStretch()
-        header.addWidget(self.move_up_button)
-        header.addWidget(self.move_down_button)
+        header.addWidget(self.grab_handle)
+        header.addWidget(self.enable_check, 1)
         header.addWidget(self.expand_button)
 
         self.content = QWidget()
@@ -2294,8 +2295,47 @@ class StageDrawer(QFrame):
 
         self.enable_check.stateChanged.connect(self.enabledChanged.emit)
         self.expand_button.toggled.connect(self._set_expanded)
-        self.move_up_button.clicked.connect(lambda: self.moveRequested.emit(-1))
-        self.move_down_button.clicked.connect(lambda: self.moveRequested.emit(1))
+
+    def _is_on_grab_handle(self, point: QPoint) -> bool:
+        widget = self.childAt(point)
+        while widget is not None:
+            if widget is self.grab_handle:
+                return True
+            widget = widget.parentWidget()
+        return False
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._is_on_grab_handle(event.position().toPoint()):
+            self._drag_start_pos = event.position().toPoint()
+            self._drag_from_handle = True
+            event.accept()
+            return
+        self._drag_from_handle = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._drag_enabled
+            and self._drag_from_handle
+            and (event.buttons() & Qt.MouseButton.LeftButton)
+            and (event.position().toPoint() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance()
+        ):
+            if not self._is_dragging:
+                self._is_dragging = True
+                self.grab_handle.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.dragStarted.emit(self, event.globalPosition().toPoint())
+            self.dragMoved.emit(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._is_dragging:
+            self.dragFinished.emit(event.globalPosition().toPoint())
+            self._is_dragging = False
+        self._drag_from_handle = False
+        self.grab_handle.setCursor(Qt.CursorShape.OpenHandCursor if self._drag_enabled else Qt.CursorShape.ArrowCursor)
+        super().mouseReleaseEvent(event)
 
     def _set_expanded(self, expanded: bool) -> None:
         self.expand_button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
@@ -2304,9 +2344,11 @@ class StageDrawer(QFrame):
     def set_stage_index(self, stage_index: int) -> None:
         self.enable_check.setText(f"{stage_index}. {self.stage_title}")
 
-    def set_move_enabled(self, can_move_up: bool, can_move_down: bool) -> None:
-        self.move_up_button.setEnabled(can_move_up)
-        self.move_down_button.setEnabled(can_move_down)
+    def set_reorder_enabled(self, drag_enabled: bool) -> None:
+        self._drag_enabled = drag_enabled
+        self.grab_handle.setEnabled(drag_enabled)
+        self.grab_handle.setCursor(Qt.CursorShape.OpenHandCursor if drag_enabled else Qt.CursorShape.ArrowCursor)
+        self.grab_handle.setToolTip("Drag to reorder stage" if drag_enabled else "This stage is fixed")
 
     def set_status(self, message: str | None, is_error: bool = False) -> None:
         if not message:
@@ -2580,12 +2622,20 @@ class ContrastWindow(QMainWindow):
             self.segmentation_stage_drawer,
         ]
         self.pipeline_stage_drawers = [*self.frame_pipeline_stage_drawers, self.analysis_stage_drawer]
+        self._dragged_stage_drawer: StageDrawer | None = None
+        self._stage_drag_placeholder: QWidget | None = None
+        self._dragged_pipeline_order: list[StageDrawer] | None = None
+        self._stage_drag_offset_y = 0
+        self._stage_drag_x = 0
         for check in self.pipeline_stage_checks:
             check.setChecked(False)
             check.stateChanged.connect(self.on_pipeline_stages_changed)
         self._build_stage_drawer_controls()
         for drawer in self.pipeline_stage_drawers:
-            drawer.moveRequested.connect(lambda direction, current=drawer: self._move_pipeline_stage(current, direction))
+            drawer.reorderRequested.connect(self._reorder_pipeline_stage_by_key)
+            drawer.dragStarted.connect(self._begin_pipeline_stage_drag)
+            drawer.dragMoved.connect(self._move_pipeline_stage_drag)
+            drawer.dragFinished.connect(self._finish_pipeline_stage_drag)
         for drawer in self.pipeline_stage_drawers:
             controls_layout.addWidget(drawer)
 
@@ -3031,6 +3081,8 @@ class ContrastWindow(QMainWindow):
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
             QFrame#videoPanel, QFrame#plotPanel { background: #111827; border: 1px solid #253044; border-radius: 8px; }
             QFrame#stageDrawer { background: #0f172a; border: 1px solid #273449; border-radius: 8px; }
+            QLabel#stageGrabHandle { color: #9fb0c6; font-weight: 700; min-width: 16px; }
+            QLabel#stageGrabHandle:disabled { color: #475569; }
             QLabel#panelTitle { font-size: 16px; font-weight: 700; color: #f8fafc; }
             QLabel#pipelineLabel { color: #e2e8f0; font-weight: 700; padding-top: 4px; }
             QLabel#subtleLabel, QLabel#hintLabel { color: #9fb0c6; }
@@ -3295,24 +3347,100 @@ class ContrastWindow(QMainWindow):
             return f"{mode.removesuffix('-ngc')}-ngc-26.06-{precision}-batch{self.inference_batch_spin.value()}"
         return f"ffdnet-native-{precision}"
 
-    def _move_pipeline_stage(self, drawer: StageDrawer, direction: int) -> None:
-        current_index = self.pipeline_stage_drawers.index(drawer)
-        target_index = current_index + direction
-        last_movable_index = len(self.pipeline_stage_drawers) - 2
-        if (
-            drawer is self.brightness_stage_drawer
-            or drawer is self.analysis_stage_drawer
-            or target_index <= 0
-            or target_index > last_movable_index
-        ):
+    def _reorder_pipeline_stage_by_key(self, source_key: str, target_key: str) -> None:
+        if source_key == target_key:
             return
-        self.pipeline_stage_drawers[current_index], self.pipeline_stage_drawers[target_index] = (
-            self.pipeline_stage_drawers[target_index],
-            self.pipeline_stage_drawers[current_index],
-        )
+        source_index = next((i for i, drawer in enumerate(self.pipeline_stage_drawers) if drawer.stage_key == source_key), -1)
+        target_index = next((i for i, drawer in enumerate(self.pipeline_stage_drawers) if drawer.stage_key == target_key), -1)
+        if source_index < 0 or target_index < 0:
+            return
+
+        source_drawer = self.pipeline_stage_drawers[source_index]
+        target_drawer = self.pipeline_stage_drawers[target_index]
+        if source_drawer in (self.brightness_stage_drawer, self.analysis_stage_drawer):
+            return
+        if target_drawer in (self.brightness_stage_drawer, self.analysis_stage_drawer):
+            return
+
+        moving_drawer = self.pipeline_stage_drawers.pop(source_index)
+        if source_index < target_index:
+            target_index -= 1
+        self.pipeline_stage_drawers.insert(target_index, moving_drawer)
         self.frame_pipeline_stage_drawers = self.pipeline_stage_drawers[:-1]
         self.frame_pipeline_stage_checks = [item.enable_check for item in self.frame_pipeline_stage_drawers]
         self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
+        self._refresh_pipeline_stage_ui()
+        self.on_enhancement_settings_changed()
+
+    def _begin_pipeline_stage_drag(self, drawer: StageDrawer, global_position: QPoint) -> None:
+        if drawer in (self.brightness_stage_drawer, self.analysis_stage_drawer):
+            return
+        self._dragged_stage_drawer = drawer
+        self._dragged_pipeline_order = list(self.pipeline_stage_drawers)
+        self._stage_drag_placeholder = QWidget(self.enhancement_layout.parentWidget())
+        self._stage_drag_placeholder.setFixedHeight(drawer.height())
+        self._stage_drag_placeholder.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        drawer_geometry = drawer.geometry()
+        self._stage_drag_x = drawer_geometry.x()
+        self._stage_drag_offset_y = self.enhancement_layout.parentWidget().mapFromGlobal(global_position).y() - drawer_geometry.y()
+        self.enhancement_layout.replaceWidget(drawer, self._stage_drag_placeholder)
+        drawer.setGeometry(drawer_geometry)
+        drawer.raise_()
+        self._move_pipeline_stage_drag(global_position)
+
+    def _move_pipeline_stage_drag(self, global_position: QPoint) -> None:
+        drawer = self._dragged_stage_drawer
+        placeholder = self._stage_drag_placeholder
+        order = self._dragged_pipeline_order
+        if drawer is None or placeholder is None or order is None:
+            return
+
+        parent = self.enhancement_layout.parentWidget()
+        cursor_y = parent.mapFromGlobal(global_position).y()
+        movable_drawers = [
+            stage_drawer
+            for stage_drawer in order
+            if stage_drawer not in (drawer, self.brightness_stage_drawer, self.analysis_stage_drawer)
+        ]
+        if not movable_drawers:
+            return
+
+        top = self.brightness_stage_drawer.geometry().bottom() + self.enhancement_layout.spacing()
+        bottom = self.analysis_stage_drawer.geometry().top() - self.enhancement_layout.spacing() - drawer.height()
+        drawer.move(self._stage_drag_x, max(top, min(cursor_y - self._stage_drag_offset_y, bottom)))
+
+        target = min(movable_drawers, key=lambda item: abs(item.geometry().center().y() - cursor_y))
+        source_index = order.index(drawer)
+        target_index = order.index(target)
+        insertion_index = target_index + int(cursor_y > target.geometry().center().y())
+        order.pop(source_index)
+        if source_index < insertion_index:
+            insertion_index -= 1
+        order.insert(insertion_index, drawer)
+
+        next_drawer = next((item for item in order[insertion_index + 1 :] if item is not drawer), self.analysis_stage_drawer)
+        self.enhancement_layout.removeWidget(placeholder)
+        self.enhancement_layout.insertWidget(self.enhancement_layout.indexOf(next_drawer), placeholder)
+
+    def _finish_pipeline_stage_drag(self, global_position: QPoint) -> None:
+        self._move_pipeline_stage_drag(global_position)
+        drawer = self._dragged_stage_drawer
+        placeholder = self._stage_drag_placeholder
+        order = self._dragged_pipeline_order
+        if drawer is None or placeholder is None or order is None:
+            return
+
+        placeholder_index = self.enhancement_layout.indexOf(placeholder)
+        self.enhancement_layout.removeWidget(placeholder)
+        placeholder.deleteLater()
+        self.enhancement_layout.insertWidget(placeholder_index, drawer)
+        self.pipeline_stage_drawers = order
+        self.frame_pipeline_stage_drawers = self.pipeline_stage_drawers[:-1]
+        self.frame_pipeline_stage_checks = [item.enable_check for item in self.frame_pipeline_stage_drawers]
+        self.pipeline_stage_checks = [*self.frame_pipeline_stage_checks, self.analysis_stage_check]
+        self._dragged_stage_drawer = None
+        self._stage_drag_placeholder = None
+        self._dragged_pipeline_order = None
         self._refresh_pipeline_stage_ui()
         self.on_enhancement_settings_changed()
 
@@ -3326,10 +3454,8 @@ class ContrastWindow(QMainWindow):
             drawer.set_stage_index(offset + 1)
             is_fixed_first_stage = drawer is self.brightness_stage_drawer
             is_fixed_last_stage = drawer is self.analysis_stage_drawer
-            drawer.set_move_enabled(
-                not is_fixed_first_stage and not is_fixed_last_stage and offset > 1,
-                not is_fixed_first_stage and not is_fixed_last_stage and offset < len(self.pipeline_stage_drawers) - 2,
-            )
+            is_movable = not is_fixed_first_stage and not is_fixed_last_stage
+            drawer.set_reorder_enabled(is_movable)
             self.enhancement_layout.insertWidget(insert_index + offset, drawer)
 
     def enhancement_parameters(self) -> EnhancementParameters:
