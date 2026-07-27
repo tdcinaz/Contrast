@@ -2669,14 +2669,6 @@ class ContrastWindow(QMainWindow):
         controls_layout.setSpacing(10)
         self._pipeline_controls_base_right_margin = controls_layout.contentsMargins().right()
 
-        hint = QLabel(
-            "ROI residence analysis depends on the aneurysm ROI extraction stage. "
-            "Enable that stage to extract a mask from the current enhanced video, then drag only when a detected ROI needs correction."
-        )
-        hint.setWordWrap(True)
-        hint.setObjectName("hintLabel")
-        controls_layout.addWidget(hint)
-
         pipeline_label = QLabel("Live processing pipeline (applied in this order, top to bottom)")
         pipeline_label.setObjectName("pipelineLabel")
         controls_layout.addWidget(pipeline_label)
@@ -2790,9 +2782,6 @@ class ContrastWindow(QMainWindow):
         for drawer in self.pipeline_stage_drawers:
             controls_layout.addWidget(drawer)
 
-        self.reset_pipeline_button = QPushButton("Show original videos")
-        self.reset_pipeline_button.clicked.connect(self.reset_enhancement_pipeline)
-        controls_layout.addWidget(self.reset_pipeline_button)
         self._refresh_pipeline_stage_ui()
         controls_layout.addStretch()
         self.enhancement_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
@@ -3737,9 +3726,10 @@ class ContrastWindow(QMainWindow):
     def _refresh_pipeline_stage_ui(self) -> None:
         for drawer in self.pipeline_stage_drawers:
             self.enhancement_layout.removeWidget(drawer)
-        insert_index = self.enhancement_layout.indexOf(self.reset_pipeline_button)
-        if insert_index < 0:
-            insert_index = self.enhancement_layout.count()
+        insert_index = self.enhancement_layout.count()
+        stretch_index = self.enhancement_layout.count() - 1
+        if stretch_index >= 0 and self.enhancement_layout.itemAt(stretch_index).spacerItem() is not None:
+            insert_index = stretch_index
         for offset, drawer in enumerate(self.pipeline_stage_drawers):
             drawer.set_stage_index(offset + 1)
             drawer.set_reorder_enabled(not self._is_fixed_pipeline_stage(drawer))
