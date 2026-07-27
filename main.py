@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import sys
 from collections import deque
@@ -51,6 +52,9 @@ from PySide6.QtWidgets import (
 from frame_scheduler import AdaptiveFrameExecutor
 
 ROOT = Path(__file__).resolve().parent
+CONFIG_DIRECTORY = ROOT / "configs"
+RECENT_CONFIG_FILE = CONFIG_DIRECTORY / "recent.json"
+CONFIG_VERSION = 1
 STREAM_END = object()
 DEFAULT_VIDEOS = {
     "Pre-deployment": ROOT / "PPI150_PreDeployment_Contrast.mov",
@@ -2544,6 +2548,7 @@ class ContrastWindow(QMainWindow):
         self._enhancement_progress_totals = [1.0, 1.0]
         self._enhancement_stage_messages = ["Waiting", "Waiting"]
         self._enhancement_message = "Preparing enhanced videos..."
+        self._loading_config = False
         self.enhancement_poll_timer = QTimer(self)
         self.enhancement_poll_timer.setInterval(30)
         self.enhancement_poll_timer.timeout.connect(self._poll_enhancement)
@@ -2570,12 +2575,17 @@ class ContrastWindow(QMainWindow):
         self.update_time_label()
         self._update_stage_statuses()
         self.on_roi_changed()
+        QTimer.singleShot(0, self.prompt_load_most_recent_config)
 
     def _build_actions(self) -> None:
         self.open_pre_action = QAction("Open pre-deployment video...", self)
         self.open_pre_action.triggered.connect(lambda: self.open_video(self.pre_panel))
         self.open_post_action = QAction("Open post-deployment video...", self)
         self.open_post_action.triggered.connect(lambda: self.open_video(self.post_panel))
+        self.save_config_action = QAction("Save configuration...", self)
+        self.save_config_action.triggered.connect(self.save_config)
+        self.load_config_action = QAction("Load configuration...", self)
+        self.load_config_action.triggered.connect(self.load_config)
         self.export_action = QAction("Export analysis CSV...", self)
         self.export_action.triggered.connect(self.export_csv)
         self.export_action.setEnabled(False)
@@ -2583,6 +2593,9 @@ class ContrastWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("File")
         file_menu.addAction(self.open_pre_action)
         file_menu.addAction(self.open_post_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.save_config_action)
+        file_menu.addAction(self.load_config_action)
         file_menu.addSeparator()
         file_menu.addAction(self.export_action)
 
@@ -2856,6 +2869,7 @@ class ContrastWindow(QMainWindow):
         self.threshold_spin.setSingleStep(0.05)
         self.threshold_spin.setValue(0.20)
         self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setObjectName("analysisThreshold")
         self.threshold_spin.valueChanged.connect(self.on_analysis_threshold_changed)
         threshold_row.addWidget(self.threshold_spin)
         self._add_parameter_slider(threshold_row, self.threshold_spin)
@@ -3046,7 +3060,8 @@ class ContrastWindow(QMainWindow):
             self.pipeline_stage_drawers.insert(insert_index, drawer)
         self._sync_pipeline_stage_lists()
         self._refresh_pipeline_stage_ui()
-        self.on_pipeline_stages_changed()
+        if not self._loading_config:
+            self.on_pipeline_stages_changed()
 
     def _duplicate_pipeline_stage(self, drawer: StageDrawer) -> None:
         duplicate = self._copy_stage_drawer(drawer)
@@ -4190,6 +4205,7 @@ class ContrastWindow(QMainWindow):
             panel.seek(self.current_frame_index)
         self.open_pre_action.setEnabled(False)
         self.open_post_action.setEnabled(False)
+        self.load_config_action.setEnabled(False)
         self.enhancement_progress.begin("Preparing enhanced videos...")
         self.statusBar().showMessage("Enhancement is running; playback follows the frames ready in both videos.")
         self._update_stage_statuses()
@@ -4405,6 +4421,7 @@ class ContrastWindow(QMainWindow):
 
         self.open_pre_action.setEnabled(True)
         self.open_post_action.setEnabled(True)
+        self.load_config_action.setEnabled(True)
         self.enhancement_progress.finish()
         self.enhancement_poll_timer.stop()
         if completed_request is None or completed_request.generation != self._enhancement_generation:
@@ -4437,6 +4454,7 @@ class ContrastWindow(QMainWindow):
         else:
             self.open_pre_action.setEnabled(True)
             self.open_post_action.setEnabled(True)
+            self.load_config_action.setEnabled(True)
             self.enhancement_poll_timer.stop()
         self.enhancement_progress.finish()
         self._set_playback_limit(self.source_max_frame)
@@ -4594,6 +4612,207 @@ class ContrastWindow(QMainWindow):
                         row.extend(["", "", "", "", ""])
                 writer.writerow(row)
         self.statusBar().showMessage(f"Exported analysis to {path}")
+
+    def _drawer_control_values(self, drawer: StageDrawer) -> dict[str, bool | int | float | str]:
+        values: dict[str, bool | int | float | str] = {}
+        for widget in drawer.findChildren(QWidget):
+            name = widget.objectName()
+            if not name:
+                continue
+            if isinstance(widget, QCheckBox):
+                values[name] = widget.isChecked()
+            elif isinstance(widget, QComboBox):
+                values[name] = str(widget.currentData())
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                values[name] = widget.value()
+        return values
+
+    def _config_data(self) -> dict[str, object]:
+        return {
+            "version": CONFIG_VERSION,
+            "videos": {
+                "pre_deployment": str(self.pre_panel.path),
+                "post_deployment": str(self.post_panel.path),
+            },
+            "pipeline": [
+                {
+                    "key": drawer.stage_key,
+                    "enabled": drawer.enable_button.isChecked(),
+                    "controls": self._drawer_control_values(drawer),
+                }
+                for drawer in self.pipeline_stage_drawers
+            ],
+            "view": {
+                "compare_enabled": self.compare_view_check.isChecked(),
+                "mask_overlay_enabled": self.overlay_mask_check.isChecked(),
+                "playback_speed": self.speed_slider.value(),
+                "frame_index": self.current_frame_index,
+            },
+            "analysis": {"clearance_threshold": self.threshold_spin.value()},
+        }
+
+    def _set_drawer_control_values(self, drawer: StageDrawer, values: dict[str, object]) -> None:
+        for name, value in values.items():
+            widget = drawer.findChild(QWidget, name)
+            if widget is None:
+                continue
+            widget.blockSignals(True)
+            try:
+                if isinstance(widget, QCheckBox) and isinstance(value, bool):
+                    widget.setChecked(value)
+                elif isinstance(widget, QComboBox) and isinstance(value, str):
+                    index = widget.findData(value)
+                    if index >= 0:
+                        widget.setCurrentIndex(index)
+                elif isinstance(widget, QSpinBox) and isinstance(value, int) and not isinstance(value, bool):
+                    widget.setValue(value)
+                elif isinstance(widget, QDoubleSpinBox) and isinstance(value, (int, float)) and not isinstance(value, bool):
+                    widget.setValue(float(value))
+            finally:
+                widget.blockSignals(False)
+
+    def _validate_config_data(self, config: object) -> tuple[dict[str, object], Path, Path]:
+        if not isinstance(config, dict) or config.get("version") != CONFIG_VERSION:
+            raise ValueError(f"Unsupported configuration version. Expected version {CONFIG_VERSION}.")
+        videos = config.get("videos")
+        pipeline = config.get("pipeline")
+        if not isinstance(videos, dict) or not isinstance(pipeline, list):
+            raise ValueError("Configuration must include videos and pipeline sections.")
+        pre_path = Path(str(videos.get("pre_deployment", ""))).expanduser()
+        post_path = Path(str(videos.get("post_deployment", ""))).expanduser()
+        missing = [str(path) for path in (pre_path, post_path) if not path.is_file()]
+        if missing:
+            raise ValueError("Configured video files are unavailable: " + ", ".join(missing))
+        for stage in pipeline:
+            if not isinstance(stage, dict) or stage.get("key") not in self.stage_drawer_templates:
+                raise ValueError("Configuration contains an unknown pipeline stage.")
+            if not isinstance(stage.get("enabled"), bool):
+                raise ValueError("Each pipeline stage must define an enabled state.")
+            controls = stage.get("controls", {})
+            if not isinstance(controls, dict):
+                raise ValueError("Pipeline stage controls must be an object.")
+        return config, pre_path, post_path
+
+    def _remember_recent_config(self, path: Path) -> None:
+        CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        RECENT_CONFIG_FILE.write_text(json.dumps({"path": str(path.resolve())}, indent=2) + "\n")
+
+    def _most_recent_config_path(self) -> Path | None:
+        try:
+            recent = json.loads(RECENT_CONFIG_FILE.read_text())
+            path = Path(str(recent["path"])).expanduser()
+            if path.is_file():
+                return path
+        except (FileNotFoundError, KeyError, TypeError, json.JSONDecodeError):
+            pass
+        if not CONFIG_DIRECTORY.is_dir():
+            return None
+        configs = [path for path in CONFIG_DIRECTORY.glob("*.json") if path != RECENT_CONFIG_FILE]
+        return max(configs, key=lambda path: path.stat().st_mtime, default=None)
+
+    def save_config(self) -> None:
+        CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save configuration",
+            str(CONFIG_DIRECTORY / "contrast_config.json"),
+            "Contrast configuration (*.json)",
+        )
+        if not path:
+            return
+        config_path = Path(path).with_suffix(".json")
+        try:
+            config_path.write_text(json.dumps(self._config_data(), indent=2, sort_keys=True) + "\n")
+            self._remember_recent_config(config_path)
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not save configuration", str(exc))
+            return
+        self.statusBar().showMessage(f"Saved configuration to {config_path}")
+
+    def load_config(self) -> None:
+        CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load configuration",
+            str(CONFIG_DIRECTORY),
+            "Contrast configuration (*.json)",
+        )
+        if path:
+            self._load_config_file(Path(path))
+
+    def _load_config_file(self, path: Path, show_error: bool = True) -> bool:
+        try:
+            config = json.loads(path.read_text())
+            config, pre_path, post_path = self._validate_config_data(config)
+            self._apply_config(config, pre_path, post_path)
+            self._remember_recent_config(path)
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            if show_error:
+                QMessageBox.critical(self, "Could not load configuration", str(exc))
+            return False
+        self.statusBar().showMessage(f"Loaded configuration from {path}")
+        return True
+
+    def _apply_config(self, config: dict[str, object], pre_path: Path, post_path: Path) -> None:
+        self.pause()
+        self._loading_config = True
+        try:
+            self.pre_panel.set_video(pre_path)
+            self.post_panel.set_video(post_path)
+            for drawer in self.pipeline_stage_drawers:
+                self.enhancement_layout.removeWidget(drawer)
+                drawer.hide()
+                drawer.setParent(None)
+            self.pipeline_stage_drawers = []
+            self._sync_pipeline_stage_lists()
+
+            pipeline = cast(list[dict[str, object]], config["pipeline"])
+            for stage in pipeline:
+                self._add_pipeline_stage(cast(str, stage["key"]))
+                drawer = self.pipeline_stage_drawers[-1]
+                self._set_drawer_control_values(drawer, cast(dict[str, object], stage.get("controls", {})))
+                drawer.enable_button.blockSignals(True)
+                drawer.enable_button.setChecked(cast(bool, stage["enabled"]))
+                drawer.enable_button.blockSignals(False)
+
+            view = config.get("view", {})
+            if isinstance(view, dict):
+                self.compare_view_check.setChecked(bool(view.get("compare_enabled", True)))
+                self.overlay_mask_check.setChecked(bool(view.get("mask_overlay_enabled", True)))
+                playback_speed = view.get("playback_speed", 100)
+                if isinstance(playback_speed, int):
+                    self.speed_slider.setValue(playback_speed)
+            analysis = config.get("analysis", {})
+            if isinstance(analysis, dict):
+                threshold = analysis.get("clearance_threshold")
+                if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+                    self.threshold_spin.setValue(float(threshold))
+
+            self._sync_pipeline_stage_lists()
+            self._refresh_pipeline_stage_ui()
+            self._sync_active_denoise_controls()
+            self._sync_trimmed_video_window()
+            frame_index = view.get("frame_index", 0) if isinstance(view, dict) else 0
+            self.set_frame_index(frame_index if isinstance(frame_index, int) else 0)
+        finally:
+            self._loading_config = False
+        self.results.clear()
+        self.clear_plots_and_metrics()
+        self.on_pipeline_stages_changed()
+
+    def prompt_load_most_recent_config(self) -> None:
+        path = self._most_recent_config_path()
+        if path is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Load recent configuration",
+            f"Load the most recent configuration?\n{path.name}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._load_config_file(path)
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self.enhancement_poll_timer.stop()

@@ -12,6 +12,9 @@ wheels/
 # Downloaded model weights
 models/
 
+# User configuration files
+configs/
+
 # Video
 *.mp4
 *.mov

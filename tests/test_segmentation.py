@@ -4,11 +4,15 @@ import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from queue import SimpleQueue
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cv2
 import numpy as np
+from PySide6.QtWidgets import QApplication, QDoubleSpinBox
 
+import main
 from main import (
     ContrastWindow,
     VideoPanel,
@@ -23,6 +27,42 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_config_round_trip_restores_duplicate_stage_settings(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window._add_pipeline_stage("local_contrast")
+        first_drawer = window.pipeline_stage_drawers[0]
+        first_drawer.findChild(QDoubleSpinBox, "claheClipLimit").setValue(2.5)
+        window._duplicate_pipeline_stage(first_drawer)
+        second_drawer = window.pipeline_stage_drawers[1]
+        second_drawer.findChild(QDoubleSpinBox, "claheClipLimit").setValue(4.0)
+        first_drawer.enable_button.blockSignals(True)
+        first_drawer.enable_button.setChecked(True)
+        first_drawer.enable_button.blockSignals(False)
+        window.compare_view_check.setChecked(False)
+        window.speed_slider.setValue(175)
+        window.threshold_spin.setValue(0.35)
+
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "pipeline.json"
+            config_path.write_text(main.json.dumps(window._config_data()))
+            with patch.object(main, "CONFIG_DIRECTORY", Path(directory)), patch.object(
+                main,
+                "RECENT_CONFIG_FILE",
+                Path(directory) / "recent.json",
+            ), patch.object(window, "on_pipeline_stages_changed"):
+                self.assertTrue(window._load_config_file(config_path, show_error=False))
+
+        self.assertEqual([drawer.stage_key for drawer in window.pipeline_stage_drawers], ["local_contrast", "local_contrast"])
+        self.assertTrue(window.pipeline_stage_drawers[0].enable_button.isChecked())
+        self.assertFalse(window.pipeline_stage_drawers[1].enable_button.isChecked())
+        self.assertEqual(window.pipeline_stage_drawers[0].findChild(QDoubleSpinBox, "claheClipLimit").value(), 2.5)
+        self.assertEqual(window.pipeline_stage_drawers[1].findChild(QDoubleSpinBox, "claheClipLimit").value(), 4.0)
+        self.assertFalse(window.compare_view_check.isChecked())
+        self.assertEqual(window.speed_slider.value(), 175)
+        self.assertEqual(window.threshold_spin.value(), 0.35)
+
     def test_aneurysm_detection_rejects_video_without_temporal_darkening(self) -> None:
         frames = [np.full((120, 160), 175, dtype=np.uint8) for _ in range(12)]
         for frame in frames:
