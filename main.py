@@ -2818,8 +2818,7 @@ class ContrastWindow(QMainWindow):
         self.enhancement_progress.configure_panels([panel.label for panel in self.panels])
         self.video_stack.setCurrentWidget(self.video_row)
         self.results.clear()
-        if not self._apply_source_pipeline_stages():
-            self._sync_trimmed_video_window()
+        self._sync_trimmed_video_window()
         self._set_playback_limit(self.source_max_frame)
         self.current_frame_index = -1
         self.set_frame_index(0)
@@ -2835,6 +2834,8 @@ class ContrastWindow(QMainWindow):
             self.pre_card.title.setText("Pre residence")
             self.post_card.title.setText("Post residence")
             self.delta_card.title.setText("Difference")
+        if not self._loading_config and self._pipeline_has_active_stage():
+            self.rebuild_enhancement_pipeline()
 
     def _select_mode_and_videos(self, mode: str) -> bool:
         if mode == MODE_SINGLE:
@@ -4173,8 +4174,7 @@ class ContrastWindow(QMainWindow):
             return
 
         self.results.clear()
-        if not self._apply_source_pipeline_stages():
-            self._sync_trimmed_video_window()
+        self._sync_trimmed_video_window()
         self.frame_slider.setRange(0, self.max_frame)
         self.frame_spin.setRange(0, self.max_frame)
         self.set_frame_index(0)

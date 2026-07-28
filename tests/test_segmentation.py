@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
-from PySide6.QtWidgets import QApplication, QDoubleSpinBox
+from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QFrame
 
 import main
 from main import (
@@ -125,6 +125,34 @@ class SegmentationTests(unittest.TestCase):
 
         self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
         self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization"])
+
+    def test_video_selection_queues_pipeline_without_sync_source_work(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+
+        class FakeVideoPanel(QFrame):
+            def __init__(self, label, color, path):  # noqa: ANN001
+                super().__init__()
+                self.label = label
+                self.roiChanged = SimpleNamespace(connect=lambda callback: None)
+                self.info = SimpleNamespace(fps=30.0)
+                self.playback_frame_count = 1
+                self.trim_frame_count = 1
+
+            def set_comparison(self, enabled, frame_index):  # noqa: ANN001
+                pass
+
+            def seek(self, frame_index):  # noqa: ANN001
+                pass
+
+        with patch.object(main, "VideoPanel", FakeVideoPanel), patch.object(
+            window, "_apply_source_pipeline_stages"
+        ) as apply_source, patch.object(window, "rebuild_enhancement_pipeline") as rebuild:
+            window._set_video_panels([Path("selected.mov")])
+
+        apply_source.assert_not_called()
+        rebuild.assert_called_once()
         self.assertTrue(all(drawer.enable_button.isChecked() for drawer in window.pipeline_stage_drawers))
 
         window._reorder_pipeline_stage_by_key("auto_crop", "brightness_stabilization")
