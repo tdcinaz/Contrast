@@ -1264,6 +1264,9 @@ class VideoDropPlaceholder(QFrame):
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setProperty("dragActive", False)
+        # Match VideoPanel sizing so replacing one slot does not reflow panel widths/heights.
+        self.setMinimumSize(0, 220)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.title_label = QLabel(label)
         self.title_label.setObjectName("panelTitle")
@@ -2998,7 +3001,9 @@ class ContrastWindow(QMainWindow):
         self.active_mode = MODE_SINGLE
         self.pending_mode: str | None = None
         self.pending_video_paths: list[Path | None] = []
-        self.video_placeholders: list[VideoDropPlaceholder] = []
+        self.video_placeholders: list[VideoDropPlaceholder | None] = []
+        self.pending_preview_panels: list[VideoPanel | None] = []
+        self.pending_slot_labels: list[str] = []
 
         self.source_max_frame = 0
         self.max_frame = 0
@@ -3126,8 +3131,20 @@ class ContrastWindow(QMainWindow):
         if not self._loading_config and self._pipeline_has_active_stage():
             if live_input:
                 self._render_live_frame()
+            elif self.active_mode == MODE_COMPARISON and len(self.panels) == 2:
+                QTimer.singleShot(0, self._rebuild_enhancement_pipeline_if_comparison_ready)
             else:
                 self.rebuild_enhancement_pipeline()
+
+    def _rebuild_enhancement_pipeline_if_comparison_ready(self) -> None:
+        if self.active_mode != MODE_COMPARISON or len(self.panels) != 2:
+            return
+        if self.video_stack.currentWidget() is not self.video_row:
+            return
+        if any(panel.current_frame is None for panel in self.panels):
+            QTimer.singleShot(0, self._rebuild_enhancement_pipeline_if_comparison_ready)
+            return
+        self.rebuild_enhancement_pipeline()
 
     def _select_mode_and_videos(self, mode: str) -> bool:
         self._show_video_placeholders(mode)
@@ -3142,10 +3159,54 @@ class ContrastWindow(QMainWindow):
 
     def _clear_video_placeholders(self) -> None:
         for placeholder in self.video_placeholders:
+            if placeholder is None:
+                continue
             placeholder.close()
             self.video_placeholder_layout.removeWidget(placeholder)
             placeholder.setParent(None)
+        for panel in self.pending_preview_panels:
+            if panel is None:
+                continue
+            panel.close()
+            self.video_placeholder_layout.removeWidget(panel)
+            panel.setParent(None)
         self.video_placeholders = []
+        self.pending_preview_panels = []
+        self.pending_slot_labels = []
+
+    def _show_pending_preview_panel(self, index: int, path: Path) -> None:
+        if self.pending_mode is None or index < 0 or index >= len(self.pending_video_paths):
+            return
+
+        label = (
+            self.pending_slot_labels[index]
+            if index < len(self.pending_slot_labels)
+            else self._placeholder_labels(self.pending_mode)[index]
+        )
+        color = PANEL_COLORS[min(index, len(PANEL_COLORS) - 1)]
+        preview_panel = self.pending_preview_panels[index]
+        if preview_panel is None:
+            preview_panel = VideoPanel(
+                label,
+                color,
+                path,
+                live_input=self.pending_mode == MODE_LIVE,
+            )
+            preview_panel.set_comparison(False, 0)
+            self.pending_preview_panels[index] = preview_panel
+            placeholder = self.video_placeholders[index]
+            if placeholder is not None:
+                self.video_placeholder_layout.replaceWidget(placeholder, preview_panel)
+                placeholder.close()
+                placeholder.setParent(None)
+                self.video_placeholders[index] = None
+            else:
+                self.video_placeholder_layout.addWidget(preview_panel)
+            self.video_placeholder_layout.setStretch(index, 1)
+            return
+
+        preview_panel.set_video(path)
+        preview_panel.set_comparison(False, 0)
 
     def _show_video_placeholders(self, mode: str) -> None:
         self.pause()
@@ -3155,6 +3216,8 @@ class ContrastWindow(QMainWindow):
         labels = self._placeholder_labels(mode)
         self.pending_mode = mode
         self.pending_video_paths = [None] * len(labels)
+        self.pending_slot_labels = list(labels)
+        self.pending_preview_panels = [None] * len(labels)
         self.enhancement_progress.configure_panels(labels)
         self.active_mode = mode
 
@@ -3164,6 +3227,7 @@ class ContrastWindow(QMainWindow):
             placeholder.fileDialogRequested.connect(lambda index=index: self._request_placeholder_video(index))
             placeholder.fileDropped.connect(lambda path, index=index: self._set_placeholder_video_path(index, cast(Path, path)))
             self.video_placeholder_layout.addWidget(placeholder)
+            self.video_placeholder_layout.setStretch(index, 1)
             self.video_placeholders.append(placeholder)
 
         self._set_video_controls_enabled(False)
@@ -3178,7 +3242,10 @@ class ContrastWindow(QMainWindow):
     def _request_placeholder_video(self, index: int) -> None:
         if self.pending_mode is None or index < 0 or index >= len(self.pending_video_paths):
             return
-        label = self.video_placeholders[index].label.lower()
+        if index < len(self.pending_slot_labels):
+            label = self.pending_slot_labels[index].lower()
+        else:
+            label = self._placeholder_labels(self.pending_mode)[index].lower()
         title = "Select video to loop as a live camera" if self.pending_mode == MODE_LIVE else f"Open {label} video"
         path = self._open_video_file(title)
         if path is None:
@@ -3189,8 +3256,7 @@ class ContrastWindow(QMainWindow):
         if self.pending_mode is None or index < 0 or index >= len(self.pending_video_paths):
             return
         self.pending_video_paths[index] = path
-        if index < len(self.video_placeholders):
-            self.video_placeholders[index].set_selected_path(path)
+        self._show_pending_preview_panel(index, path)
 
         remaining = sum(1 for selected in self.pending_video_paths if selected is None)
         if remaining > 0:
