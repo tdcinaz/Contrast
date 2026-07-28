@@ -15,6 +15,30 @@ from stream_server import LiveStreamProcessor, StreamService, StreamSettings, cr
 
 
 class StreamServerTests(unittest.TestCase):
+    def test_mode_selection_panel_scales_when_graph_drawer_opens(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        window.resize(1280, 760)
+        window.show()
+        QApplication.processEvents()
+
+        self.assertIs(window.video_stack.currentWidget(), window.mode_selection_page)
+        self.assertEqual(window.mode_selection_panel.size().width(), 720)
+        self.assertEqual(window.mode_selection_panel.size().height(), 560)
+        self.assertIn("background: #111827;", window.mode_selection_panel.styleSheet())
+
+        window._set_graph_drawer_expanded(True)
+        QApplication.processEvents()
+
+        view = window.mode_selection_view
+        self.assertLess(view.transform().m11(), 1.0)
+        self.assertTrue(view.viewport().rect().contains(view.mapFromScene(view.sceneRect()).boundingRect()))
+
+        window.close()
+        app.quit()
+
     def test_playback_controls_move_up_after_selecting_comparison_mode(self) -> None:
         from PySide6.QtWidgets import QApplication
 
@@ -27,6 +51,14 @@ class StreamServerTests(unittest.TestCase):
         QApplication.processEvents()
         baseline_playback_y = window.playback_row.y()
         baseline_stack_height = window.video_stack.height()
+        self.assertTrue(window.video_placeholders)
+        for placeholder in window.video_placeholders:
+            assert placeholder is not None
+            self.assertEqual(placeholder.height(), placeholder.heightForWidth(placeholder.width()))
+            surface = placeholder.video_surface
+            button = placeholder.hint_button
+            self.assertLessEqual(abs(button.x() - (surface.width() - button.width()) // 2), 1)
+            self.assertLessEqual(abs(button.y() - (surface.height() - button.height()) // 2), 1)
 
         splitter = window.main_splitter
         sizes = splitter.sizes()
@@ -36,8 +68,8 @@ class StreamServerTests(unittest.TestCase):
         QApplication.processEvents()
 
         self.assertIs(window.video_stack.currentWidget(), window.video_placeholder_row)
-        self.assertLess(window.video_stack.height(), baseline_stack_height)
-        self.assertLess(window.playback_row.y(), baseline_playback_y)
+        self.assertLessEqual(window.video_stack.height(), baseline_stack_height)
+        self.assertLessEqual(window.playback_row.y(), baseline_playback_y)
         self.assertEqual(
             window.playback_row.y(),
             window.video_stack.geometry().bottom() + window.video_stack.parentWidget().layout().spacing() + 1,

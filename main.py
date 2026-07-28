@@ -18,7 +18,7 @@ from typing import Callable, Generator, Protocol, cast
 import cv2
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGraphicsScene,
+    QGraphicsView,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -1346,23 +1348,57 @@ class CurrentPageStack(QStackedWidget):
 
     def hasHeightForWidth(self) -> bool:
         page = self.currentWidget()
-        return page is not None and page.hasHeightForWidth()
+        return page is not None and (page.hasHeightForWidth() or bool(self._current_page_cards()))
 
     def heightForWidth(self, width: int) -> int:
         page = self.currentWidget()
         if page is None:
             return super().heightForWidth(width)
+        card_height = self._card_height_for_width(width)
+        if card_height is not None:
+            return card_height
         return page.heightForWidth(width) if page.hasHeightForWidth() else page.sizeHint().height()
 
     def sizeHint(self) -> QSize:
         page = self.currentWidget()
-        return page.sizeHint() if page is not None else super().sizeHint()
+        if page is None:
+            return super().sizeHint()
+        card_height = self._card_height_for_width(self.width()) if self.width() > 0 else None
+        if card_height is None:
+            return page.sizeHint()
+        return QSize(page.sizeHint().width(), card_height)
 
     def _update_current_page_geometry(self) -> None:
         self.updateGeometry()
         if self.parentWidget() is not None and self.parentWidget().layout() is not None:
             self.parentWidget().layout().invalidate()
         self.request_height_refresh()
+
+    def _current_page_cards(self) -> list[QWidget]:
+        page = self.currentWidget()
+        layout = page.layout() if page is not None else None
+        if layout is None:
+            return []
+        return [
+            widget
+            for index in range(layout.count())
+            if (widget := layout.itemAt(index).widget()) is not None and widget.hasHeightForWidth()
+        ]
+
+    def _card_height_for_width(self, width: int) -> int | None:
+        page = self.currentWidget()
+        layout = page.layout() if page is not None else None
+        cards = self._current_page_cards()
+        if layout is None or not cards:
+            return None
+
+        margins = layout.contentsMargins()
+        available_width = max(
+            0,
+            width - margins.left() - margins.right() - layout.spacing() * (len(cards) - 1),
+        )
+        card_width = available_width // len(cards)
+        return margins.top() + max(card.heightForWidth(card_width) for card in cards) + margins.bottom()
 
     def request_height_refresh(self) -> None:
         if self._height_refresh_pending:
@@ -1375,26 +1411,45 @@ class CurrentPageStack(QStackedWidget):
         page = self.currentWidget()
         if page is None:
             return
-        layout = page.layout()
-        card_widgets = [
-            layout.itemAt(index).widget()
-            for index in range(layout.count())
-        ] if layout is not None else []
-        cards = [card for card in card_widgets if card is not None and card.hasHeightForWidth()]
-        if not cards:
+        card_height = self._card_height_for_width(self.width())
+        if card_height is None:
             self.setMaximumHeight(16_777_215)
             return
-
-        margins = layout.contentsMargins()
-        available_width = max(
-            0,
-            self.width() - margins.left() - margins.right() - layout.spacing() * (len(cards) - 1),
-        )
-        card_width = available_width // len(cards)
-        self.setMaximumHeight(max(card.heightForWidth(card_width) for card in cards))
+        self.setMaximumHeight(card_height)
         self.updateGeometry()
         if self.parentWidget() is not None and self.parentWidget().layout() is not None:
             self.parentWidget().layout().activate()
+
+
+class UniformScaleView(QGraphicsView):
+    def __init__(self, content: QWidget, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._content_size = content.size()
+        self._scene = QGraphicsScene(self)
+        self._proxy = self._scene.addWidget(content)
+        self._scene.setSceneRect(0, 0, self._content_size.width(), self._content_size.height())
+        self.setScene(self._scene)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def sizeHint(self) -> QSize:
+        return self._content_size
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        viewport_size = self.viewport().size()
+        available_width = max(0, viewport_size.width() - 2)
+        available_height = max(0, viewport_size.height() - 2)
+        scale = min(
+            1.0,
+            available_width / max(1, self._content_size.width()),
+            available_height / max(1, self._content_size.height()),
+        )
+        self.resetTransform()
+        self.scale(scale, scale)
 
 
 class VideoDropPlaceholder(QFrame):
@@ -1464,6 +1519,13 @@ class VideoDropPlaceholder(QFrame):
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
         self.setMaximumHeight(self.heightForWidth(self.width()))
+        QTimer.singleShot(0, self._refresh_surface_layout)
+
+    def _refresh_surface_layout(self) -> None:
+        layout = self.video_surface.layout()
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
 
     def hasHeightForWidth(self) -> bool:
         return True
@@ -3084,6 +3146,7 @@ class CollapsibleDrawer(QFrame):
         layout.addWidget(self.content)
 
         self.toggle_button.toggled.connect(self._set_expanded)
+        self._set_expanded(self.toggle_button.isChecked())
 
     def _set_expanded(self, expanded: bool) -> None:
         self.toggle_button.setArrowType(Qt.ArrowType.LeftArrow if expanded else Qt.ArrowType.RightArrow)
@@ -3152,6 +3215,7 @@ class GraphDrawer(QFrame):
         layout.addWidget(self.content)
 
         self.toggle_button.toggled.connect(self._set_expanded)
+        self._set_expanded(self.toggle_button.isChecked())
 
     def _set_expanded(self, expanded: bool) -> None:
         self.toggle_button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.UpArrow)
@@ -3638,13 +3702,10 @@ class ContrastWindow(QMainWindow):
         self.mode_selection_page.setObjectName("modeSelectionPage")
         mode_layout = QVBoxLayout(self.mode_selection_page)
         mode_layout.setContentsMargins(24, 24, 24, 24)
-        mode_layout.addStretch()
 
         mode_panel = QFrame()
         mode_panel.setObjectName("modeSelectionPanel")
-        mode_panel.setMinimumSize(720, 560)
-        mode_panel.setMaximumWidth(720)
-        mode_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        mode_panel.setFixedSize(720, 560)
         mode_panel_layout = QVBoxLayout(mode_panel)
         mode_panel_layout.setContentsMargins(40, 30, 40, 30)
         mode_panel_layout.setSpacing(14)
@@ -3706,11 +3767,12 @@ class ContrastWindow(QMainWindow):
         mode_panel_layout.addWidget(mode_load_label)
         mode_panel_layout.addWidget(mode_config_row)
         mode_panel_layout.addStretch(1)
-        mode_layout.addWidget(mode_panel, 0, Qt.AlignmentFlag.AlignCenter)
-        mode_layout.addStretch()
+        self.mode_selection_panel = mode_panel
+        self.mode_selection_view = UniformScaleView(mode_panel)
+        mode_layout.addWidget(self.mode_selection_view)
 
         self.video_stack = CurrentPageStack()
-        self.video_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self.video_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.video_stack.addWidget(self.mode_selection_page)
         self.video_stack.addWidget(self.video_placeholder_row)
         self.video_stack.addWidget(self.video_row)
@@ -3753,9 +3815,8 @@ class ContrastWindow(QMainWindow):
         video_layout = QVBoxLayout(video_panel)
         video_layout.setContentsMargins(0, 0, 0, 12)
         video_layout.setSpacing(14)
-        video_layout.addWidget(self.video_stack, 0, Qt.AlignmentFlag.AlignTop)
+        video_layout.addWidget(self.video_stack, 1)
         video_layout.addWidget(playback_row, 0, Qt.AlignmentFlag.AlignTop)
-        video_layout.addStretch(1)
 
         self.graph_drawer = GraphDrawer("Analysis")
         self.graph_drawer.setMinimumHeight(self.graph_drawer.header_height())
@@ -4345,7 +4406,9 @@ class ContrastWindow(QMainWindow):
         if splitter is None or drawer is None:
             return
         drawer.set_expanded(False)
-        splitter.setSizes([1, max(1, drawer.header_height())])
+        total_height = max(1, sum(splitter.sizes()) or splitter.height())
+        header_height = max(1, drawer.header_height())
+        splitter.setSizes([max(1, total_height - header_height), header_height])
 
     def _expand_pipeline_panel_by_default(self) -> None:
         drawer = getattr(self, "pipeline_drawer", None)
@@ -4909,6 +4972,7 @@ class ContrastWindow(QMainWindow):
             QProgressBar::chunk { background: #14b8a6; border-radius: 5px; }
             """
         )
+        self.mode_selection_panel.setStyleSheet(self.styleSheet())
 
     def open_video(self, panel: VideoPanel | None) -> None:
         if panel is None:
