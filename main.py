@@ -2802,7 +2802,7 @@ class GraphDrawer(QFrame):
 
         self.content = QWidget()
         self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(0, 12, 0, 12)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(0)
 
         layout = QVBoxLayout(self)
