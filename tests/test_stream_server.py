@@ -22,14 +22,22 @@ class StreamServerTests(unittest.TestCase):
         window = ContrastWindow()
         window.show()
         QApplication.processEvents()
-        setup_page_playback_y = window.playback_row.y()
 
         window._show_video_placeholders(MODE_COMPARISON)
         QApplication.processEvents()
+        baseline_playback_y = window.playback_row.y()
+        baseline_stack_height = window.video_stack.height()
+
+        splitter = window.main_splitter
+        sizes = splitter.sizes()
+        total_width = max(1, sum(sizes) or splitter.width())
+        expanded_left = min(total_width - 1, sizes[0] + 120)
+        splitter.setSizes([expanded_left, max(1, total_width - expanded_left)])
+        QApplication.processEvents()
 
         self.assertIs(window.video_stack.currentWidget(), window.video_placeholder_row)
-        self.assertGreater(window.video_stack.height(), 200)
-        self.assertLess(window.playback_row.y(), setup_page_playback_y)
+        self.assertLess(window.video_stack.height(), baseline_stack_height)
+        self.assertLess(window.playback_row.y(), baseline_playback_y)
         self.assertEqual(
             window.playback_row.y(),
             window.video_stack.geometry().bottom() + window.video_stack.parentWidget().layout().spacing() + 1,

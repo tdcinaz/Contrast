@@ -1337,7 +1337,12 @@ class LandscapeSurface(QFrame):
 class CurrentPageStack(QStackedWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._height_refresh_pending = False
         self.currentChanged.connect(self._update_current_page_geometry)
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        self.request_height_refresh()
 
     def hasHeightForWidth(self) -> bool:
         page = self.currentWidget()
@@ -1357,9 +1362,16 @@ class CurrentPageStack(QStackedWidget):
         self.updateGeometry()
         if self.parentWidget() is not None and self.parentWidget().layout() is not None:
             self.parentWidget().layout().invalidate()
+        self.request_height_refresh()
+
+    def request_height_refresh(self) -> None:
+        if self._height_refresh_pending:
+            return
+        self._height_refresh_pending = True
         QTimer.singleShot(0, self._apply_current_page_height)
 
     def _apply_current_page_height(self) -> None:
+        self._height_refresh_pending = False
         page = self.currentWidget()
         if page is None:
             return
@@ -3433,11 +3445,13 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage("Select a video file by dragging it into a placeholder or clicking to browse.")
 
     def _update_video_stack_geometry(self) -> None:
+        self.video_stack.request_height_refresh()
         self.video_stack.updateGeometry()
         parent = self.video_stack.parentWidget()
         if parent is not None and parent.layout() is not None:
             parent.layout().invalidate()
             parent.updateGeometry()
+        QTimer.singleShot(0, self.video_stack.request_height_refresh)
         QTimer.singleShot(0, self.video_stack.updateGeometry)
 
     def _request_placeholder_video(self, index: int) -> None:
