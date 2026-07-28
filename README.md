@@ -18,6 +18,24 @@ Use the **File** menu to choose different videos if needed.
 
 For live fluoroscope enhancement, choose **File > Switch to live camera mode** and select a video to use as a looping camera simulation. The source crop is measured once from that stream and retained for every live frame. Sequence-dependent stages, including temporal alignment and motion-aware temporal filtering, are unavailable in this mode; the remaining compatible stages are applied directly to each incoming frame.
 
+## Headless Streaming
+
+Run the live enhancement service with a stream configuration:
+
+```bash
+uv run python main.py --headless --config configs/headless_stream_config.json
+```
+
+`POST /ingest` accepts one `image/jpeg` frame per request. The service samples the configured number of initial frames to calculate a fixed auto-crop, then processes and publishes each following frame. `GET /egress.mjpg` returns the enhanced stream as MJPEG, and `GET /health` reports crop readiness and frame counters. The most recent enhanced frame is retained, so a slow egress consumer never delays ingest.
+
+For example, a camera bridge that can produce JPEG snapshots can forward frames with:
+
+```bash
+curl --data-binary @frame.jpg -H 'Content-Type: image/jpeg' http://localhost:8080/ingest
+```
+
+View the enhanced output at `http://localhost:8080/egress.mjpg`. [configs/headless_stream_config.json](configs/headless_stream_config.json) is a ready-to-edit example. Headless mode rejects stages that require a full temporal sequence, including temporal alignment, brightness stabilization, ROI extraction, motion-aware filtering, and ROI residence analysis.
+
 ## Workflow
 
 1. Enable live processing stages in order. The default stage order now places **Aneurysm ROI extraction** second, immediately after gain / brightness stabilization.

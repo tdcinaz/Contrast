@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import math
@@ -5708,7 +5709,66 @@ def recompute_threshold_metrics(result: AnalysisResult, threshold_fraction: floa
     return build_analysis_result(result.label, result.path, result.fps, result.roi, result.mean_intensity, result.reference_intensity, threshold_fraction, result.gain_corrected)
 
 
-def main() -> None:
+def run_headless(config_path: Path) -> None:
+    from stream_server import LiveStreamProcessor, StreamService, create_http_server, load_stream_configuration
+
+    settings, stages, parameters, noise_sigma, auto_crop_enabled, denoiser_settings = load_stream_configuration(str(config_path))
+    denoiser: FrameDenoiser | None = None
+    if stages.denoise and denoiser_settings.mode != "classical":
+        if denoiser_settings.mode.endswith("-ngc"):
+            from container_denoiser import ContainerDenoiser
+
+            model_name = denoiser_settings.mode.removesuffix("-ngc")
+            weights_name = "ffdnet_gray.pth" if model_name == "ffdnet" else f"{model_name.replace('-', '_')}.pth"
+            denoiser = ContainerDenoiser(
+                model_name,
+                ROOT / "models" / weights_name,
+                denoiser_settings.batch_size,
+                denoiser_settings.precision,
+            )
+        elif denoiser_settings.mode == "ffdnet-native":
+            from deep_denoiser import FFDNetDenoiser
+
+            denoiser = FFDNetDenoiser(ROOT / "models" / "ffdnet_gray.pth", denoiser_settings.precision)
+        else:
+            raise ValueError(f"Unsupported headless denoiser mode: {denoiser_settings.mode}")
+    processor = LiveStreamProcessor(
+        stages,
+        parameters,
+        noise_sigma,
+        settings.crop_sample_frames,
+        settings.jpeg_quality,
+        auto_crop_enabled,
+        denoiser,
+    )
+    service = StreamService(processor, settings.max_frame_bytes)
+    server = create_http_server(settings, service)
+    print(f"Contrast stream service listening on http://{settings.host}:{settings.port}", flush=True)
+    print("POST JPEG frames to /ingest; read enhanced MJPEG from /egress.mjpg", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        if denoiser is not None:
+            close = getattr(denoiser, "close", None)
+            if close is not None:
+                close()
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Contrast fluoroscopy enhancement")
+    parser.add_argument("--headless", action="store_true", help="Run the HTTP live-stream service without the desktop UI")
+    parser.add_argument("--config", type=Path, help="Configuration JSON used by --headless")
+    arguments = parser.parse_args(argv)
+    if arguments.headless:
+        if arguments.config is None:
+            parser.error("--headless requires --config PATH")
+        run_headless(arguments.config)
+        return
+    if arguments.config is not None:
+        parser.error("--config is only supported with --headless")
     app = QApplication(sys.argv)
     window = ContrastWindow()
     window.show()
