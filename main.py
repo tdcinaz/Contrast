@@ -3246,13 +3246,13 @@ class ContrastWindow(QMainWindow):
 
         right_column = QWidget()
         right_layout = QVBoxLayout(right_column)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setContentsMargins(12, 0, 0, 0)
         right_layout.setSpacing(0)
         right_layout.addWidget(right_splitter)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter = splitter
-        self._pipeline_drawer_default_width = 450
+        self._pipeline_drawer_default_width = 420
         splitter.addWidget(self.pipeline_drawer)
         splitter.addWidget(right_column)
         splitter.setHandleWidth(8)
@@ -4324,7 +4324,7 @@ class ContrastWindow(QMainWindow):
             QSlider::groove:horizontal { height: 6px; background: #273449; border-radius: 3px; }
             QSlider::handle:horizontal { background: #67e8f9; width: 16px; margin: -5px 0; border-radius: 8px; }
             QSplitter::handle:vertical { background: #1c2637; border-top: 1px solid #334155; border-bottom: 1px solid #253044; margin: 2px 0; }
-            QSplitter::handle:horizontal { background: #1c2637; border-left: 1px solid #334155; border-right: 1px solid #253044; margin: 0 2px; }
+            QSplitter::handle:horizontal { background: #1c2637; border-left: 1px solid #334155; border-right: 1px solid #253044; margin: 0; }
             QSpinBox, QDoubleSpinBox, QComboBox { background: #111827; border: 1px solid #334155; border-radius: 6px; padding: 5px; color: #e5edf6; }
             QGroupBox { background: #111827; border: 1px solid #253044; border-radius: 8px; margin-top: 12px; padding: 12px; font-weight: 700; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
