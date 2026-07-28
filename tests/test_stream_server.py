@@ -10,11 +10,38 @@ from threading import Thread
 import cv2
 import numpy as np
 
-from main import CollapsibleDrawer, EnhancementParameters, EnhancementStages
+from main import CollapsibleDrawer, ContrastWindow, EnhancementParameters, EnhancementStages
 from stream_server import LiveStreamProcessor, StreamService, StreamSettings, create_http_server, load_stream_configuration
 
 
 class StreamServerTests(unittest.TestCase):
+    def test_window_keeps_pipeline_drawer_expanded_by_default(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        window.show()
+        QApplication.processEvents()
+
+        self.assertTrue(window.pipeline_drawer.toggle_button.isChecked())
+        self.assertTrue(window.pipeline_drawer.content.isVisible())
+
+        window.close()
+        app.quit()
+
+    def test_show_source_toggle_is_off_by_default(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        window.show()
+        QApplication.processEvents()
+
+        self.assertFalse(window.compare_view_check.isChecked())
+
+        window.close()
+        app.quit()
+
     def test_pipeline_drawer_toggle_hides_content(self) -> None:
         from PySide6.QtWidgets import QApplication, QWidget
 

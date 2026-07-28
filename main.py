@@ -3454,7 +3454,7 @@ class ContrastWindow(QMainWindow):
         self.time_label.setObjectName("timeLabel")
 
         self.compare_view_check = QCheckBox("Show source")
-        self.compare_view_check.setChecked(True)
+        self.compare_view_check.setChecked(False)
         self.compare_view_check.setToolTip("Show source beside enhanced output")
         self.compare_view_check.toggled.connect(self.on_compare_view_toggled)
 
@@ -3630,7 +3630,7 @@ class ContrastWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
         QTimer.singleShot(0, self._collapse_graph_panel_by_default)
-        QTimer.singleShot(0, self._collapse_pipeline_panel_by_default)
+        QTimer.singleShot(0, self._expand_pipeline_panel_by_default)
         QTimer.singleShot(0, self._update_pipeline_column_width)
 
     def _build_controls_panel(self) -> QWidget:
@@ -4178,12 +4178,12 @@ class ContrastWindow(QMainWindow):
         drawer.set_expanded(False)
         splitter.setSizes([1, max(1, drawer.header_height())])
 
-    def _collapse_pipeline_panel_by_default(self) -> None:
+    def _expand_pipeline_panel_by_default(self) -> None:
         drawer = getattr(self, "pipeline_drawer", None)
         if drawer is None:
             return
-        drawer.set_expanded(False)
-        self._set_pipeline_drawer_expanded(False)
+        drawer.set_expanded(True)
+        self._set_pipeline_drawer_expanded(True)
 
     def _set_pipeline_drawer_expanded(self, expanded: bool) -> None:
         splitter = getattr(self, "main_splitter", None)
@@ -4686,9 +4686,9 @@ class ContrastWindow(QMainWindow):
             QLabel#modeSelectionLabel { color: #f8fafc; font-size: 16px; font-weight: 700; }
             QFrame#videoDropPlaceholder { background: #000000; border: 1px solid #334155; border-radius: 8px; }
             QFrame#videoDropPlaceholder[dragActive="true"] { background: #072226; border: 1px solid #2dd4bf; }
-            QPushButton#videoDropHintButton { background: #173244; border: 1px dashed #5d7991; border-radius: 10px; padding: 0; }
-            QPushButton#videoDropHintButton:hover { background: #20435b; border-color: #78b7db; }
-            QPushButton#videoDropHintButton[dragActive="true"] { background: #1a4b5f; border-color: #5eead4; }
+            QPushButton#videoDropHintButton { background: #173244; border: 1px solid #253044; border-radius: 10px; padding: 0; }
+            QPushButton#videoDropHintButton:hover { background: #20435b; border-color: #253044; }
+            QPushButton#videoDropHintButton[dragActive="true"] { background: #1a4b5f; border-color: #253044; }
             QWidget#videoDropGlyph { background: transparent; }
             QSlider::groove:horizontal { height: 6px; background: #273449; border-radius: 3px; }
             QSlider::handle:horizontal { background: #67e8f9; width: 16px; margin: -5px 0; border-radius: 8px; }
