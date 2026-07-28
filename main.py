@@ -1403,7 +1403,7 @@ class VideoDropPlaceholder(QFrame):
     SUPPORTED_EXTENSIONS = {".mov", ".mp4", ".avi", ".mkv"}
     PANEL_MARGIN = 14
     PANEL_SPACING = 10
-    TITLE_HEIGHT = 24
+    TITLE_HEIGHT = 30
 
     def __init__(self, label: str, color: QColor, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1425,7 +1425,7 @@ class VideoDropPlaceholder(QFrame):
         self.title_container.setObjectName("videoPanelTitleContainer")
         self.title_container.setFixedHeight(self.TITLE_HEIGHT)
         title_layout = QHBoxLayout(self.title_container)
-        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setContentsMargins(8, 2, 8, 2)
         title_layout.addWidget(self.title_label)
 
         self.video_surface = LandscapeSurface()
@@ -1541,7 +1541,7 @@ class VideoPanel(QFrame):
     roiChanged = Signal()
     PANEL_MARGIN = 14
     PANEL_SPACING = 10
-    TITLE_HEIGHT = 24
+    TITLE_HEIGHT = 30
 
     def __init__(
         self,
@@ -1597,7 +1597,7 @@ class VideoPanel(QFrame):
         self.title_container.setObjectName("videoPanelTitleContainer")
         self.title_container.setFixedHeight(self.TITLE_HEIGHT)
         header = QHBoxLayout(self.title_container)
-        header.setContentsMargins(0, 0, 0, 0)
+        header.setContentsMargins(8, 2, 8, 2)
         header.addWidget(self.title_label)
         header.addStretch()
         header.addWidget(self.meta_label)
@@ -3065,9 +3065,9 @@ class CollapsibleDrawer(QFrame):
 
         self.header = QWidget()
         self.header.setObjectName("pipelineDrawerHeader")
-        self.header.setMinimumHeight(38)
+        self.header.setMinimumHeight(44)
         header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(12, 4, 12, 4)
+        header_layout.setContentsMargins(14, 6, 14, 6)
         header_layout.setSpacing(8)
         header_layout.addWidget(self.title_label, 1)
         header_layout.addWidget(self.toggle_button)
@@ -3132,9 +3132,9 @@ class GraphDrawer(QFrame):
 
         self.header = QWidget()
         self.header.setObjectName("graphDrawerHeader")
-        self.header.setMinimumHeight(34)
+        self.header.setMinimumHeight(40)
         header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(12, 4, 12, 4)
+        header_layout.setContentsMargins(14, 6, 14, 6)
         header_layout.setSpacing(8)
         header_layout.addWidget(self.drag_handle)
         header_layout.addWidget(self.title_label, 1)
@@ -4878,13 +4878,13 @@ class ContrastWindow(QMainWindow):
             QFrame#videoPanel, QFrame#plotPanel { background: #111827; border: 1px solid #253044; border-radius: 8px; }
             QFrame#graphDrawer { background: #0f172a; border: 1px solid #253044; border-top-left-radius: 8px; border-top-right-radius: 8px; }
             QWidget#graphDrawerHeader { background: #111827; border-top: 1px solid #253044; border-bottom: 1px solid #334155; }
-            QLabel#graphDrawerTitle { color: #f8fafc; font-size: 14px; font-weight: 700; }
+            QLabel#graphDrawerTitle { color: #f8fafc; font-size: 14px; font-weight: 700; padding-left: 6px; }
             QLabel#graphDrawerHandle { color: #9fb0c6; font-weight: 700; letter-spacing: 1px; }
             QToolButton#graphDrawerToggle { background: #1c2637; border: 1px solid #334155; border-radius: 6px; padding: 0; }
             QToolButton#graphDrawerToggle:hover { background: #263449; }
             QFrame#pipelineDrawer { background: #0f172a; border: 1px solid #253044; border-radius: 8px; }
             QWidget#pipelineDrawerHeader { background: #111827; border-top: 1px solid #253044; border-bottom: 1px solid #334155; }
-            QLabel#pipelineDrawerTitle { color: #f8fafc; font-size: 14px; font-weight: 700; }
+            QLabel#pipelineDrawerTitle { color: #f8fafc; font-size: 14px; font-weight: 700; padding-left: 6px; }
             QToolButton#pipelineDrawerToggle { background: #1c2637; border: 1px solid #334155; border-radius: 6px; padding: 0; }
             QToolButton#pipelineDrawerToggle:hover { background: #263449; }
             QFrame#stageDrawer { background: #0f172a; border: 1px solid #273449; border-radius: 8px; }
