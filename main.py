@@ -67,49 +67,39 @@ class ModeSelectionButton(QPushButton):
         super().__init__()
         self.setText("")
         self.setObjectName("modeSelectionButton")
-        self.setMinimumSize(190, 150)
+        self.setFixedSize(210, 164)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setCheckable(False)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(14)
 
         preview = QFrame(self)
-        preview.setFixedSize(126, 76)
-        preview.setStyleSheet(
-            "background: #111827; border: 1px solid #334155; border-radius: 8px;"
-        )
+        preview.setObjectName("modePreview")
+        preview.setFixedSize(142, 82)
         preview_layout = QHBoxLayout(preview)
         preview_layout.setContentsMargins(8, 8, 8, 8)
         preview_layout.setSpacing(6)
 
         if preview_mode == MODE_SINGLE:
             panel = QFrame(preview)
+            panel.setObjectName("modePreviewPane")
             panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            panel.setStyleSheet(
-                "background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #38bdf8, stop:1 #0f766e); border: 1px solid #14b8a6; border-radius: 6px;"
-            )
             preview_layout.addWidget(panel)
         else:
             left_panel = QFrame(preview)
+            left_panel.setObjectName("modePreviewPane")
             left_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            left_panel.setStyleSheet(
-                "background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #38bdf8, stop:1 #0f766e); border: 1px solid #14b8a6; border-radius: 6px;"
-            )
             right_panel = QFrame(preview)
+            right_panel.setObjectName("modePreviewPane")
             right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            right_panel.setStyleSheet(
-                "background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #38bdf8, stop:1 #0f766e); border: 1px solid #14b8a6; border-radius: 6px;"
-            )
             preview_layout.addWidget(left_panel)
             preview_layout.addWidget(right_panel)
 
         label_widget = QLabel(label)
+        label_widget.setObjectName("modeSelectionLabel")
         label_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label_widget.setStyleSheet(
-            "font-size: 18px; font-weight: 600; color: #e5edf6;"
-        )
         layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(label_widget, 0, Qt.AlignmentFlag.AlignCenter)
 
@@ -2998,20 +2988,38 @@ class ContrastWindow(QMainWindow):
         self.video_layout.setSpacing(14)
 
         self.mode_selection_page = QWidget()
+        self.mode_selection_page.setObjectName("modeSelectionPage")
         mode_layout = QVBoxLayout(self.mode_selection_page)
         mode_layout.setContentsMargins(24, 24, 24, 24)
-        mode_layout.setSpacing(20)
         mode_layout.addStretch()
 
-        mode_buttons_row = QWidget()
-        mode_buttons_layout = QHBoxLayout(mode_buttons_row)
-        mode_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        mode_buttons_layout.setSpacing(24)
+        mode_panel = QFrame()
+        mode_panel.setObjectName("modeSelectionPanel")
+        mode_panel.setMinimumSize(600, 350)
+        mode_panel.setMaximumWidth(720)
+        mode_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        mode_panel_layout = QVBoxLayout(mode_panel)
+        mode_panel_layout.setContentsMargins(40, 34, 40, 40)
+        mode_panel_layout.setSpacing(10)
 
-        self.single_mode_button = ModeSelectionButton("Single", MODE_SINGLE)
+        mode_context_label = QLabel("STUDY SETUP")
+        mode_context_label.setObjectName("modeSelectionContext")
+        mode_context_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        mode_title = QLabel("Choose a video workspace")
+        mode_title.setObjectName("modeSelectionTitle")
+        mode_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        mode_buttons_row = QWidget()
+        mode_buttons_row.setObjectName("modeSelectionButtons")
+        mode_buttons_layout = QHBoxLayout(mode_buttons_row)
+        mode_buttons_layout.setContentsMargins(0, 20, 0, 0)
+        mode_buttons_layout.setSpacing(20)
+
+        self.single_mode_button = ModeSelectionButton("Single video", MODE_SINGLE)
         self.single_mode_button.clicked.connect(lambda: self._select_mode_and_videos(MODE_SINGLE))
 
-        self.comparison_mode_button = ModeSelectionButton("Dual", MODE_COMPARISON)
+        self.comparison_mode_button = ModeSelectionButton("Comparison", MODE_COMPARISON)
         self.comparison_mode_button.clicked.connect(lambda: self._select_mode_and_videos(MODE_COMPARISON))
 
         mode_buttons_layout.addStretch()
@@ -3019,7 +3027,10 @@ class ContrastWindow(QMainWindow):
         mode_buttons_layout.addWidget(self.comparison_mode_button)
         mode_buttons_layout.addStretch()
 
-        mode_layout.addWidget(mode_buttons_row, 0, Qt.AlignmentFlag.AlignHCenter)
+        mode_panel_layout.addWidget(mode_context_label)
+        mode_panel_layout.addWidget(mode_title)
+        mode_panel_layout.addWidget(mode_buttons_row)
+        mode_layout.addWidget(mode_panel, 0, Qt.AlignmentFlag.AlignCenter)
         mode_layout.addStretch()
 
         self.video_stack = QStackedWidget()
@@ -3085,6 +3096,7 @@ class ContrastWindow(QMainWindow):
         self.main_splitter = splitter
         splitter.addWidget(left_column)
         splitter.addWidget(right_column)
+        splitter.setHandleWidth(8)
         splitter.setSizes([420, 1080])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -4052,12 +4064,21 @@ class ContrastWindow(QMainWindow):
             QPushButton:disabled { color: #64748b; background: #111827; }
             QPushButton#primaryButton { background: #0f766e; border-color: #14b8a6; font-weight: 700; }
             QPushButton#primaryButton:hover { background: #0d9488; }
-            QPushButton#modeSelectionButton { background: #1c2637; border: 1px solid #334155; border-radius: 10px; color: #e5edf6; padding: 8px; }
-            QPushButton#modeSelectionButton:hover { background: #263449; border-color: #475569; }
-            QPushButton#modeSelectionButton:pressed { background: #0f172a; }
+            QWidget#modeSelectionPage { background: #0d131d; }
+            QFrame#modeSelectionPanel { background: #111827; border: 1px solid #334155; border-radius: 8px; }
+            QFrame#modeSelectionPanel QLabel, QWidget#modeSelectionButtons { background: transparent; border: none; }
+            QLabel#modeSelectionContext { color: #5eead4; font-size: 11px; font-weight: 700; }
+            QLabel#modeSelectionTitle { color: #f8fafc; font-size: 24px; font-weight: 700; }
+            QPushButton#modeSelectionButton { background: #182233; border: 1px solid #334155; border-radius: 8px; color: #e5edf6; padding: 0; }
+            QPushButton#modeSelectionButton:hover { background: #202d40; border-color: #5eead4; }
+            QPushButton#modeSelectionButton:pressed { background: #0f172a; border-color: #14b8a6; }
+            QFrame#modePreview { background: #0b1018; border: 1px solid #334155; border-radius: 7px; }
+            QFrame#modePreviewPane { background: #159bb0; border: 1px solid #67e8f9; border-radius: 5px; }
+            QLabel#modeSelectionLabel { color: #f8fafc; font-size: 16px; font-weight: 700; }
             QSlider::groove:horizontal { height: 6px; background: #273449; border-radius: 3px; }
             QSlider::handle:horizontal { background: #67e8f9; width: 16px; margin: -5px 0; border-radius: 8px; }
             QSplitter::handle:vertical { background: #1c2637; border-top: 1px solid #334155; border-bottom: 1px solid #253044; margin: 2px 0; }
+            QSplitter::handle:horizontal { background: #1c2637; border-left: 1px solid #334155; border-right: 1px solid #253044; margin: 0 2px; }
             QSpinBox, QDoubleSpinBox, QComboBox { background: #111827; border: 1px solid #334155; border-radius: 6px; padding: 5px; color: #e5edf6; }
             QGroupBox { background: #111827; border: 1px solid #253044; border-radius: 8px; margin-top: 12px; padding: 12px; font-weight: 700; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
