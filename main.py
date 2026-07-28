@@ -62,6 +62,58 @@ MODE_SINGLE = "single"
 MODE_COMPARISON = "comparison"
 
 
+class ModeSelectionButton(QPushButton):
+    def __init__(self, label: str, preview_mode: str) -> None:
+        super().__init__()
+        self.setText("")
+        self.setObjectName("modeSelectionButton")
+        self.setMinimumSize(190, 150)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setCheckable(False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        preview = QFrame(self)
+        preview.setFixedSize(126, 76)
+        preview.setStyleSheet(
+            "background: #111827; border: 1px solid #334155; border-radius: 8px;"
+        )
+        preview_layout = QHBoxLayout(preview)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        preview_layout.setSpacing(6)
+
+        if preview_mode == MODE_SINGLE:
+            panel = QFrame(preview)
+            panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            panel.setStyleSheet(
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #38bdf8, stop:1 #0f766e); border: 1px solid #14b8a6; border-radius: 6px;"
+            )
+            preview_layout.addWidget(panel)
+        else:
+            left_panel = QFrame(preview)
+            left_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            left_panel.setStyleSheet(
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #38bdf8, stop:1 #0f766e); border: 1px solid #14b8a6; border-radius: 6px;"
+            )
+            right_panel = QFrame(preview)
+            right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            right_panel.setStyleSheet(
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #38bdf8, stop:1 #0f766e); border: 1px solid #14b8a6; border-radius: 6px;"
+            )
+            preview_layout.addWidget(left_panel)
+            preview_layout.addWidget(right_panel)
+
+        label_widget = QLabel(label)
+        label_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label_widget.setStyleSheet(
+            "font-size: 18px; font-weight: 600; color: #e5edf6;"
+        )
+        layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label_widget, 0, Qt.AlignmentFlag.AlignCenter)
+
+
 @contextmanager
 def frame_parallel_opencv() -> Generator[None]:
     previous_thread_count = cv2.getNumThreads()
@@ -2948,24 +3000,26 @@ class ContrastWindow(QMainWindow):
         self.mode_selection_page = QWidget()
         mode_layout = QVBoxLayout(self.mode_selection_page)
         mode_layout.setContentsMargins(24, 24, 24, 24)
-        mode_layout.setSpacing(14)
+        mode_layout.setSpacing(20)
         mode_layout.addStretch()
-        mode_title = QLabel("Choose how to load video")
-        mode_title.setObjectName("panelTitle")
-        mode_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        mode_hint = QLabel("Open one video for single-view processing, or load two videos for side-by-side comparison.")
-        mode_hint.setObjectName("subtleLabel")
-        mode_hint.setWordWrap(True)
-        mode_hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self.single_mode_button = QPushButton("Open single video")
+
+        mode_buttons_row = QWidget()
+        mode_buttons_layout = QHBoxLayout(mode_buttons_row)
+        mode_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        mode_buttons_layout.setSpacing(24)
+
+        self.single_mode_button = ModeSelectionButton("Single", MODE_SINGLE)
         self.single_mode_button.clicked.connect(lambda: self._select_mode_and_videos(MODE_SINGLE))
-        self.comparison_mode_button = QPushButton("Open comparison videos")
+
+        self.comparison_mode_button = ModeSelectionButton("Dual", MODE_COMPARISON)
         self.comparison_mode_button.clicked.connect(lambda: self._select_mode_and_videos(MODE_COMPARISON))
-        self.single_mode_button.setObjectName("primaryButton")
-        mode_layout.addWidget(mode_title, 0, Qt.AlignmentFlag.AlignHCenter)
-        mode_layout.addWidget(mode_hint, 0, Qt.AlignmentFlag.AlignHCenter)
-        mode_layout.addWidget(self.single_mode_button, 0, Qt.AlignmentFlag.AlignHCenter)
-        mode_layout.addWidget(self.comparison_mode_button, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        mode_buttons_layout.addStretch()
+        mode_buttons_layout.addWidget(self.single_mode_button)
+        mode_buttons_layout.addWidget(self.comparison_mode_button)
+        mode_buttons_layout.addStretch()
+
+        mode_layout.addWidget(mode_buttons_row, 0, Qt.AlignmentFlag.AlignHCenter)
         mode_layout.addStretch()
 
         self.video_stack = QStackedWidget()
@@ -3998,6 +4052,9 @@ class ContrastWindow(QMainWindow):
             QPushButton:disabled { color: #64748b; background: #111827; }
             QPushButton#primaryButton { background: #0f766e; border-color: #14b8a6; font-weight: 700; }
             QPushButton#primaryButton:hover { background: #0d9488; }
+            QPushButton#modeSelectionButton { background: #1c2637; border: 1px solid #334155; border-radius: 10px; color: #e5edf6; padding: 8px; }
+            QPushButton#modeSelectionButton:hover { background: #263449; border-color: #475569; }
+            QPushButton#modeSelectionButton:pressed { background: #0f172a; }
             QSlider::groove:horizontal { height: 6px; background: #273449; border-radius: 3px; }
             QSlider::handle:horizontal { background: #67e8f9; width: 16px; margin: -5px 0; border-radius: 8px; }
             QSplitter::handle:vertical { background: #1c2637; border-top: 1px solid #334155; border-bottom: 1px solid #253044; margin: 2px 0; }
