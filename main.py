@@ -2613,6 +2613,67 @@ class StageDrawer(QFrame):
         self.status_label.setVisible(True)
 
 
+class GraphDrawer(QFrame):
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("graphDrawer")
+
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("graphDrawerTitle")
+
+        self.drag_handle = QLabel("||")
+        self.drag_handle.setObjectName("graphDrawerHandle")
+        self.drag_handle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.drag_handle.setToolTip("Drag the drawer edge to resize the graph area")
+
+        self.toggle_button = QToolButton()
+        self.toggle_button.setObjectName("graphDrawerToggle")
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.toggle_button.setArrowType(Qt.ArrowType.UpArrow)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(False)
+        self.toggle_button.setFixedSize(32, 32)
+        self.toggle_button.setToolTip("Show graph panel")
+
+        self.header = QWidget()
+        self.header.setObjectName("graphDrawerHeader")
+        self.header.setMinimumHeight(34)
+        header_layout = QHBoxLayout(self.header)
+        header_layout.setContentsMargins(12, 4, 12, 4)
+        header_layout.setSpacing(8)
+        header_layout.addWidget(self.drag_handle)
+        header_layout.addWidget(self.title_label, 1)
+        header_layout.addWidget(self.toggle_button)
+
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(0, 12, 0, 12)
+        self.content_layout.setSpacing(0)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.header)
+        layout.addWidget(self.content)
+
+        self.toggle_button.toggled.connect(self._set_expanded)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.toggle_button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.UpArrow)
+        self.toggle_button.setToolTip("Hide graph panel" if expanded else "Show graph panel")
+        self.content.setVisible(expanded)
+
+    def set_expanded(self, expanded: bool) -> None:
+        if self.toggle_button.isChecked() != expanded:
+            self.toggle_button.blockSignals(True)
+            self.toggle_button.setChecked(expanded)
+            self.toggle_button.blockSignals(False)
+        self._set_expanded(expanded)
+
+    def header_height(self) -> int:
+        return self.header.sizeHint().height()
+
+
 class ContrastWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2940,13 +3001,31 @@ class ContrastWindow(QMainWindow):
         left_layout.addWidget(self.enhancement_progress)
         plot_panel = self._build_plot_panel()
 
+        video_panel = QWidget()
+        video_layout = QVBoxLayout(video_panel)
+        video_layout.setContentsMargins(0, 0, 0, 12)
+        video_layout.setSpacing(14)
+        video_layout.addWidget(self.video_stack, 3)
+        video_layout.addWidget(playback_row)
+
+        self.graph_drawer = GraphDrawer("Analysis")
+        self.graph_drawer.content_layout.addWidget(plot_panel)
+        self.graph_drawer.toggle_button.toggled.connect(self._set_graph_drawer_expanded)
+
+        right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.graph_splitter = right_splitter
+        right_splitter.addWidget(video_panel)
+        right_splitter.addWidget(self.graph_drawer)
+        right_splitter.setCollapsible(1, True)
+        right_splitter.setHandleWidth(8)
+        right_splitter.setStretchFactor(0, 1)
+        right_splitter.setStretchFactor(1, 0)
+
         right_column = QWidget()
         right_layout = QVBoxLayout(right_column)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(14)
-        right_layout.addWidget(self.video_stack, 3)
-        right_layout.addWidget(playback_row)
-        right_layout.addWidget(plot_panel, 2)
+        right_layout.setSpacing(0)
+        right_layout.addWidget(right_splitter)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter = splitter
@@ -2963,6 +3042,7 @@ class ContrastWindow(QMainWindow):
         layout.addWidget(splitter)
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
+        QTimer.singleShot(0, self._collapse_graph_panel_by_default)
         QTimer.singleShot(0, self._update_pipeline_column_width)
 
     def _build_controls_panel(self) -> QWidget:
@@ -3452,6 +3532,34 @@ class ContrastWindow(QMainWindow):
         plot_layout.addWidget(self.raw_plot, 1, 0)
         return plot_group
 
+    def _collapse_graph_panel_by_default(self) -> None:
+        splitter = getattr(self, "graph_splitter", None)
+        drawer = getattr(self, "graph_drawer", None)
+        if splitter is None or drawer is None:
+            return
+        drawer.set_expanded(False)
+        splitter.setSizes([1, max(1, drawer.header_height())])
+
+    def _set_graph_drawer_expanded(self, expanded: bool) -> None:
+        splitter = getattr(self, "graph_splitter", None)
+        drawer = getattr(self, "graph_drawer", None)
+        if splitter is None or drawer is None:
+            return
+
+        sizes = splitter.sizes()
+        drawer_height = max(1, drawer.sizeHint().height())
+        header_height = max(1, drawer.header_height())
+        if expanded:
+            drawer.set_expanded(True)
+            target_height = max(drawer_height, getattr(self, "_graph_drawer_last_height", 260), header_height * 6)
+            total_height = max(1, sum(sizes) or splitter.height())
+            splitter.setSizes([max(1, total_height - target_height), target_height])
+        else:
+            if len(sizes) > 1 and sizes[1] > header_height:
+                self._graph_drawer_last_height = sizes[1]
+            drawer.set_expanded(False)
+            splitter.setSizes([max(1, sizes[0] if sizes else 1), header_height])
+
     def _build_stage_drawer_controls(self) -> None:
         self._parameter_slider_pairs: list[tuple[QSpinBox | QDoubleSpinBox, QSlider]] = []
         enhancement_mode_row = QHBoxLayout()
@@ -3892,10 +4000,17 @@ class ContrastWindow(QMainWindow):
             QPushButton#primaryButton:hover { background: #0d9488; }
             QSlider::groove:horizontal { height: 6px; background: #273449; border-radius: 3px; }
             QSlider::handle:horizontal { background: #67e8f9; width: 16px; margin: -5px 0; border-radius: 8px; }
+            QSplitter::handle:vertical { background: #1c2637; border-top: 1px solid #334155; border-bottom: 1px solid #253044; margin: 2px 0; }
             QSpinBox, QDoubleSpinBox, QComboBox { background: #111827; border: 1px solid #334155; border-radius: 6px; padding: 5px; color: #e5edf6; }
             QGroupBox { background: #111827; border: 1px solid #253044; border-radius: 8px; margin-top: 12px; padding: 12px; font-weight: 700; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
             QFrame#videoPanel, QFrame#plotPanel { background: #111827; border: 1px solid #253044; border-radius: 8px; }
+            QFrame#graphDrawer { background: #0f172a; border: 1px solid #253044; border-top-left-radius: 8px; border-top-right-radius: 8px; }
+            QWidget#graphDrawerHeader { background: #111827; border-top: 1px solid #253044; border-bottom: 1px solid #334155; }
+            QLabel#graphDrawerTitle { color: #f8fafc; font-size: 14px; font-weight: 700; }
+            QLabel#graphDrawerHandle { color: #9fb0c6; font-weight: 700; letter-spacing: 1px; }
+            QToolButton#graphDrawerToggle { background: #1c2637; border: 1px solid #334155; border-radius: 6px; padding: 0; }
+            QToolButton#graphDrawerToggle:hover { background: #263449; }
             QFrame#stageDrawer { background: #0f172a; border: 1px solid #273449; border-radius: 8px; }
             QToolButton#stageEnableButton, QToolButton#stageExpandButton, QToolButton#stageOptionsButton { border: 1px solid transparent; border-radius: 6px; icon-size: 16px; padding: 0; }
             QToolButton#stageEnableButton:hover, QToolButton#stageExpandButton:hover, QToolButton#stageOptionsButton:hover { background: #1c2637; border-color: #334155; }
