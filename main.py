@@ -1217,6 +1217,139 @@ class VideoDisplay(QLabel):
         )
 
 
+class VideoDropGlyph(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("videoDropGlyph")
+        self.setFixedSize(102, 78)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        drag_active = bool(self.parentWidget() and self.parentWidget().property("dragActive"))
+        accent = QColor("#5eead4") if drag_active else QColor("#94a3b8")
+        tray_pen = QPen(accent, 2)
+        tray_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        tray_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+        painter.setPen(tray_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRect(13, 47, 76, 18), 6, 6)
+        painter.drawLine(24, 47, 24, 39)
+        painter.drawLine(78, 47, 78, 39)
+
+        painter.drawLine(51, 14, 51, 38)
+        arrow = QPolygon([QPoint(40, 31), QPoint(51, 42), QPoint(62, 31)])
+        painter.setBrush(accent)
+        painter.drawPolygon(arrow)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRect(37, 5, 28, 14), 3, 3)
+
+
+class VideoDropPlaceholder(QFrame):
+    fileDialogRequested = Signal()
+    fileDropped = Signal(object)
+    SUPPORTED_EXTENSIONS = {".mov", ".mp4", ".avi", ".mkv"}
+
+    def __init__(self, label: str, color: QColor, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.label = label
+        self.color = color
+        self.selected_path: Path | None = None
+        self.setObjectName("videoDropPlaceholder")
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setProperty("dragActive", False)
+
+        self.title_label = QLabel(label)
+        self.title_label.setObjectName("panelTitle")
+
+        self.hint_button = QPushButton("")
+        self.hint_button.setObjectName("videoDropHintButton")
+        self.hint_button.setProperty("dragActive", False)
+        self.hint_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hint_button.setFixedSize(170, 170)
+        hint_layout = QVBoxLayout(self.hint_button)
+        hint_layout.setContentsMargins(0, 0, 0, 0)
+        hint_layout.setSpacing(0)
+
+        self.hint_glyph = VideoDropGlyph(self.hint_button)
+        hint_layout.addWidget(self.hint_glyph, 0, Qt.AlignmentFlag.AlignCenter)
+        self.hint_button.clicked.connect(self.fileDialogRequested.emit)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        layout.addWidget(self.title_label)
+        layout.addStretch()
+        layout.addWidget(self.hint_button, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch()
+
+    def set_selected_path(self, path: Path) -> None:
+        self.selected_path = path
+
+    def dragEnterEvent(self, event) -> None:  # noqa: ANN001
+        if self._extract_video_path(event) is not None:
+            self._set_drag_active(True)
+            event.acceptProposedAction()
+            return
+        self._set_drag_active(False)
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: ANN001
+        if self._extract_video_path(event) is not None:
+            self._set_drag_active(True)
+            event.acceptProposedAction()
+            return
+        self._set_drag_active(False)
+        event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: ANN001
+        self._set_drag_active(False)
+        event.accept()
+
+    def dropEvent(self, event) -> None:  # noqa: ANN001
+        self._set_drag_active(False)
+        path = self._extract_video_path(event)
+        if path is None:
+            event.ignore()
+            return
+        self.fileDropped.emit(path)
+        event.acceptProposedAction()
+
+    def _set_drag_active(self, active: bool) -> None:
+        if bool(self.property("dragActive")) == active:
+            return
+        self.setProperty("dragActive", active)
+        self.hint_button.setProperty("dragActive", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.style().unpolish(self.hint_button)
+        self.style().polish(self.hint_button)
+        self.update()
+        self.hint_button.update()
+        self.hint_glyph.update()
+
+    def _extract_video_path(self, event) -> Path | None:  # noqa: ANN001
+        mime_data = event.mimeData()
+        if not mime_data.hasUrls():
+            return None
+        for url in mime_data.urls():
+            local_path = url.toLocalFile()
+            if not local_path:
+                continue
+            path = Path(local_path)
+            if not path.exists() or not path.is_file():
+                continue
+            if path.suffix.lower() in self.SUPPORTED_EXTENSIONS:
+                return path
+        return None
+
+
 class VideoPanel(QFrame):
     roiChanged = Signal()
 
@@ -2863,6 +2996,9 @@ class ContrastWindow(QMainWindow):
         self.post_panel: VideoPanel | None = None
         self.panels: list[VideoPanel] = []
         self.active_mode = MODE_SINGLE
+        self.pending_mode: str | None = None
+        self.pending_video_paths: list[Path | None] = []
+        self.video_placeholders: list[VideoDropPlaceholder] = []
 
         self.source_max_frame = 0
         self.max_frame = 0
@@ -2932,6 +3068,7 @@ class ContrastWindow(QMainWindow):
     def _set_video_panels(self, videos: list[Path], live_input: bool = False) -> None:
         if not videos:
             self._clear_video_panels()
+            self._clear_video_placeholders()
             self.active_mode = MODE_SINGLE
             self.enhancement_progress.configure_panels(["Video 1"])
             self._set_video_controls_enabled(False)
@@ -2943,6 +3080,9 @@ class ContrastWindow(QMainWindow):
             return
 
         self.pause()
+        self.pending_mode = None
+        self.pending_video_paths = []
+        self._clear_video_placeholders()
         self._clear_video_panels()
         labels = ["Pre-deployment", "Post-deployment"] if len(videos) > 1 else ["Video"]
         for index, path in enumerate(videos):
@@ -2990,34 +3130,97 @@ class ContrastWindow(QMainWindow):
                 self.rebuild_enhancement_pipeline()
 
     def _select_mode_and_videos(self, mode: str) -> bool:
-        if mode == MODE_LIVE:
-            source = self._open_video_file("Select video to loop as a live camera")
-            if source is None:
-                return False
-            self._set_video_panels([source], live_input=True)
-            self.statusBar().showMessage("Live camera simulation ready. The selected video loops continuously.")
-            return True
-        if mode == MODE_SINGLE:
-            first = self._open_video_file("Open video")
-            if first is None:
-                return False
-            self._set_video_panels([first])
-            return True
-
-        first = self._open_video_file("Open pre-deployment video")
-        if first is None:
-            return False
-        second = self._open_video_file("Open post-deployment video")
-        if second is None:
-            return False
-        self._set_video_panels([first, second])
+        self._show_video_placeholders(mode)
         return True
+
+    def _placeholder_labels(self, mode: str) -> list[str]:
+        if mode == MODE_COMPARISON:
+            return ["Pre-deployment", "Post-deployment"]
+        if mode == MODE_LIVE:
+            return ["Live camera source"]
+        return ["Video"]
+
+    def _clear_video_placeholders(self) -> None:
+        for placeholder in self.video_placeholders:
+            placeholder.close()
+            self.video_placeholder_layout.removeWidget(placeholder)
+            placeholder.setParent(None)
+        self.video_placeholders = []
+
+    def _show_video_placeholders(self, mode: str) -> None:
+        self.pause()
+        self._clear_video_panels()
+        self._clear_video_placeholders()
+
+        labels = self._placeholder_labels(mode)
+        self.pending_mode = mode
+        self.pending_video_paths = [None] * len(labels)
+        self.enhancement_progress.configure_panels(labels)
+        self.active_mode = mode
+
+        for index, label in enumerate(labels):
+            color = PANEL_COLORS[min(index, len(PANEL_COLORS) - 1)]
+            placeholder = VideoDropPlaceholder(label, color)
+            placeholder.fileDialogRequested.connect(lambda index=index: self._request_placeholder_video(index))
+            placeholder.fileDropped.connect(lambda path, index=index: self._set_placeholder_video_path(index, cast(Path, path)))
+            self.video_placeholder_layout.addWidget(placeholder)
+            self.video_placeholders.append(placeholder)
+
+        self._set_video_controls_enabled(False)
+        self._set_live_incompatible_stages_enabled(mode != MODE_LIVE)
+        self.video_stack.setCurrentWidget(self.video_placeholder_row)
+        self._sync_trimmed_video_window()
+        self._set_playback_limit(self.source_max_frame)
+        self.current_frame_index = 0
+        self.update_time_label()
+        self.statusBar().showMessage("Select a video file by dragging it into a placeholder or clicking to browse.")
+
+    def _request_placeholder_video(self, index: int) -> None:
+        if self.pending_mode is None or index < 0 or index >= len(self.pending_video_paths):
+            return
+        label = self.video_placeholders[index].label.lower()
+        title = "Select video to loop as a live camera" if self.pending_mode == MODE_LIVE else f"Open {label} video"
+        path = self._open_video_file(title)
+        if path is None:
+            return
+        self._set_placeholder_video_path(index, path)
+
+    def _set_placeholder_video_path(self, index: int, path: Path) -> None:
+        if self.pending_mode is None or index < 0 or index >= len(self.pending_video_paths):
+            return
+        self.pending_video_paths[index] = path
+        if index < len(self.video_placeholders):
+            self.video_placeholders[index].set_selected_path(path)
+
+        remaining = sum(1 for selected in self.pending_video_paths if selected is None)
+        if remaining > 0:
+            noun = "video" if remaining == 1 else "videos"
+            self.statusBar().showMessage(f"Select {remaining} more {noun} to continue.")
+            return
+
+        mode = self.pending_mode
+        videos = [selected for selected in self.pending_video_paths if selected is not None]
+        self.pending_mode = None
+        self.pending_video_paths = []
+        self._set_video_panels(cast(list[Path], videos), live_input=mode == MODE_LIVE)
+        if mode == MODE_LIVE:
+            self.statusBar().showMessage("Live camera simulation ready. The selected video loops continuously.")
+
+    def _open_slot_video(self, slot_index: int) -> None:
+        if slot_index == 0 and self.pre_panel is not None:
+            self.open_video(self.pre_panel)
+            return
+        if slot_index == 1 and self.post_panel is not None:
+            self.open_video(self.post_panel)
+            return
+        if self.pending_mode is not None:
+            self._request_placeholder_video(slot_index)
 
     def _build_actions(self) -> None:
         self.open_pre_action = QAction("Open video 1...", self)
-        self.open_pre_action.triggered.connect(lambda: self.open_video(self.pre_panel))
+        self.open_pre_action.triggered.connect(lambda: self._open_slot_video(0))
         self.open_post_action = QAction("Open video 2...", self)
-        self.open_post_action.triggered.connect(lambda: self.open_video(self.post_panel))
+        self.open_post_action.triggered.connect(lambda: self._open_slot_video(1))
         self.open_single_mode_action = QAction("Switch to single video mode...", self)
         self.open_single_mode_action.triggered.connect(lambda: self._select_mode_and_videos(MODE_SINGLE))
         self.open_comparison_mode_action = QAction("Switch to comparison mode...", self)
@@ -3141,6 +3344,11 @@ class ContrastWindow(QMainWindow):
         self.video_layout.setContentsMargins(0, 0, 0, 0)
         self.video_layout.setSpacing(14)
 
+        self.video_placeholder_row = QWidget()
+        self.video_placeholder_layout = QHBoxLayout(self.video_placeholder_row)
+        self.video_placeholder_layout.setContentsMargins(0, 0, 0, 0)
+        self.video_placeholder_layout.setSpacing(14)
+
         self.mode_selection_page = QWidget()
         self.mode_selection_page.setObjectName("modeSelectionPage")
         mode_layout = QVBoxLayout(self.mode_selection_page)
@@ -3192,6 +3400,7 @@ class ContrastWindow(QMainWindow):
 
         self.video_stack = QStackedWidget()
         self.video_stack.addWidget(self.mode_selection_page)
+        self.video_stack.addWidget(self.video_placeholder_row)
         self.video_stack.addWidget(self.video_row)
         self.video_stack.setCurrentWidget(self.mode_selection_page)
 
@@ -4321,6 +4530,12 @@ class ContrastWindow(QMainWindow):
             QFrame#modePreview { background: #0b1018; border: 1px solid #334155; border-radius: 7px; }
             QFrame#modePreviewPane { background: #159bb0; border: 1px solid #67e8f9; border-radius: 5px; }
             QLabel#modeSelectionLabel { color: #f8fafc; font-size: 16px; font-weight: 700; }
+            QFrame#videoDropPlaceholder { background: #000000; border: 1px solid #334155; border-radius: 8px; }
+            QFrame#videoDropPlaceholder[dragActive="true"] { background: #072226; border: 1px solid #2dd4bf; }
+            QPushButton#videoDropHintButton { background: #173244; border: 1px dashed #5d7991; border-radius: 10px; padding: 0; }
+            QPushButton#videoDropHintButton:hover { background: #20435b; border-color: #78b7db; }
+            QPushButton#videoDropHintButton[dragActive="true"] { background: #1a4b5f; border-color: #5eead4; }
+            QWidget#videoDropGlyph { background: transparent; }
             QSlider::groove:horizontal { height: 6px; background: #273449; border-radius: 3px; }
             QSlider::handle:horizontal { background: #67e8f9; width: 16px; margin: -5px 0; border-radius: 8px; }
             QSplitter::handle:vertical { background: #1c2637; border-top: 1px solid #334155; border-bottom: 1px solid #253044; margin: 2px 0; }
