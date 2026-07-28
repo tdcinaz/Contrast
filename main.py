@@ -1020,7 +1020,9 @@ class VideoDisplay(QLabel):
         self._right_display_rect = QRect()
 
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(620, 220)
+        # Keep height stable but allow width to compress so splitters do not
+        # force-resize neighboring drawers in dual-panel mode.
+        self.setMinimumSize(0, 220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setStyleSheet("background: #0e1116; border: 1px solid #253044; border-radius: 8px;")
@@ -2704,6 +2706,68 @@ class StageDrawer(QFrame):
         self.status_label.setVisible(True)
 
 
+class CollapsibleDrawer(QFrame):
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("pipelineDrawer")
+
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("pipelineDrawerTitle")
+
+        self.toggle_button = QToolButton()
+        self.toggle_button.setObjectName("pipelineDrawerToggle")
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.toggle_button.setArrowType(Qt.ArrowType.LeftArrow)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(True)
+        self.toggle_button.setFixedSize(32, 32)
+        self.toggle_button.setToolTip("Hide pipeline panel")
+
+        self.header = QWidget()
+        self.header.setObjectName("pipelineDrawerHeader")
+        self.header.setMinimumHeight(38)
+        header_layout = QHBoxLayout(self.header)
+        header_layout.setContentsMargins(12, 4, 12, 4)
+        header_layout.setSpacing(8)
+        header_layout.addWidget(self.title_label, 1)
+        header_layout.addWidget(self.toggle_button)
+
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(0, 10, 0, 12)
+        self.content_layout.setSpacing(10)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.header)
+        layout.addWidget(self.content)
+
+        self.toggle_button.toggled.connect(self._set_expanded)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.toggle_button.setArrowType(Qt.ArrowType.LeftArrow if expanded else Qt.ArrowType.RightArrow)
+        self.toggle_button.setToolTip("Hide pipeline panel" if expanded else "Show pipeline panel")
+        self.title_label.setVisible(expanded)
+        self.content.setVisible(expanded)
+
+    def set_expanded(self, expanded: bool) -> None:
+        if self.toggle_button.isChecked() != expanded:
+            self.toggle_button.blockSignals(True)
+            self.toggle_button.setChecked(expanded)
+            self.toggle_button.blockSignals(False)
+        self._set_expanded(expanded)
+
+    def header_height(self) -> int:
+        return self.header.sizeHint().height()
+
+    def header_width(self) -> int:
+        return self.header.sizeHint().width()
+
+    def collapsed_width(self) -> int:
+        return max(42, self.toggle_button.sizeHint().width() + 10)
+
+
 class GraphDrawer(QFrame):
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -3038,7 +3102,8 @@ class ContrastWindow(QMainWindow):
         self.frame_slider = QSlider(Qt.Orientation.Horizontal)
         self.frame_slider.setRange(0, self.max_frame)
         self.frame_slider.valueChanged.connect(self.set_frame_index)
-        self.frame_slider.setMinimumWidth(360)
+        # Keep this flexible so the main splitter can allocate more width to the pipeline drawer.
+        self.frame_slider.setMinimumWidth(180)
 
         self.frame_spin = QSpinBox()
         self.frame_spin.setRange(0, self.max_frame)
@@ -3147,15 +3212,16 @@ class ContrastWindow(QMainWindow):
 
         controls_panel = self._build_controls_panel()
         self.enhancement_progress = EnhancementProgressPanel()
-        left_column = QWidget()
-        self.pipeline_left_column = left_column
+        self.pipeline_drawer = CollapsibleDrawer("Pipeline")
+        self.pipeline_left_column = self.pipeline_drawer
         self.pipeline_controls_scroll = controls_panel
-        left_column.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
-        left_layout = QVBoxLayout(left_column)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(10)
-        left_layout.addWidget(controls_panel, 1)
-        left_layout.addWidget(self.enhancement_progress)
+        self.pipeline_drawer.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Expanding)
+        self.pipeline_drawer.setMinimumWidth(self.pipeline_drawer.collapsed_width())
+        self.pipeline_drawer.setMaximumWidth(1200)
+        self.pipeline_drawer.setMinimumHeight(0)
+        self.pipeline_drawer.content_layout.addWidget(controls_panel, 1)
+        self.pipeline_drawer.content_layout.addWidget(self.enhancement_progress)
+        self.pipeline_drawer.toggle_button.toggled.connect(self._set_pipeline_drawer_expanded)
         plot_panel = self._build_plot_panel()
 
         video_panel = QWidget()
@@ -3186,10 +3252,12 @@ class ContrastWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter = splitter
-        splitter.addWidget(left_column)
+        self._pipeline_drawer_default_width = 450
+        splitter.addWidget(self.pipeline_drawer)
         splitter.addWidget(right_column)
         splitter.setHandleWidth(8)
-        splitter.setSizes([420, 1080])
+        splitter.setCollapsible(0, False)
+        splitter.setSizes([self._pipeline_drawer_default_width, 1080])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
@@ -3201,6 +3269,7 @@ class ContrastWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
         QTimer.singleShot(0, self._collapse_graph_panel_by_default)
+        QTimer.singleShot(0, self._collapse_pipeline_panel_by_default)
         QTimer.singleShot(0, self._update_pipeline_column_width)
 
     def _build_controls_panel(self) -> QWidget:
@@ -3396,8 +3465,6 @@ class ContrastWindow(QMainWindow):
         controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
         controls_scroll.verticalScrollBar().rangeChanged.connect(self._update_pipeline_column_width)
-        for drawer in self.pipeline_stage_drawers:
-            drawer.expand_button.toggled.connect(self._update_pipeline_column_width)
         return controls_scroll
 
     def _name_stage_parameter_widgets(self) -> None:
@@ -3525,7 +3592,6 @@ class ContrastWindow(QMainWindow):
         drawer.dragMoved.connect(self._move_pipeline_stage_drag)
         drawer.dragFinished.connect(self._finish_pipeline_stage_drag)
         drawer.optionsRequested.connect(self._show_stage_options)
-        drawer.expand_button.toggled.connect(self._update_pipeline_column_width)
 
     def _copy_stage_drawer(self, source: StageDrawer) -> StageDrawer:
         drawer = StageDrawer(source.stage_key, source.stage_title, 0)
@@ -3710,19 +3776,12 @@ class ContrastWindow(QMainWindow):
             return
 
         self._sync_pipeline_scroll_gutter()
-        drawer_width = max(
-            [
-                self.source_add_stage_button.minimumSizeHint().width(),
-                self.live_add_stage_button.minimumSizeHint().width(),
-                *(drawer.minimumSizeHint().width() for drawer in self.pipeline_stage_drawers),
-            ]
-        )
-        margins = self.enhancement_layout.contentsMargins()
-        base_right = getattr(self, "_pipeline_controls_base_right_margin", margins.right())
-        reserve_width = self._pipeline_scrollbar_reserve_width()
-        required_width = drawer_width + margins.left() + base_right + reserve_width
-        self.pipeline_controls_scroll.setMinimumWidth(required_width)
-        self.pipeline_left_column.setMinimumWidth(required_width)
+        if hasattr(self, "pipeline_drawer"):
+            self.pipeline_drawer.setMinimumWidth(self.pipeline_drawer.collapsed_width())
+        if hasattr(self, "pipeline_controls_scroll"):
+            self.pipeline_controls_scroll.setMinimumWidth(0)
+        if hasattr(self, "pipeline_left_column"):
+            self.pipeline_left_column.setMinimumWidth(self.pipeline_drawer.collapsed_width() if hasattr(self, "pipeline_drawer") else 0)
 
     def _build_plot_panel(self) -> QWidget:
         plot_group = QFrame()
@@ -3757,6 +3816,41 @@ class ContrastWindow(QMainWindow):
             return
         drawer.set_expanded(False)
         splitter.setSizes([1, max(1, drawer.header_height())])
+
+    def _collapse_pipeline_panel_by_default(self) -> None:
+        drawer = getattr(self, "pipeline_drawer", None)
+        if drawer is None:
+            return
+        drawer.set_expanded(False)
+        self._set_pipeline_drawer_expanded(False)
+
+    def _set_pipeline_drawer_expanded(self, expanded: bool) -> None:
+        splitter = getattr(self, "main_splitter", None)
+        drawer = getattr(self, "pipeline_drawer", None)
+        if splitter is None or drawer is None:
+            return
+
+        sizes = splitter.sizes()
+        if len(sizes) < 2:
+            return
+        total_width = max(1, sum(sizes) or splitter.width())
+        collapsed_width = max(1, drawer.collapsed_width())
+        last_width = getattr(self, "_pipeline_drawer_last_width", 0)
+        default_expanded_width = getattr(self, "_pipeline_drawer_default_width", 600)
+        expanded_width = max(
+            default_expanded_width,
+            last_width if last_width > collapsed_width else default_expanded_width,
+        )
+        if expanded:
+            drawer.set_expanded(True)
+            target_width = max(collapsed_width + 1, min(expanded_width, max(1, total_width - 1)))
+            self._pipeline_drawer_last_width = target_width
+            splitter.setSizes([target_width, max(1, total_width - target_width)])
+        else:
+            if sizes[0] > collapsed_width:
+                self._pipeline_drawer_last_width = sizes[0]
+            drawer.set_expanded(False)
+            splitter.setSizes([collapsed_width, max(1, total_width - collapsed_width)])
 
     def _set_graph_drawer_expanded(self, expanded: bool) -> None:
         splitter = getattr(self, "graph_splitter", None)
@@ -4241,6 +4335,11 @@ class ContrastWindow(QMainWindow):
             QLabel#graphDrawerHandle { color: #9fb0c6; font-weight: 700; letter-spacing: 1px; }
             QToolButton#graphDrawerToggle { background: #1c2637; border: 1px solid #334155; border-radius: 6px; padding: 0; }
             QToolButton#graphDrawerToggle:hover { background: #263449; }
+            QFrame#pipelineDrawer { background: #0f172a; border: 1px solid #253044; border-radius: 8px; }
+            QWidget#pipelineDrawerHeader { background: #111827; border-top: 1px solid #253044; border-bottom: 1px solid #334155; }
+            QLabel#pipelineDrawerTitle { color: #f8fafc; font-size: 14px; font-weight: 700; }
+            QToolButton#pipelineDrawerToggle { background: #1c2637; border: 1px solid #334155; border-radius: 6px; padding: 0; }
+            QToolButton#pipelineDrawerToggle:hover { background: #263449; }
             QFrame#stageDrawer { background: #0f172a; border: 1px solid #273449; border-radius: 8px; }
             QToolButton#stageEnableButton, QToolButton#stageExpandButton, QToolButton#stageOptionsButton { border: 1px solid transparent; border-radius: 6px; icon-size: 16px; padding: 0; }
             QToolButton#stageEnableButton:hover, QToolButton#stageExpandButton:hover, QToolButton#stageOptionsButton:hover { background: #1c2637; border-color: #334155; }

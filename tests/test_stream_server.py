@@ -10,11 +10,51 @@ from threading import Thread
 import cv2
 import numpy as np
 
-from main import EnhancementParameters, EnhancementStages
+from main import CollapsibleDrawer, EnhancementParameters, EnhancementStages
 from stream_server import LiveStreamProcessor, StreamService, StreamSettings, create_http_server, load_stream_configuration
 
 
 class StreamServerTests(unittest.TestCase):
+    def test_pipeline_drawer_toggle_hides_content(self) -> None:
+        from PySide6.QtWidgets import QApplication, QWidget
+
+        app = QApplication.instance() or QApplication([])
+        parent = QWidget()
+        parent.show()
+        drawer = CollapsibleDrawer("Pipeline")
+        drawer.setParent(parent)
+        content = QWidget()
+        drawer.content_layout.addWidget(content)
+        drawer.show()
+
+        drawer.set_expanded(False)
+        self.assertFalse(content.isVisible())
+
+        drawer.set_expanded(True)
+        self.assertTrue(content.isVisible())
+
+        parent.close()
+        app.quit()
+
+    def test_pipeline_drawer_hides_title_when_collapsed(self) -> None:
+        from PySide6.QtWidgets import QApplication, QWidget
+
+        app = QApplication.instance() or QApplication([])
+        parent = QWidget()
+        parent.show()
+        drawer = CollapsibleDrawer("Pipeline")
+        drawer.setParent(parent)
+        drawer.show()
+
+        drawer.set_expanded(True)
+        self.assertTrue(drawer.title_label.isVisible())
+
+        drawer.set_expanded(False)
+        self.assertFalse(drawer.title_label.isVisible())
+
+        parent.close()
+        app.quit()
+
     def setUp(self) -> None:
         image = np.full((48, 64, 3), 150, dtype=np.uint8)
         ok, encoded = cv2.imencode(".jpg", image)
