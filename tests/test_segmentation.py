@@ -19,6 +19,7 @@ from main import (
     EnhancementParameters,
     EnhancementRequest,
     EnhancementStages,
+    MODE_LIVE,
     VideoPanel,
     analyze_gray_frames,
     compute_temporal_change_map,
@@ -158,6 +159,44 @@ class SegmentationTests(unittest.TestCase):
         window._reorder_pipeline_stage_by_key("auto_crop", "brightness_stabilization")
         self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
         self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization"])
+
+    def test_live_mode_disables_temporal_stages_without_precomputing_video(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+
+        class FakeLiveVideoPanel(QFrame):
+            def __init__(self, label, color, path, live_input=False):  # noqa: ANN001
+                super().__init__()
+                self.label = label
+                self.live_input = live_input
+                self.roiChanged = SimpleNamespace(connect=lambda callback: None)
+                self.info = SimpleNamespace(fps=30.0)
+                self.playback_frame_count = 1
+                self.trim_frame_count = 1
+
+            def set_comparison(self, enabled, frame_index):  # noqa: ANN001
+                pass
+
+            def seek(self, frame_index):  # noqa: ANN001
+                pass
+
+        with patch.object(main, "VideoPanel", FakeLiveVideoPanel), patch.object(
+            window, "_apply_source_pipeline_stages"
+        ) as apply_source, patch.object(window, "_render_live_frame") as render_live, patch.object(
+            window, "rebuild_enhancement_pipeline"
+        ) as rebuild:
+            window._set_video_panels([Path("camera-loop.mov")], live_input=True)
+
+        self.assertEqual(window.active_mode, MODE_LIVE)
+        self.assertTrue(window.panels[0].live_input)
+        self.assertTrue(apply_source.called)
+        self.assertTrue(render_live.called)
+        rebuild.assert_not_called()
+        for stage_key in ("temporal_alignment", "brightness_stabilization"):
+            drawer = window._stage_drawers(stage_key)[0]
+            self.assertFalse(drawer.enable_button.isEnabled())
+            self.assertFalse(drawer.enable_button.isChecked())
 
     def test_aneurysm_detection_rejects_video_without_temporal_darkening(self) -> None:
         frames = [np.full((120, 160), 175, dtype=np.uint8) for _ in range(12)]

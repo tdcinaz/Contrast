@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import cv2
 import numpy as np
+from PySide6.QtCore import QRect
 
-from main import _detect_aligned_field_crop, _detect_pillarbox_crop, detect_pre_injection_trim_start
+import main
+from main import (
+    _detect_aligned_field_crop,
+    _detect_pillarbox_crop,
+    detect_fluoroscope_crop_from_frames,
+    detect_pre_injection_trim_start,
+    VideoPanel,
+)
 
 
 class AutoCropTests(unittest.TestCase):
@@ -29,6 +40,40 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertIsNone(_detect_aligned_field_crop(frames))
         self.assertEqual(_detect_pillarbox_crop(frames, 400, 200).getRect(), (78, 0, 244, 200))
+
+    def test_detects_one_fixed_crop_from_live_camera_samples(self) -> None:
+        frames: list[np.ndarray] = []
+        for level in (150, 155, 160, 165, 170, 175):
+            frame = np.zeros((240, 400), dtype=np.uint8)
+            cv2.circle(frame, (200, 120), 110, level, thickness=-1)
+            frames.append(frame)
+
+        crop = detect_fluoroscope_crop_from_frames(frames, 400, 240)
+
+        self.assertEqual(crop.getRect(), (120, 40, 160, 160))
+
+    def test_live_source_caches_one_crop_and_disables_temporal_alignment(self) -> None:
+        class LiveSource:
+            _full_frame_rect = VideoPanel._full_frame_rect
+
+            def __init__(self) -> None:
+                self.path = Path("camera-loop.mov")
+                self.info = SimpleNamespace(width=400, height=240)
+                self.live_input = True
+                self._auto_crop_rect_cache = None
+                self._trim_start_cache = {}
+
+        source = LiveSource()
+        expected_crop = QRect(120, 40, 160, 160)
+        with patch.object(main, "detect_fluoroscope_crop", return_value=expected_crop) as detect_crop:
+            first = VideoPanel.calculate_source_pipeline(source, True, True)
+            second = VideoPanel.calculate_source_pipeline(source, True, True)
+
+        self.assertEqual(first.crop_rect.getRect(), expected_crop.getRect())
+        self.assertEqual(second.crop_rect.getRect(), expected_crop.getRect())
+        self.assertEqual(first.configuration, (True, False))
+        self.assertEqual(second.configuration, (True, False))
+        detect_crop.assert_called_once()
 
     def test_detects_trim_start_half_second_before_contrast_onset(self) -> None:
         frames: list[np.ndarray] = []

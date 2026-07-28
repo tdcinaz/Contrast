@@ -60,6 +60,7 @@ STREAM_END = object()
 PANEL_COLORS = [QColor("#38bdf8"), QColor("#f97316")]
 MODE_SINGLE = "single"
 MODE_COMPARISON = "comparison"
+MODE_LIVE = "live"
 
 
 class ModeSelectionButton(QPushButton):
@@ -493,6 +494,16 @@ def _detect_pillarbox_crop(gray_frames: list[np.ndarray], width: int, height: in
     return QRect(left, 0, cropped_width, height)
 
 
+def detect_fluoroscope_crop_from_frames(
+    gray_frames: list[np.ndarray],
+    width: int,
+    height: int,
+) -> QRect:
+    if len(gray_frames) < 3:
+        return QRect(0, 0, width, height)
+    return _detect_aligned_field_crop(gray_frames) or _detect_pillarbox_crop(gray_frames, width, height)
+
+
 def detect_fluoroscope_crop(
     path: Path,
     info: VideoInfo,
@@ -519,13 +530,7 @@ def detect_fluoroscope_crop(
             if progress_callback is not None and not progress_callback(sample_index + 1, len(frame_indexes)):
                 return full_frame
 
-        if len(gray_frames) < 3:
-            return full_frame
-        return _detect_aligned_field_crop(gray_frames) or _detect_pillarbox_crop(
-            gray_frames,
-            info.width,
-            info.height,
-        )
+        return detect_fluoroscope_crop_from_frames(gray_frames, info.width, info.height)
     finally:
         capture.release()
 
@@ -1212,11 +1217,19 @@ class VideoDisplay(QLabel):
 class VideoPanel(QFrame):
     roiChanged = Signal()
 
-    def __init__(self, label: str, color: QColor, path: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        label: str,
+        color: QColor,
+        path: Path,
+        parent: QWidget | None = None,
+        live_input: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.label = label
         self.color = color
         self.path = path
+        self.live_input = live_input
         self.info = probe_video(path)
         self.crop_rect = QRect(0, 0, self.info.width, self.info.height)
         self._auto_crop_rect_cache: QRect | None = None
@@ -1281,6 +1294,7 @@ class VideoPanel(QFrame):
         temporal_alignment_enabled: bool,
         progress_callback: Callable[[str, float, float], bool] | None = None,
     ) -> SourcePipelineState:
+        temporal_alignment_enabled = temporal_alignment_enabled and not self.live_input
         full_rect = self._full_frame_rect()
         next_crop_rect = full_rect
         source_stage_count = int(auto_crop_enabled) + int(temporal_alignment_enabled)
@@ -1301,6 +1315,8 @@ class VideoPanel(QFrame):
                     self.info,
                     lambda done, total: report("Auto-cropping", done, total),
                 )
+                if self.live_input:
+                    self._auto_crop_rect_cache = QRect(auto_crop_rect)
             next_crop_rect = QRect(auto_crop_rect)
             report("Auto-cropping", 1.0, 1.0)
             completed_stages += 1
@@ -2205,9 +2221,10 @@ class VideoPanel(QFrame):
         crop_width = self.crop_rect.width()
         crop_height = self.crop_rect.height()
         trimmed_duration = self.playback_duration
+        source_suffix = " | looping live input" if self.live_input else f" | {trimmed_duration:.1f} s trimmed"
         if crop_width != self.info.width or crop_height != self.info.height:
-            return f"{crop_width}x{crop_height} (auto-cropped) | {self.info.fps:.1f} fps | {trimmed_duration:.1f} s trimmed"
-        return f"{self.info.width}x{self.info.height} | {self.info.fps:.1f} fps | {trimmed_duration:.1f} s trimmed"
+            return f"{crop_width}x{crop_height} (auto-cropped) | {self.info.fps:.1f} fps{source_suffix}"
+        return f"{self.info.width}x{self.info.height} | {self.info.fps:.1f} fps{source_suffix}"
 
     def _display_frame(self, frame: np.ndarray, apply_enhancement: bool | None = None) -> None:
         self.current_frame = frame
@@ -2231,13 +2248,54 @@ class VideoPanel(QFrame):
         self.display.set_frames(frame, enhanced_frame)
 
     def read_next(self, playback: bool = False) -> bool:
-        if self.current_frame_index >= self.playback_frame_count - 1:
+        if not self.live_input and self.current_frame_index >= self.playback_frame_count - 1:
             return False
         ok, frame = self.capture.read()
+        if not ok and self.live_input:
+            self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self.capture.read()
         if ok:
             self.current_frame_index += 1
             self._display_frame(crop_frame(frame, self.crop_rect), apply_enhancement=self.enhance_display)
         return ok
+
+    def apply_live_enhancement(
+        self,
+        stages: EnhancementStages,
+        default_parameters: EnhancementParameters,
+        denoiser: FrameDenoiser | None = None,
+        noise_sigma: int = 10,
+    ) -> None:
+        if not self.live_input or self.current_frame is None:
+            return
+        source = self.current_frame
+        enhanced: np.ndarray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+        segmentation_mask: np.ndarray | None = None
+        for stage in stages.enabled_stage_instances(default_parameters):
+            parameters = stage.parameters or default_parameters
+            if stage.key in {"temporal_filter", "brightness_stabilization", "roi_extraction"}:
+                continue
+            if stage.key == "segmentation":
+                if parameters.segmentation_mode == "dark_contrast":
+                    segmentation_mask = segment_dark_contrast(
+                        np.clip(enhanced, 0, 255).astype(np.uint8),
+                        parameters.segmentation_block_size,
+                        parameters.segmentation_sensitivity,
+                        parameters.segmentation_level_tolerance,
+                        parameters.segmentation_min_area,
+                    )
+                continue
+            if stage.key == "denoise" and denoiser is not None:
+                result = denoiser.denoise_batch([np.clip(enhanced, 0, 255).astype(np.uint8)], stage.noise_sigma or noise_sigma)
+                if result:
+                    enhanced = result[0]
+                continue
+            enhanced = self._apply_frame_stage(stage.key, enhanced, parameters)
+
+        output = cv2.cvtColor(np.clip(enhanced, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        if segmentation_mask is not None and self.segmentation_overlay_display:
+            output = overlay_segmentation_mask(output, segmentation_mask)
+        self.display.set_frames(source, output)
 
     def seek(self, frame_index: int) -> bool:
         frame_index = max(0, min(frame_index, self.playback_frame_count - 1))
@@ -2760,14 +2818,33 @@ class ContrastWindow(QMainWindow):
         QTimer.singleShot(0, self.prompt_load_most_recent_config)
 
     def _set_video_controls_enabled(self, enabled: bool) -> None:
+        live_input = self.active_mode == MODE_LIVE
         self.play_button.setEnabled(enabled)
-        self.frame_slider.setEnabled(enabled)
-        self.frame_spin.setEnabled(enabled)
+        self.frame_slider.setEnabled(enabled and not live_input)
+        self.frame_spin.setEnabled(enabled and not live_input)
         self.speed_slider.setEnabled(enabled)
         self.compare_view_check.setEnabled(enabled)
         self.overlay_mask_check.setEnabled(enabled and self._has_enabled_stage("segmentation"))
         self.open_pre_action.setEnabled(enabled and bool(self.pre_panel))
         self.open_post_action.setEnabled(enabled and bool(self.post_panel))
+
+    def _set_live_incompatible_stages_enabled(self, enabled: bool) -> None:
+        for stage_key in (
+            "temporal_alignment",
+            "brightness_stabilization",
+            "roi_extraction",
+            "temporal_filter",
+            "roi_residence_analysis",
+        ):
+            for drawer in self._stage_drawers(stage_key):
+                if not enabled:
+                    drawer.enable_button.blockSignals(True)
+                    drawer.enable_button.setChecked(False)
+                    drawer.enable_button.blockSignals(False)
+                    drawer.enable_button.setToolTip("Unavailable for live camera input")
+                else:
+                    drawer.enable_button.setToolTip("Enable stage")
+                drawer.enable_button.setEnabled(enabled)
 
     def _open_video_file(self, title: str) -> Path | None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2787,7 +2864,7 @@ class ContrastWindow(QMainWindow):
         self.pre_panel = None
         self.post_panel = None
 
-    def _set_video_panels(self, videos: list[Path]) -> None:
+    def _set_video_panels(self, videos: list[Path], live_input: bool = False) -> None:
         if not videos:
             self._clear_video_panels()
             self.active_mode = MODE_SINGLE
@@ -2805,13 +2882,17 @@ class ContrastWindow(QMainWindow):
         labels = ["Pre-deployment", "Post-deployment"] if len(videos) > 1 else ["Video"]
         for index, path in enumerate(videos):
             color = PANEL_COLORS[min(index, len(PANEL_COLORS) - 1)]
-            panel = VideoPanel(labels[index], color, path)
+            panel = (
+                VideoPanel(labels[index], color, path, live_input=True)
+                if live_input
+                else VideoPanel(labels[index], color, path)
+            )
             panel.roiChanged.connect(self.on_roi_changed)
             self.video_layout.addWidget(panel)
             self.panels.append(panel)
         self.pre_panel = self.panels[0] if self.panels else None
         self.post_panel = self.panels[1] if len(self.panels) > 1 else None
-        self.active_mode = MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE
+        self.active_mode = MODE_LIVE if live_input else (MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE)
         self.open_pre_action.setText(f"Open {self.pre_panel.label.lower()} video..." if self.pre_panel else "Open video 1...")
         self.open_post_action.setText(f"Open {self.post_panel.label.lower()} video..." if self.post_panel else "Open video 2...")
         self.compare_view_check.setEnabled(True)
@@ -2825,6 +2906,9 @@ class ContrastWindow(QMainWindow):
         self.clear_plots_and_metrics()
         self._update_stage_statuses()
         self._set_video_controls_enabled(True)
+        self._set_live_incompatible_stages_enabled(not live_input)
+        if live_input:
+            self._apply_source_pipeline_stages()
         self.on_compare_view_toggled(self.compare_view_check.isChecked())
         if len(self.panels) == 1:
             self.pre_card.title.setText("Residence")
@@ -2835,9 +2919,19 @@ class ContrastWindow(QMainWindow):
             self.post_card.title.setText("Post residence")
             self.delta_card.title.setText("Difference")
         if not self._loading_config and self._pipeline_has_active_stage():
-            self.rebuild_enhancement_pipeline()
+            if live_input:
+                self._render_live_frame()
+            else:
+                self.rebuild_enhancement_pipeline()
 
     def _select_mode_and_videos(self, mode: str) -> bool:
+        if mode == MODE_LIVE:
+            source = self._open_video_file("Select video to loop as a live camera")
+            if source is None:
+                return False
+            self._set_video_panels([source], live_input=True)
+            self.statusBar().showMessage("Live camera simulation ready. The selected video loops continuously.")
+            return True
         if mode == MODE_SINGLE:
             first = self._open_video_file("Open video")
             if first is None:
@@ -2863,6 +2957,8 @@ class ContrastWindow(QMainWindow):
         self.open_single_mode_action.triggered.connect(lambda: self._select_mode_and_videos(MODE_SINGLE))
         self.open_comparison_mode_action = QAction("Switch to comparison mode...", self)
         self.open_comparison_mode_action.triggered.connect(lambda: self._select_mode_and_videos(MODE_COMPARISON))
+        self.open_live_mode_action = QAction("Switch to live camera mode...", self)
+        self.open_live_mode_action.triggered.connect(lambda: self._select_mode_and_videos(MODE_LIVE))
         self.save_config_action = QAction("Save configuration...", self)
         self.save_config_action.triggered.connect(self.save_config)
         self.load_config_action = QAction("Load configuration...", self)
@@ -2877,6 +2973,7 @@ class ContrastWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.open_single_mode_action)
         file_menu.addAction(self.open_comparison_mode_action)
+        file_menu.addAction(self.open_live_mode_action)
         file_menu.addSeparator()
         file_menu.addAction(self.save_config_action)
         file_menu.addAction(self.load_config_action)
@@ -3012,10 +3109,13 @@ class ContrastWindow(QMainWindow):
 
         self.comparison_mode_button = ModeSelectionButton("Comparison", MODE_COMPARISON)
         self.comparison_mode_button.clicked.connect(lambda: self._select_mode_and_videos(MODE_COMPARISON))
+        self.live_mode_button = ModeSelectionButton("Live camera", MODE_SINGLE)
+        self.live_mode_button.clicked.connect(lambda: self._select_mode_and_videos(MODE_LIVE))
 
         mode_buttons_layout.addStretch()
         mode_buttons_layout.addWidget(self.single_mode_button)
         mode_buttons_layout.addWidget(self.comparison_mode_button)
+        mode_buttons_layout.addWidget(self.live_mode_button)
         mode_buttons_layout.addStretch()
 
         mode_panel_layout.addWidget(mode_context_label)
@@ -3447,6 +3547,15 @@ class ContrastWindow(QMainWindow):
             if pipeline == "source"
             else tuple(key for key in self.stage_drawer_templates if key not in {"auto_crop", "temporal_alignment"})
         )
+        if self.active_mode == MODE_LIVE:
+            unavailable = {
+                "temporal_alignment",
+                "brightness_stabilization",
+                "roi_extraction",
+                "temporal_filter",
+                "roi_residence_analysis",
+            }
+            stage_keys = tuple(key for key in stage_keys if key not in unavailable)
         for key in stage_keys:
             drawer = self.stage_drawer_templates[key]
             action = menu.addAction(drawer.stage_title)
@@ -4219,7 +4328,7 @@ class ContrastWindow(QMainWindow):
         self.timer.stop()
         self.play_button.setText("")
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        if self.panels and any(panel.enhance_display for panel in self.panels):
+        if self.active_mode != MODE_LIVE and self.panels and any(panel.enhance_display for panel in self.panels):
             for panel in self.panels:
                 panel.seek(self.current_frame_index)
 
@@ -4227,7 +4336,8 @@ class ContrastWindow(QMainWindow):
         if not self.panels:
             self.pause()
             return
-        if self.current_frame_index >= self.max_frame:
+        live_input = self.active_mode == MODE_LIVE
+        if not live_input and self.current_frame_index >= self.max_frame:
             if self._enhancement_future is not None:
                 return
             self.pause()
@@ -4237,6 +4347,8 @@ class ContrastWindow(QMainWindow):
             self.pause()
             return
         self.current_frame_index = next_frame_index
+        if live_input:
+            self._render_live_frame()
         for widget in [self.frame_slider, self.frame_spin]:
             if widget.value() != next_frame_index:
                 widget.blockSignals(True)
@@ -4284,6 +4396,9 @@ class ContrastWindow(QMainWindow):
         self.update_time_label()
 
     def update_time_label(self) -> None:
+        if self.active_mode == MODE_LIVE:
+            self.time_label.setText(f"LIVE | {self.current_frame_index / self.fps:05.2f} s")
+            return
         current_time = self.current_frame_index / self.fps if self.fps else 0.0
         total_time = self.max_frame / self.fps if self.fps else 0.0
         self.time_label.setText(f"{current_time:05.2f} s / {total_time:05.2f} s")
@@ -4383,9 +4498,51 @@ class ContrastWindow(QMainWindow):
     def set_display_enhancement(self, enabled: bool) -> None:
         if not self.panels:
             return
+        if self.active_mode == MODE_LIVE:
+            self._render_live_frame()
+            self.statusBar().showMessage("Live enhancement enabled.")
+            return
         for panel in self.panels:
             panel.set_enhancement(enabled, self.current_frame_index)
         self.statusBar().showMessage("Video enhancement enabled." if enabled else "Video enhancement disabled.")
+
+    def _render_live_frame(self) -> None:
+        if self.active_mode != MODE_LIVE:
+            return
+        stages = self.enhancement_stages()
+        parameters = self.enhancement_parameters()
+        denoiser = self._live_denoiser_for(stages)
+        for panel in self.panels:
+            panel.apply_live_enhancement(stages, parameters, denoiser, self.denoise_strength_spin.value())
+
+    def _live_denoiser_for(self, stages: EnhancementStages) -> FrameDenoiser | None:
+        mode = str(self.enhancement_mode_combo.currentData())
+        if not stages.denoise or mode == "classical":
+            return None
+        key = self._denoiser_key(mode)
+        denoiser = self.deep_denoisers.get(key)
+        if denoiser is not None:
+            return denoiser
+        if mode.endswith("-ngc"):
+            from container_denoiser import ContainerDenoiser
+
+            model_name = mode.removesuffix("-ngc")
+            weights_name = "ffdnet_gray.pth" if model_name == "ffdnet" else f"{model_name.replace('-', '_')}.pth"
+            denoiser = ContainerDenoiser(
+                model_name,
+                ROOT / "models" / weights_name,
+                self.inference_batch_spin.value(),
+                str(self.inference_precision_combo.currentData()),
+            )
+        else:
+            from deep_denoiser import FFDNetDenoiser
+
+            denoiser = FFDNetDenoiser(
+                ROOT / "models" / "ffdnet_gray.pth",
+                str(self.inference_precision_combo.currentData()),
+            )
+        self.deep_denoisers[key] = denoiser
+        return denoiser
 
     def on_compare_view_toggled(self, enabled: bool) -> None:
         for panel in self.panels:
@@ -4417,7 +4574,9 @@ class ContrastWindow(QMainWindow):
         self._sync_parameter_slider_enabled(self.inference_batch_spin)
         self.inference_precision_combo.setEnabled(use_deep_model)
         self._sync_active_denoise_controls()
-        if self._pipeline_has_active_stage():
+        if self.active_mode == MODE_LIVE:
+            self._render_live_frame()
+        elif self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
         else:
             self._stop_enhancement_preview()
@@ -4663,7 +4822,10 @@ class ContrastWindow(QMainWindow):
         self.inference_batch_spin.setEnabled(use_deep_model)
         self.inference_precision_combo.setEnabled(use_deep_model)
         self._sync_active_denoise_controls()
-        if self._pipeline_has_active_stage():
+        if self.active_mode == MODE_LIVE:
+            self._apply_source_pipeline_stages()
+            self._render_live_frame()
+        elif self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
         else:
             self._stop_enhancement_preview()
@@ -4686,6 +4848,10 @@ class ContrastWindow(QMainWindow):
         return f"{mode}:{precision}:batch{batch_size}"
 
     def rebuild_enhancement_pipeline(self) -> None:
+        if self.active_mode == MODE_LIVE:
+            self._apply_source_pipeline_stages()
+            self._render_live_frame()
+            return
         mode = str(self.enhancement_mode_combo.currentData())
         auto_crop = self._has_enabled_stage("auto_crop")
         temporal_alignment = self._has_enabled_stage("temporal_alignment")
@@ -5227,7 +5393,7 @@ class ContrastWindow(QMainWindow):
         return values
 
     def _config_data(self) -> dict[str, object]:
-        mode = MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE
+        mode = self.active_mode if self.panels else MODE_SINGLE
         return {
             "version": CONFIG_VERSION,
             "videos": {
@@ -5294,6 +5460,11 @@ class ContrastWindow(QMainWindow):
 
         if len(video_paths) not in (0, 1, 2):
             raise ValueError("Configuration must include zero, one, or two videos.")
+        configured_mode = videos.get("mode", MODE_COMPARISON if len(video_paths) > 1 else MODE_SINGLE)
+        if configured_mode not in {MODE_SINGLE, MODE_COMPARISON, MODE_LIVE}:
+            raise ValueError("Configuration contains an unknown video mode.")
+        if configured_mode == MODE_LIVE and len(video_paths) != 1:
+            raise ValueError("Live camera mode requires exactly one looping video source.")
         missing = [str(path) for path in video_paths if not path.is_file()]
         if missing:
             raise ValueError("Configured video files are unavailable: " + ", ".join(missing))
@@ -5374,7 +5545,8 @@ class ContrastWindow(QMainWindow):
         self.pause()
         self._loading_config = True
         try:
-            self._set_video_panels(video_paths)
+            videos = cast(dict[str, object], config["videos"])
+            self._set_video_panels(video_paths, live_input=videos.get("mode") == MODE_LIVE)
             for drawer in self.pipeline_stage_drawers:
                 self._pipeline_layout_for(drawer).removeWidget(drawer)
                 drawer.hide()
@@ -5408,6 +5580,7 @@ class ContrastWindow(QMainWindow):
 
             self._sync_pipeline_stage_lists()
             self._refresh_pipeline_stage_ui()
+            self._set_live_incompatible_stages_enabled(self.active_mode != MODE_LIVE)
             self._sync_active_denoise_controls()
             self._sync_trimmed_video_window()
             frame_index = view.get("frame_index", 0) if isinstance(view, dict) else 0

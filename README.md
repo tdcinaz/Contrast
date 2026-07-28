@@ -16,6 +16,8 @@ The app loads these videos by default when they are present in the project folde
 
 Use the **File** menu to choose different videos if needed.
 
+For live fluoroscope enhancement, choose **File > Switch to live camera mode** and select a video to use as a looping camera simulation. The source crop is measured once from that stream and retained for every live frame. Sequence-dependent stages, including temporal alignment and motion-aware temporal filtering, are unavailable in this mode; the remaining compatible stages are applied directly to each incoming frame.
+
 ## Workflow
 
 1. Enable live processing stages in order. The default stage order now places **Aneurysm ROI extraction** second, immediately after gain / brightness stabilization.
