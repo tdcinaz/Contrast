@@ -71,16 +71,18 @@ class ModeSelectionButton(QPushButton):
         super().__init__()
         self.setText("")
         self.setObjectName("modeSelectionButton")
-        self.setFixedSize(210, 164)
+        self.setFixedSize(196, 196)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setCheckable(False)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 16)
-        layout.setSpacing(14)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
 
         preview = QFrame(self)
         preview.setObjectName("modePreview")
+        if preview_mode in (MODE_RECENT, MODE_SELECT):
+            preview.setProperty("actionPreview", True)
         preview.setFixedSize(142, 82)
         preview_layout = QHBoxLayout(preview)
         preview_layout.setContentsMargins(8, 8, 8, 8)
@@ -108,8 +110,10 @@ class ModeSelectionButton(QPushButton):
         label_widget = QLabel(label)
         label_widget.setObjectName("modeSelectionLabel")
         label_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch()
         layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(label_widget, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch()
 
     def _build_recent_icon_preview(self, preview_layout: QHBoxLayout) -> None:
         icon_canvas = ModeActionGlyph("recent", self)
@@ -138,7 +142,7 @@ class ModeActionGlyph(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        accent = QColor("#67e8f9")
+        accent = QColor("#0b1018")
         pen = QPen(accent, 3.6)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -4676,6 +4680,7 @@ class ContrastWindow(QMainWindow):
             QPushButton#modeSelectionButton:hover { background: #202d40; border-color: #5eead4; }
             QPushButton#modeSelectionButton:pressed { background: #0f172a; border-color: #14b8a6; }
             QFrame#modePreview { background: #0b1018; border: 1px solid #334155; border-radius: 7px; }
+            QFrame#modePreview[actionPreview="true"] { background: #159bb0; }
             QFrame#modePreviewPane { background: #159bb0; border: 1px solid #67e8f9; border-radius: 5px; }
             QWidget#modeActionGlyph { background: transparent; border: none; }
             QLabel#modeSelectionLabel { color: #f8fafc; font-size: 16px; font-weight: 700; }
