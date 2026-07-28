@@ -62,6 +62,8 @@ PANEL_COLORS = [QColor("#38bdf8"), QColor("#f97316")]
 MODE_SINGLE = "single"
 MODE_COMPARISON = "comparison"
 MODE_LIVE = "live"
+MODE_RECENT = "recent"
+MODE_SELECT = "select"
 
 
 class ModeSelectionButton(QPushButton):
@@ -89,7 +91,7 @@ class ModeSelectionButton(QPushButton):
             panel.setObjectName("modePreviewPane")
             panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             preview_layout.addWidget(panel)
-        else:
+        elif preview_mode == MODE_COMPARISON:
             left_panel = QFrame(preview)
             left_panel.setObjectName("modePreviewPane")
             left_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -98,12 +100,66 @@ class ModeSelectionButton(QPushButton):
             right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             preview_layout.addWidget(left_panel)
             preview_layout.addWidget(right_panel)
+        elif preview_mode == MODE_RECENT:
+            self._build_recent_icon_preview(preview_layout)
+        else:
+            self._build_select_icon_preview(preview_layout)
 
         label_widget = QLabel(label)
         label_widget.setObjectName("modeSelectionLabel")
         label_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(label_widget, 0, Qt.AlignmentFlag.AlignCenter)
+
+    def _build_recent_icon_preview(self, preview_layout: QHBoxLayout) -> None:
+        icon_canvas = ModeActionGlyph("recent", self)
+
+        preview_layout.addStretch()
+        preview_layout.addWidget(icon_canvas)
+        preview_layout.addStretch()
+
+    def _build_select_icon_preview(self, preview_layout: QHBoxLayout) -> None:
+        icon_canvas = ModeActionGlyph("select", self)
+
+        preview_layout.addStretch()
+        preview_layout.addWidget(icon_canvas)
+        preview_layout.addStretch()
+
+
+class ModeActionGlyph(QWidget):
+    def __init__(self, kind: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._kind = kind
+        self.setObjectName("modeActionGlyph")
+        self.setFixedSize(88, 56)
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        accent = QColor("#67e8f9")
+        pen = QPen(accent, 3.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        if self._kind == "recent":
+            # Simple CCW rewind-style arrow.
+            arc_rect = QRectF(24, 10, 38, 38)
+            painter.drawArc(arc_rect, 210 * 16, 300 * 16)
+            arrow = QPolygon([QPoint(20, 27), QPoint(23, 15), QPoint(34, 21)])
+            painter.setBrush(accent)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(arrow)
+            return
+
+        # Simple folder shape.
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(accent)
+        painter.drawRoundedRect(QRectF(17, 17, 54, 32), 4, 4)
+        painter.drawRoundedRect(QRectF(23, 9, 22, 11), 3, 3)
 
 
 @contextmanager
@@ -3021,7 +3077,6 @@ class ContrastWindow(QMainWindow):
         self.update_time_label()
         self._update_stage_statuses()
         self._set_video_controls_enabled(False)
-        QTimer.singleShot(0, self.prompt_load_most_recent_config)
 
     def _set_video_controls_enabled(self, enabled: bool) -> None:
         live_input = self.active_mode == MODE_LIVE
@@ -3423,25 +3478,21 @@ class ContrastWindow(QMainWindow):
 
         mode_panel = QFrame()
         mode_panel.setObjectName("modeSelectionPanel")
-        mode_panel.setMinimumSize(600, 350)
+        mode_panel.setMinimumSize(720, 560)
         mode_panel.setMaximumWidth(720)
         mode_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         mode_panel_layout = QVBoxLayout(mode_panel)
-        mode_panel_layout.setContentsMargins(40, 34, 40, 40)
-        mode_panel_layout.setSpacing(10)
+        mode_panel_layout.setContentsMargins(40, 30, 40, 30)
+        mode_panel_layout.setSpacing(14)
 
-        mode_context_label = QLabel("STUDY SETUP")
-        mode_context_label.setObjectName("modeSelectionContext")
-        mode_context_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        mode_title = QLabel("Choose a video workspace")
-        mode_title.setObjectName("modeSelectionTitle")
-        mode_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mode_setup_label = QLabel("Setup study")
+        mode_setup_label.setObjectName("modeSelectionSectionTitle")
+        mode_setup_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         mode_buttons_row = QWidget()
         mode_buttons_row.setObjectName("modeSelectionButtons")
         mode_buttons_layout = QHBoxLayout(mode_buttons_row)
-        mode_buttons_layout.setContentsMargins(0, 20, 0, 0)
+        mode_buttons_layout.setContentsMargins(0, 0, 0, 0)
         mode_buttons_layout.setSpacing(20)
 
         self.single_mode_button = ModeSelectionButton("Single video", MODE_SINGLE)
@@ -3458,9 +3509,39 @@ class ContrastWindow(QMainWindow):
         mode_buttons_layout.addWidget(self.live_mode_button)
         mode_buttons_layout.addStretch()
 
-        mode_panel_layout.addWidget(mode_context_label)
-        mode_panel_layout.addWidget(mode_title)
+        mode_separator = QFrame()
+        mode_separator.setObjectName("modeSelectionSeparator")
+        mode_separator.setFrameShape(QFrame.Shape.HLine)
+        mode_separator.setFrameShadow(QFrame.Shadow.Plain)
+
+        mode_load_label = QLabel("Load study")
+        mode_load_label.setObjectName("modeSelectionSectionTitle")
+        mode_load_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        mode_config_row = QWidget()
+        mode_config_row.setObjectName("modeSelectionConfigActions")
+        mode_config_layout = QHBoxLayout(mode_config_row)
+        mode_config_layout.setContentsMargins(0, 0, 0, 0)
+        mode_config_layout.setSpacing(20)
+
+        self.load_recent_mode_button = ModeSelectionButton("Recent", MODE_RECENT)
+        self.load_recent_mode_button.clicked.connect(self.load_most_recent_config)
+
+        self.select_config_mode_button = ModeSelectionButton("Select", MODE_SELECT)
+        self.select_config_mode_button.clicked.connect(self.load_config)
+
+        mode_config_layout.addStretch()
+        mode_config_layout.addWidget(self.load_recent_mode_button)
+        mode_config_layout.addWidget(self.select_config_mode_button)
+        mode_config_layout.addStretch()
+
+        mode_panel_layout.addWidget(mode_setup_label)
         mode_panel_layout.addWidget(mode_buttons_row)
+        mode_panel_layout.addStretch(1)
+        mode_panel_layout.addWidget(mode_separator)
+        mode_panel_layout.addWidget(mode_load_label)
+        mode_panel_layout.addWidget(mode_config_row)
+        mode_panel_layout.addStretch(1)
         mode_layout.addWidget(mode_panel, 0, Qt.AlignmentFlag.AlignCenter)
         mode_layout.addStretch()
 
@@ -3469,6 +3550,7 @@ class ContrastWindow(QMainWindow):
         self.video_stack.addWidget(self.video_placeholder_row)
         self.video_stack.addWidget(self.video_row)
         self.video_stack.setCurrentWidget(self.mode_selection_page)
+        self._update_mode_selection_config_actions()
 
         playback_row = QWidget()
         playback_layout = QHBoxLayout(playback_row)
@@ -4587,14 +4669,15 @@ class ContrastWindow(QMainWindow):
             QPushButton#primaryButton:hover { background: #0d9488; }
             QWidget#modeSelectionPage { background: #0d131d; }
             QFrame#modeSelectionPanel { background: #111827; border: 1px solid #334155; border-radius: 8px; }
-            QFrame#modeSelectionPanel QLabel, QWidget#modeSelectionButtons { background: transparent; border: none; }
-            QLabel#modeSelectionContext { color: #5eead4; font-size: 11px; font-weight: 700; }
-            QLabel#modeSelectionTitle { color: #f8fafc; font-size: 24px; font-weight: 700; }
+            QFrame#modeSelectionPanel QLabel, QWidget#modeSelectionButtons, QWidget#modeSelectionConfigActions { background: transparent; border: none; }
+            QLabel#modeSelectionSectionTitle { color: #f8fafc; font-size: 18px; font-weight: 700; letter-spacing: 0.2px; }
+            QFrame#modeSelectionSeparator { color: #334155; min-height: 1px; max-height: 1px; }
             QPushButton#modeSelectionButton { background: #182233; border: 1px solid #334155; border-radius: 8px; color: #e5edf6; padding: 0; }
             QPushButton#modeSelectionButton:hover { background: #202d40; border-color: #5eead4; }
             QPushButton#modeSelectionButton:pressed { background: #0f172a; border-color: #14b8a6; }
             QFrame#modePreview { background: #0b1018; border: 1px solid #334155; border-radius: 7px; }
             QFrame#modePreviewPane { background: #159bb0; border: 1px solid #67e8f9; border-radius: 5px; }
+            QWidget#modeActionGlyph { background: transparent; border: none; }
             QLabel#modeSelectionLabel { color: #f8fafc; font-size: 16px; font-weight: 700; }
             QFrame#videoDropPlaceholder { background: #000000; border: 1px solid #334155; border-radius: 8px; }
             QFrame#videoDropPlaceholder[dragActive="true"] { background: #072226; border: 1px solid #2dd4bf; }
@@ -5876,6 +5959,12 @@ class ContrastWindow(QMainWindow):
         configs = [path for path in CONFIG_DIRECTORY.glob("*.json") if path != RECENT_CONFIG_FILE]
         return max(configs, key=lambda path: path.stat().st_mtime, default=None)
 
+    def _update_mode_selection_config_actions(self) -> None:
+        recent_path = self._most_recent_config_path()
+        self.load_recent_mode_button.setEnabled(recent_path is not None)
+        tooltip = f"Load {recent_path.name}" if recent_path is not None else "No recent configuration available"
+        self.load_recent_mode_button.setToolTip(tooltip)
+
     def save_config(self) -> None:
         if not self.panels:
             self.statusBar().showMessage("Load video files before saving a configuration.")
@@ -5893,6 +5982,7 @@ class ContrastWindow(QMainWindow):
         try:
             config_path.write_text(json.dumps(self._config_data(), indent=2, sort_keys=True) + "\n")
             self._remember_recent_config(config_path)
+            self._update_mode_selection_config_actions()
         except OSError as exc:
             QMessageBox.critical(self, "Could not save configuration", str(exc))
             return
@@ -5909,12 +5999,21 @@ class ContrastWindow(QMainWindow):
         if path:
             self._load_config_file(Path(path))
 
+    def load_most_recent_config(self) -> None:
+        path = self._most_recent_config_path()
+        if path is None:
+            self.statusBar().showMessage("No recent configuration found.")
+            self._update_mode_selection_config_actions()
+            return
+        self._load_config_file(path)
+
     def _load_config_file(self, path: Path, show_error: bool = True) -> bool:
         try:
             config = json.loads(path.read_text())
             config, video_paths = self._validate_config_data(config)
             self._apply_config(config, video_paths)
             self._remember_recent_config(path)
+            self._update_mode_selection_config_actions()
         except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
             if show_error:
                 QMessageBox.critical(self, "Could not load configuration", str(exc))
@@ -5971,23 +6070,6 @@ class ContrastWindow(QMainWindow):
         self.results.clear()
         self.clear_plots_and_metrics()
         self.on_pipeline_stages_changed()
-
-    def prompt_load_most_recent_config(self) -> None:
-        path = self._most_recent_config_path()
-        if path is None:
-            self.video_stack.setCurrentWidget(self.mode_selection_page)
-            return
-        answer = QMessageBox.question(
-            self,
-            "Load recent configuration",
-            f"Load the most recent configuration?\n{path.name}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            if self._load_config_file(path):
-                return
-        self.video_stack.setCurrentWidget(self.mode_selection_page)
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self.enhancement_poll_timer.stop()
