@@ -1234,7 +1234,6 @@ class VideoPanel(QFrame):
         self.enhanced_frames: list[np.ndarray] | None = None
         self.segmentation_masks: list[np.ndarray] | None = None
         self.source_gray_frames: list[np.ndarray] | None = None
-        self.stage_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.encoded_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.segmentation_mask_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.roi_selection_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], ROISelection | None] = {}
@@ -1610,15 +1609,13 @@ class VideoPanel(QFrame):
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
         frame_count = self.playback_frame_count
         work_units = 0.0
+        if sequence_key in self.encoded_frame_cache:
+            return work_units
         if self.source_gray_frames is None:
             work_units += self._estimated_stage_duration(self._source_stage_token(), frame_count)
-        prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
         for token in sequence_key:
-            prefix = prefix + (token,)
-            if prefix not in self.stage_frame_cache:
-                work_units += self._estimated_stage_duration(token, frame_count)
-        if sequence_key not in self.encoded_frame_cache:
-            work_units += self._estimated_stage_duration(self._encode_stage_token(), frame_count)
+            work_units += self._estimated_stage_duration(token, frame_count)
+        work_units += self._estimated_stage_duration(self._encode_stage_token(), frame_count)
         return work_units
 
     def _stage_display_name(self, stage_key: str) -> str:
@@ -1738,20 +1735,13 @@ class VideoPanel(QFrame):
 
         frame_count = self.playback_frame_count
         source_missing = self.source_gray_frames is None
-        start_prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
         missing_stages: list[
             tuple[tuple[str, tuple[object, ...]], tuple[tuple[str, tuple[object, ...]], ...]]
         ] = []
         prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
-        cache_gap_found = source_missing
         for token in sequence_key:
-            next_prefix = prefix + (token,)
-            if not cache_gap_found and next_prefix in self.stage_frame_cache:
-                start_prefix = next_prefix
-            else:
-                cache_gap_found = True
-                missing_stages.append((token, next_prefix))
-            prefix = next_prefix
+            prefix += (token,)
+            missing_stages.append((token, prefix))
 
         work_tokens = ([self._source_stage_token()] if source_missing else []) + [
             token for token, _ in missing_stages
@@ -1810,7 +1800,7 @@ class VideoPanel(QFrame):
 
         def produce_frames() -> None:
             if not source_missing:
-                for index, frame in enumerate(self.stage_frame_cache[start_prefix]):
+                for index, frame in enumerate(self.source_gray_frames or []):
                     if not enqueue(queues[0], (index, frame)):
                         break
                 close_queue(queues[0])
@@ -2197,9 +2187,6 @@ class VideoPanel(QFrame):
             return False
         if source_missing:
             self.source_gray_frames = source_output
-            self.stage_frame_cache[tuple()] = source_output
-        for (_, stage_prefix), output in zip(missing_stages, stage_outputs):
-            self.stage_frame_cache[stage_prefix] = output
         self.segmentation_mask_cache.update(segmentation_outputs)
         self.roi_selection_cache.update(roi_outputs)
         self.encoded_frame_cache[sequence_key] = encoded_frames
@@ -2327,7 +2314,6 @@ class VideoPanel(QFrame):
         self.segmentation_masks = None
         self.source_gray_frames = None
         self.stage_roi_selection = None
-        self.stage_frame_cache.clear()
         self.encoded_frame_cache.clear()
         self.segmentation_mask_cache.clear()
         self.roi_selection_cache.clear()
@@ -2345,7 +2331,11 @@ class VideoPanel(QFrame):
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
         if not sequence_key:
             return self.source_gray_frames
-        return self.stage_frame_cache.get(sequence_key)
+        encoded_frames = self.encoded_frame_cache.get(sequence_key)
+        if encoded_frames is None:
+            return None
+        frames = [cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE) for encoded in encoded_frames]
+        return frames if all(frame is not None for frame in frames) else None
 
     def close(self) -> None:
         self.capture.release()
@@ -3120,10 +3110,21 @@ class ContrastWindow(QMainWindow):
         controls_layout.setSpacing(10)
         self._pipeline_controls_base_right_margin = controls_layout.contentsMargins().right()
 
-        pipeline_label = QLabel("Live processing pipeline (applied in this order, top to bottom)")
+        pipeline_label = QLabel("Source pipeline")
         pipeline_label.setObjectName("pipelineLabel")
         controls_layout.addWidget(pipeline_label)
         self.enhancement_layout = controls_layout
+        self.source_pipeline_layout = QVBoxLayout()
+        self.source_pipeline_layout.setContentsMargins(0, 0, 0, 0)
+        self.source_pipeline_layout.setSpacing(controls_layout.spacing())
+        controls_layout.addLayout(self.source_pipeline_layout)
+        self.live_pipeline_label = QLabel("Live pipeline (applied in this order, top to bottom)")
+        self.live_pipeline_label.setObjectName("pipelineLabel")
+        controls_layout.addWidget(self.live_pipeline_label)
+        self.live_pipeline_layout = QVBoxLayout()
+        self.live_pipeline_layout.setContentsMargins(0, 0, 0, 0)
+        self.live_pipeline_layout.setSpacing(controls_layout.spacing())
+        controls_layout.addLayout(self.live_pipeline_layout)
         self.auto_crop_stage_drawer = StageDrawer(
             "auto_crop",
             "Auto-crop fluoroscope field",
@@ -3207,18 +3208,28 @@ class ContrastWindow(QMainWindow):
             self.smoothing_stage_drawer,
             self.segmentation_stage_drawer,
         ]
-        self.pipeline_stage_drawers = [
-            *self.source_pipeline_stage_drawers,
+        self.live_pipeline_stage_drawers = [
             *self.frame_pipeline_stage_drawers,
             self.analysis_stage_drawer,
+        ]
+        self.pipeline_stage_drawers = [
+            *self.source_pipeline_stage_drawers,
+            *self.live_pipeline_stage_drawers,
         ]
         self._dragged_stage_drawer: StageDrawer | None = None
         self._stage_drag_placeholder: QWidget | None = None
         self._dragged_pipeline_order: list[StageDrawer] | None = None
+        self._dragged_pipeline_layout: QVBoxLayout | None = None
         self._stage_drag_offset_y = 0
         self._stage_drag_x = 0
         for check in self.pipeline_stage_checks:
-            check.setChecked(False)
+            check.setChecked(
+                check in {
+                    self.auto_crop_stage_check,
+                    self.temporal_alignment_stage_check,
+                    self.brightness_stage_check,
+                }
+            )
             check.toggled.connect(self.on_pipeline_stages_changed)
         self._build_stage_drawer_controls()
         self._name_stage_parameter_widgets()
@@ -3230,15 +3241,18 @@ class ContrastWindow(QMainWindow):
             drawer.optionsRequested.connect(self._show_stage_options)
 
         self.stage_drawer_templates = {drawer.stage_key: drawer for drawer in self.pipeline_stage_drawers}
+        self.source_pipeline_stage_drawers = []
+        self.live_pipeline_stage_drawers = []
         self.pipeline_stage_drawers = []
-        self._sync_pipeline_stage_lists()
+        self.source_add_stage_button = self._create_add_stage_button("Add source stage")
+        self.source_add_stage_button.clicked.connect(lambda: self._show_add_stage_menu("source"))
+        self.live_add_stage_button = self._create_add_stage_button("Add live stage")
+        self.live_add_stage_button.clicked.connect(lambda: self._show_add_stage_menu("live"))
+        self.add_stage_button = self.live_add_stage_button
 
-        self.add_stage_button = QToolButton()
-        self.add_stage_button.setObjectName("addStageButton")
-        self.add_stage_button.setText("+")
-        self.add_stage_button.setFixedSize(32, 32)
-        self.add_stage_button.setToolTip("Add pipeline stage")
-        self.add_stage_button.clicked.connect(self._show_add_stage_menu)
+        self._add_pipeline_stage("auto_crop", pipeline="source")
+        self._add_pipeline_stage("temporal_alignment", pipeline="source")
+        self._add_pipeline_stage("brightness_stabilization", pipeline="live")
 
         self._refresh_pipeline_stage_ui()
         controls_layout.addStretch()
@@ -3417,13 +3431,30 @@ class ContrastWindow(QMainWindow):
         self._configure_dynamic_stage_drawer(drawer)
         return drawer
 
-    def _show_add_stage_menu(self) -> None:
+    def _create_add_stage_button(self, tooltip: str) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("addStageButton")
+        button.setText("+")
+        button.setFixedSize(32, 32)
+        button.setToolTip(tooltip)
+        return button
+
+    def _show_add_stage_menu(self, pipeline: str) -> None:
         menu = QMenu(self)
-        for key, drawer in self.stage_drawer_templates.items():
+        stage_keys = (
+            ("auto_crop", "temporal_alignment")
+            if pipeline == "source"
+            else tuple(key for key in self.stage_drawer_templates if key not in {"auto_crop", "temporal_alignment"})
+        )
+        for key in stage_keys:
+            drawer = self.stage_drawer_templates[key]
             action = menu.addAction(drawer.stage_title)
-            action.triggered.connect(lambda _checked=False, stage_key=key: self._add_pipeline_stage(stage_key))
+            action.triggered.connect(
+                lambda _checked=False, stage_key=key, target=pipeline: self._add_pipeline_stage(stage_key, pipeline=target)
+            )
         self._stage_menu = menu
-        menu.popup(self.add_stage_button.mapToGlobal(self.add_stage_button.rect().bottomLeft()))
+        button = self.source_add_stage_button if pipeline == "source" else self.live_add_stage_button
+        menu.popup(button.mapToGlobal(button.rect().bottomLeft()))
 
     def _show_stage_options(self, drawer: StageDrawer, position: QPoint) -> None:
         menu = QMenu(self)
@@ -3434,31 +3465,40 @@ class ContrastWindow(QMainWindow):
         self._stage_menu = menu
         menu.popup(position)
 
-    def _add_pipeline_stage(self, stage_key: str, after: StageDrawer | None = None) -> None:
+    def _add_pipeline_stage(
+        self,
+        stage_key: str,
+        after: StageDrawer | None = None,
+        pipeline: str | None = None,
+    ) -> StageDrawer:
         template = self.stage_drawer_templates[stage_key]
-        drawer = template if template not in self.pipeline_stage_drawers else self._copy_stage_drawer(template)
-        if drawer not in self.pipeline_stage_drawers:
+        stage_pipeline = pipeline or ("source" if stage_key in {"auto_crop", "temporal_alignment"} else "live")
+        drawers = self.source_pipeline_stage_drawers if stage_pipeline == "source" else self.live_pipeline_stage_drawers
+        drawer = template if template not in drawers else self._copy_stage_drawer(template)
+        if drawer not in drawers:
             drawer.setParent(self.enhancement_layout.parentWidget())
-            insert_index = len(self.pipeline_stage_drawers)
+            insert_index = len(drawers)
             if after is not None:
-                insert_index = self.pipeline_stage_drawers.index(after) + 1
-            self.pipeline_stage_drawers.insert(insert_index, drawer)
+                insert_index = drawers.index(after) + 1
+            drawers.insert(insert_index, drawer)
         self._sync_pipeline_stage_lists()
         self._refresh_pipeline_stage_ui()
         if drawer.enable_button.isChecked() and not self._loading_config:
             self.on_pipeline_stages_changed()
+        return drawer
 
     def _duplicate_pipeline_stage(self, drawer: StageDrawer) -> None:
         duplicate = self._copy_stage_drawer(drawer)
         duplicate.enable_button.setChecked(False)
-        self.pipeline_stage_drawers.insert(self.pipeline_stage_drawers.index(drawer) + 1, duplicate)
+        drawers = self._pipeline_drawers_for(drawer)
+        drawers.insert(drawers.index(drawer) + 1, duplicate)
         self._sync_pipeline_stage_lists()
         self._refresh_pipeline_stage_ui()
 
     def _delete_pipeline_stage(self, drawer: StageDrawer) -> None:
         was_enabled = drawer.enable_button.isChecked()
-        self.pipeline_stage_drawers.remove(drawer)
-        self.enhancement_layout.removeWidget(drawer)
+        self._pipeline_drawers_for(drawer).remove(drawer)
+        self._pipeline_layout_for(drawer).removeWidget(drawer)
         drawer.hide()
         drawer.setParent(None)
         self._sync_pipeline_stage_lists()
@@ -3561,7 +3601,8 @@ class ContrastWindow(QMainWindow):
         self._sync_pipeline_scroll_gutter()
         drawer_width = max(
             [
-                self.add_stage_button.minimumSizeHint().width(),
+                self.source_add_stage_button.minimumSizeHint().width(),
+                self.live_add_stage_button.minimumSizeHint().width(),
                 *(drawer.minimumSizeHint().width() for drawer in self.pipeline_stage_drawers),
             ]
         )
@@ -4437,39 +4478,47 @@ class ContrastWindow(QMainWindow):
         return False
 
     def _sync_pipeline_stage_lists(self) -> None:
-        self.source_pipeline_stage_drawers = [
-            drawer
-            for drawer in self.pipeline_stage_drawers
-            if drawer.stage_key in {"auto_crop", "temporal_alignment"}
+        self.pipeline_stage_drawers = [
+            *self.source_pipeline_stage_drawers,
+            *self.live_pipeline_stage_drawers,
         ]
         self.frame_pipeline_stage_drawers = [
-            drawer
-            for drawer in self.pipeline_stage_drawers
-            if drawer.stage_key not in {"auto_crop", "temporal_alignment", "roi_residence_analysis"}
+            drawer for drawer in self.live_pipeline_stage_drawers if drawer.stage_key != "roi_residence_analysis"
         ]
         self.source_pipeline_stage_checks = [item.enable_button for item in self.source_pipeline_stage_drawers]
         self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
         self.pipeline_stage_checks = [drawer.enable_button for drawer in self.pipeline_stage_drawers]
 
+    def _pipeline_drawers_for(self, drawer: StageDrawer) -> list[StageDrawer]:
+        if drawer in self.source_pipeline_stage_drawers:
+            return self.source_pipeline_stage_drawers
+        return self.live_pipeline_stage_drawers
+
+    def _pipeline_layout_for(self, drawer: StageDrawer) -> QVBoxLayout:
+        if drawer in self.source_pipeline_stage_drawers:
+            return self.source_pipeline_layout
+        return self.live_pipeline_layout
+
     def _reorder_pipeline_stage_by_key(self, source_key: str, target_key: str) -> None:
         if source_key == target_key:
             return
-        source_index = next((i for i, drawer in enumerate(self.pipeline_stage_drawers) if drawer.stage_key == source_key), -1)
-        target_index = next((i for i, drawer in enumerate(self.pipeline_stage_drawers) if drawer.stage_key == target_key), -1)
-        if source_index < 0 or target_index < 0:
+        source_drawer = next((drawer for drawer in self.pipeline_stage_drawers if drawer.stage_key == source_key), None)
+        target_drawer = next((drawer for drawer in self.pipeline_stage_drawers if drawer.stage_key == target_key), None)
+        if source_drawer is None or target_drawer is None:
             return
-
-        source_drawer = self.pipeline_stage_drawers[source_index]
-        target_drawer = self.pipeline_stage_drawers[target_index]
         if self._is_fixed_pipeline_stage(source_drawer):
             return
         if self._is_fixed_pipeline_stage(target_drawer):
             return
-
-        moving_drawer = self.pipeline_stage_drawers.pop(source_index)
+        drawers = self._pipeline_drawers_for(source_drawer)
+        if drawers is not self._pipeline_drawers_for(target_drawer):
+            return
+        source_index = drawers.index(source_drawer)
+        target_index = drawers.index(target_drawer)
+        moving_drawer = drawers.pop(source_index)
         if source_index < target_index:
             target_index -= 1
-        self.pipeline_stage_drawers.insert(target_index, moving_drawer)
+        drawers.insert(target_index, moving_drawer)
         self._sync_pipeline_stage_lists()
         self._refresh_pipeline_stage_ui()
         self.on_enhancement_settings_changed()
@@ -4478,14 +4527,16 @@ class ContrastWindow(QMainWindow):
         if self._is_fixed_pipeline_stage(drawer):
             return
         self._dragged_stage_drawer = drawer
-        self._dragged_pipeline_order = list(self.pipeline_stage_drawers)
-        self._stage_drag_placeholder = QWidget(self.enhancement_layout.parentWidget())
+        self._dragged_pipeline_order = list(self._pipeline_drawers_for(drawer))
+        self._dragged_pipeline_layout = self._pipeline_layout_for(drawer)
+        layout = self._dragged_pipeline_layout
+        self._stage_drag_placeholder = QWidget(layout.parentWidget())
         self._stage_drag_placeholder.setFixedHeight(drawer.height())
         self._stage_drag_placeholder.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         drawer_geometry = drawer.geometry()
         self._stage_drag_x = drawer_geometry.x()
-        self._stage_drag_offset_y = self.enhancement_layout.parentWidget().mapFromGlobal(global_position).y() - drawer_geometry.y()
-        self.enhancement_layout.replaceWidget(drawer, self._stage_drag_placeholder)
+        self._stage_drag_offset_y = layout.parentWidget().mapFromGlobal(global_position).y() - drawer_geometry.y()
+        layout.replaceWidget(drawer, self._stage_drag_placeholder)
         drawer.setGeometry(drawer_geometry)
         drawer.raise_()
         self._move_pipeline_stage_drag(global_position)
@@ -4497,7 +4548,10 @@ class ContrastWindow(QMainWindow):
         if drawer is None or placeholder is None or order is None:
             return
 
-        parent = self.enhancement_layout.parentWidget()
+        layout = self._dragged_pipeline_layout
+        if layout is None:
+            return
+        parent = layout.parentWidget()
         cursor_y = parent.mapFromGlobal(global_position).y()
         other_drawers = [item for item in order if item is not drawer]
         if not other_drawers:
@@ -4518,9 +4572,10 @@ class ContrastWindow(QMainWindow):
         order.pop(source_index)
         order.insert(insertion_index, drawer)
 
-        next_drawer = order[insertion_index + 1] if insertion_index < len(order) - 1 else self.add_stage_button
-        self.enhancement_layout.removeWidget(placeholder)
-        self.enhancement_layout.insertWidget(self.enhancement_layout.indexOf(next_drawer), placeholder)
+        add_button = self.source_add_stage_button if drawer in self.source_pipeline_stage_drawers else self.live_add_stage_button
+        next_drawer = order[insertion_index + 1] if insertion_index < len(order) - 1 else add_button
+        layout.removeWidget(placeholder)
+        layout.insertWidget(layout.indexOf(next_drawer), placeholder)
 
     def _finish_pipeline_stage_drag(self, global_position: QPoint) -> None:
         self._move_pipeline_stage_drag(global_position)
@@ -4529,32 +4584,38 @@ class ContrastWindow(QMainWindow):
         order = self._dragged_pipeline_order
         if drawer is None or placeholder is None or order is None:
             return
-
-        placeholder_index = self.enhancement_layout.indexOf(placeholder)
-        self.enhancement_layout.removeWidget(placeholder)
+        layout = self._dragged_pipeline_layout
+        if layout is None:
+            return
+        placeholder_index = layout.indexOf(placeholder)
+        layout.removeWidget(placeholder)
         placeholder.deleteLater()
-        self.enhancement_layout.insertWidget(placeholder_index, drawer)
-        self.pipeline_stage_drawers = order
+        layout.insertWidget(placeholder_index, drawer)
+        self._pipeline_drawers_for(drawer)[:] = order
         self._sync_pipeline_stage_lists()
         self._dragged_stage_drawer = None
         self._stage_drag_placeholder = None
         self._dragged_pipeline_order = None
+        self._dragged_pipeline_layout = None
         self._refresh_pipeline_stage_ui()
         self.on_enhancement_settings_changed()
 
     def _refresh_pipeline_stage_ui(self) -> None:
         for drawer in self.pipeline_stage_drawers:
-            self.enhancement_layout.removeWidget(drawer)
-        self.enhancement_layout.removeWidget(self.add_stage_button)
-        insert_index = self.enhancement_layout.count()
-        stretch_index = self.enhancement_layout.count() - 1
-        if stretch_index >= 0 and self.enhancement_layout.itemAt(stretch_index).spacerItem() is not None:
-            insert_index = stretch_index
-        for offset, drawer in enumerate(self.pipeline_stage_drawers):
+            self.source_pipeline_layout.removeWidget(drawer)
+            self.live_pipeline_layout.removeWidget(drawer)
+        self.source_pipeline_layout.removeWidget(self.source_add_stage_button)
+        self.live_pipeline_layout.removeWidget(self.live_add_stage_button)
+        for offset, drawer in enumerate(self.source_pipeline_stage_drawers):
             drawer.set_stage_index(offset + 1)
             drawer.set_reorder_enabled(not self._is_fixed_pipeline_stage(drawer))
-            self.enhancement_layout.insertWidget(insert_index + offset, drawer)
-        self.enhancement_layout.insertWidget(insert_index + len(self.pipeline_stage_drawers), self.add_stage_button)
+            self.source_pipeline_layout.insertWidget(offset, drawer)
+        self.source_pipeline_layout.insertWidget(len(self.source_pipeline_stage_drawers), self.source_add_stage_button)
+        for offset, drawer in enumerate(self.live_pipeline_stage_drawers):
+            drawer.set_stage_index(offset + 1)
+            drawer.set_reorder_enabled(not self._is_fixed_pipeline_stage(drawer))
+            self.live_pipeline_layout.insertWidget(offset, drawer)
+        self.live_pipeline_layout.insertWidget(len(self.live_pipeline_stage_drawers), self.live_add_stage_button)
         self._update_pipeline_column_width()
 
     def enhancement_parameters(self) -> EnhancementParameters:
@@ -5315,16 +5376,17 @@ class ContrastWindow(QMainWindow):
         try:
             self._set_video_panels(video_paths)
             for drawer in self.pipeline_stage_drawers:
-                self.enhancement_layout.removeWidget(drawer)
+                self._pipeline_layout_for(drawer).removeWidget(drawer)
                 drawer.hide()
                 drawer.setParent(None)
             self.pipeline_stage_drawers = []
+            self.source_pipeline_stage_drawers = []
+            self.live_pipeline_stage_drawers = []
             self._sync_pipeline_stage_lists()
 
             pipeline = cast(list[dict[str, object]], config["pipeline"])
             for stage in pipeline:
-                self._add_pipeline_stage(cast(str, stage["key"]))
-                drawer = self.pipeline_stage_drawers[-1]
+                drawer = self._add_pipeline_stage(cast(str, stage["key"]))
                 self._set_drawer_control_values(drawer, cast(dict[str, object], stage.get("controls", {})))
                 drawer.enable_button.blockSignals(True)
                 drawer.enable_button.setChecked(cast(bool, stage["enabled"]))

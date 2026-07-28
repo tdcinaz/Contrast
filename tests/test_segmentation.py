@@ -74,10 +74,9 @@ class SegmentationTests(unittest.TestCase):
         self.addCleanup(window.close)
 
         with patch.object(window, "rebuild_enhancement_pipeline") as rebuild:
-            window._add_pipeline_stage("local_contrast")
-            first_drawer = window.pipeline_stage_drawers[0]
+            first_drawer = window._add_pipeline_stage("local_contrast")
             window._duplicate_pipeline_stage(first_drawer)
-            window._delete_pipeline_stage(window.pipeline_stage_drawers[1])
+            window._delete_pipeline_stage(window.live_pipeline_stage_drawers[-1])
             rebuild.assert_not_called()
 
             first_drawer.enable_button.setChecked(True)
@@ -87,11 +86,10 @@ class SegmentationTests(unittest.TestCase):
         app = QApplication.instance() or QApplication([])
         window = ContrastWindow()
         self.addCleanup(window.close)
-        window._add_pipeline_stage("local_contrast")
-        first_drawer = window.pipeline_stage_drawers[0]
+        first_drawer = window._add_pipeline_stage("local_contrast")
         first_drawer.findChild(QDoubleSpinBox, "claheClipLimit").setValue(2.5)
         window._duplicate_pipeline_stage(first_drawer)
-        second_drawer = window.pipeline_stage_drawers[1]
+        second_drawer = window.live_pipeline_stage_drawers[-1]
         second_drawer.findChild(QDoubleSpinBox, "claheClipLimit").setValue(4.0)
         first_drawer.enable_button.blockSignals(True)
         first_drawer.enable_button.setChecked(True)
@@ -110,14 +108,28 @@ class SegmentationTests(unittest.TestCase):
             ), patch.object(window, "on_pipeline_stages_changed"):
                 self.assertTrue(window._load_config_file(config_path, show_error=False))
 
-        self.assertEqual([drawer.stage_key for drawer in window.pipeline_stage_drawers], ["local_contrast", "local_contrast"])
-        self.assertTrue(window.pipeline_stage_drawers[0].enable_button.isChecked())
-        self.assertFalse(window.pipeline_stage_drawers[1].enable_button.isChecked())
-        self.assertEqual(window.pipeline_stage_drawers[0].findChild(QDoubleSpinBox, "claheClipLimit").value(), 2.5)
-        self.assertEqual(window.pipeline_stage_drawers[1].findChild(QDoubleSpinBox, "claheClipLimit").value(), 4.0)
+        self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
+        self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization", "local_contrast", "local_contrast"])
+        self.assertTrue(window.live_pipeline_stage_drawers[1].enable_button.isChecked())
+        self.assertFalse(window.live_pipeline_stage_drawers[2].enable_button.isChecked())
+        self.assertEqual(window.live_pipeline_stage_drawers[1].findChild(QDoubleSpinBox, "claheClipLimit").value(), 2.5)
+        self.assertEqual(window.live_pipeline_stage_drawers[2].findChild(QDoubleSpinBox, "claheClipLimit").value(), 4.0)
         self.assertFalse(window.compare_view_check.isChecked())
         self.assertEqual(window.speed_slider.value(), 175)
         self.assertEqual(window.threshold_spin.value(), 0.35)
+
+    def test_source_and_live_pipeline_defaults_are_separate(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+
+        self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
+        self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization"])
+        self.assertTrue(all(drawer.enable_button.isChecked() for drawer in window.pipeline_stage_drawers))
+
+        window._reorder_pipeline_stage_by_key("auto_crop", "brightness_stabilization")
+        self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
+        self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization"])
 
     def test_aneurysm_detection_rejects_video_without_temporal_darkening(self) -> None:
         frames = [np.full((120, 160), 175, dtype=np.uint8) for _ in range(12)]
