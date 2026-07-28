@@ -1080,12 +1080,21 @@ class VideoDisplay(QLabel):
         self._right_display_rect = QRect()
 
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # Keep height stable but allow width to compress so splitters do not
-        # force-resize neighboring drawers in dual-panel mode.
-        self.setMinimumSize(0, 220)
+        # Keep video areas landscape by preventing the display from becoming taller than wide.
+        self.setMinimumSize(0, 0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setStyleSheet("background: #0e1116; border: 1px solid #253044; border-radius: 8px;")
+        self._update_landscape_height_limit()
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        self._update_landscape_height_limit()
+
+    def _update_landscape_height_limit(self) -> None:
+        max_height = max(1, self.width())
+        if self.maximumHeight() != max_height:
+            self.setMaximumHeight(max_height)
 
     def _to_pixmap(self, frame: np.ndarray) -> QPixmap:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1310,10 +1319,79 @@ class VideoDropGlyph(QWidget):
         painter.drawRoundedRect(QRect(37, 5, 28, 14), 3, 3)
 
 
+class LandscapeSurface(QFrame):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._update_landscape_height_limit()
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        self._update_landscape_height_limit()
+
+    def _update_landscape_height_limit(self) -> None:
+        max_height = max(1, self.width())
+        if self.maximumHeight() != max_height:
+            self.setMaximumHeight(max_height)
+
+
+class CurrentPageStack(QStackedWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.currentChanged.connect(self._update_current_page_geometry)
+
+    def hasHeightForWidth(self) -> bool:
+        page = self.currentWidget()
+        return page is not None and page.hasHeightForWidth()
+
+    def heightForWidth(self, width: int) -> int:
+        page = self.currentWidget()
+        if page is None:
+            return super().heightForWidth(width)
+        return page.heightForWidth(width) if page.hasHeightForWidth() else page.sizeHint().height()
+
+    def sizeHint(self) -> QSize:
+        page = self.currentWidget()
+        return page.sizeHint() if page is not None else super().sizeHint()
+
+    def _update_current_page_geometry(self) -> None:
+        self.updateGeometry()
+        if self.parentWidget() is not None and self.parentWidget().layout() is not None:
+            self.parentWidget().layout().invalidate()
+        QTimer.singleShot(0, self._apply_current_page_height)
+
+    def _apply_current_page_height(self) -> None:
+        page = self.currentWidget()
+        if page is None:
+            return
+        layout = page.layout()
+        card_widgets = [
+            layout.itemAt(index).widget()
+            for index in range(layout.count())
+        ] if layout is not None else []
+        cards = [card for card in card_widgets if card is not None and card.hasHeightForWidth()]
+        if not cards:
+            self.setMaximumHeight(16_777_215)
+            return
+
+        margins = layout.contentsMargins()
+        available_width = max(
+            0,
+            self.width() - margins.left() - margins.right() - layout.spacing() * (len(cards) - 1),
+        )
+        card_width = available_width // len(cards)
+        self.setMaximumHeight(max(card.heightForWidth(card_width) for card in cards))
+        self.updateGeometry()
+        if self.parentWidget() is not None and self.parentWidget().layout() is not None:
+            self.parentWidget().layout().activate()
+
+
 class VideoDropPlaceholder(QFrame):
     fileDialogRequested = Signal()
     fileDropped = Signal(object)
     SUPPORTED_EXTENSIONS = {".mov", ".mp4", ".avi", ".mkv"}
+    PANEL_MARGIN = 14
+    PANEL_SPACING = 10
+    TITLE_HEIGHT = 24
 
     def __init__(self, label: str, color: QColor, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1325,11 +1403,25 @@ class VideoDropPlaceholder(QFrame):
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setProperty("dragActive", False)
         # Match VideoPanel sizing so replacing one slot does not reflow panel widths/heights.
-        self.setMinimumSize(0, 220)
+        self.setMinimumSize(0, 0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.title_label = QLabel(label)
         self.title_label.setObjectName("panelTitle")
+
+        self.title_container = QWidget()
+        self.title_container.setObjectName("videoPanelTitleContainer")
+        self.title_container.setFixedHeight(self.TITLE_HEIGHT)
+        title_layout = QHBoxLayout(self.title_container)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.addWidget(self.title_label)
+
+        self.video_surface = LandscapeSurface()
+        self.video_surface.setObjectName("videoDropSurface")
+        self.video_surface.setProperty("dragActive", False)
+        # Mirror VideoDisplay sizing so placeholders reserve the same visual area.
+        self.video_surface.setMinimumSize(0, 0)
+        self.video_surface.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.hint_button = QPushButton("")
         self.hint_button.setObjectName("videoDropHintButton")
@@ -1344,13 +1436,29 @@ class VideoDropPlaceholder(QFrame):
         hint_layout.addWidget(self.hint_glyph, 0, Qt.AlignmentFlag.AlignCenter)
         self.hint_button.clicked.connect(self.fileDialogRequested.emit)
 
+        surface_layout = QVBoxLayout(self.video_surface)
+        surface_layout.setContentsMargins(16, 16, 16, 16)
+        surface_layout.setSpacing(0)
+        surface_layout.addStretch()
+        surface_layout.addWidget(self.hint_button, 0, Qt.AlignmentFlag.AlignCenter)
+        surface_layout.addStretch()
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-        layout.addWidget(self.title_label)
-        layout.addStretch()
-        layout.addWidget(self.hint_button, 0, Qt.AlignmentFlag.AlignCenter)
-        layout.addStretch()
+        layout.setContentsMargins(self.PANEL_MARGIN, self.PANEL_MARGIN, self.PANEL_MARGIN, self.PANEL_MARGIN)
+        layout.setSpacing(self.PANEL_SPACING)
+        layout.addWidget(self.title_container)
+        layout.addWidget(self.video_surface, 1)
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        self.setMaximumHeight(self.heightForWidth(self.width()))
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        surface_width = max(0, width - 2 * self.PANEL_MARGIN)
+        return 2 * self.PANEL_MARGIN + self.TITLE_HEIGHT + self.PANEL_SPACING + surface_width
 
     def set_selected_path(self, path: Path) -> None:
         self.selected_path = path
@@ -1388,12 +1496,16 @@ class VideoDropPlaceholder(QFrame):
         if bool(self.property("dragActive")) == active:
             return
         self.setProperty("dragActive", active)
+        self.video_surface.setProperty("dragActive", active)
         self.hint_button.setProperty("dragActive", active)
         self.style().unpolish(self)
         self.style().polish(self)
+        self.style().unpolish(self.video_surface)
+        self.style().polish(self.video_surface)
         self.style().unpolish(self.hint_button)
         self.style().polish(self.hint_button)
         self.update()
+        self.video_surface.update()
         self.hint_button.update()
         self.hint_glyph.update()
 
@@ -1415,6 +1527,9 @@ class VideoDropPlaceholder(QFrame):
 
 class VideoPanel(QFrame):
     roiChanged = Signal()
+    PANEL_MARGIN = 14
+    PANEL_SPACING = 10
+    TITLE_HEIGHT = 24
 
     def __init__(
         self,
@@ -1425,6 +1540,7 @@ class VideoPanel(QFrame):
         live_input: bool = False,
     ) -> None:
         super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.label = label
         self.color = color
         self.path = path
@@ -1465,21 +1581,37 @@ class VideoPanel(QFrame):
         self.meta_label = QLabel(self._metadata_text())
         self.meta_label.setObjectName("subtleLabel")
 
-        header = QHBoxLayout()
+        self.title_container = QWidget()
+        self.title_container.setObjectName("videoPanelTitleContainer")
+        self.title_container.setFixedHeight(self.TITLE_HEIGHT)
+        header = QHBoxLayout(self.title_container)
+        header.setContentsMargins(0, 0, 0, 0)
         header.addWidget(self.title_label)
         header.addStretch()
         header.addWidget(self.meta_label)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-        layout.addLayout(header)
+        layout.setContentsMargins(self.PANEL_MARGIN, self.PANEL_MARGIN, self.PANEL_MARGIN, self.PANEL_MARGIN)
+        layout.setSpacing(self.PANEL_SPACING)
+        layout.addWidget(self.title_container)
         layout.addWidget(self.path_label)
         layout.addWidget(self.display, 1)
 
         self.setObjectName("videoPanel")
         self.set_trim_window(0)
         self.seek(0)
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        self.setMaximumHeight(self.heightForWidth(self.width()))
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        surface_width = max(0, width - 2 * self.PANEL_MARGIN)
+        path_height = self.path_label.sizeHint().height()
+        return 2 * self.PANEL_MARGIN + self.TITLE_HEIGHT + path_height + 2 * self.PANEL_SPACING + surface_width
 
     def _full_frame_rect(self) -> QRect:
         return QRect(0, 0, self.info.width, self.info.height)
@@ -3167,6 +3299,7 @@ class ContrastWindow(QMainWindow):
         self.compare_view_check.setEnabled(True)
         self.enhancement_progress.configure_panels([panel.label for panel in self.panels])
         self.video_stack.setCurrentWidget(self.video_row)
+        self._update_video_stack_geometry()
         self.results.clear()
         self._sync_trimmed_video_window()
         self._set_playback_limit(self.source_max_frame)
@@ -3292,11 +3425,20 @@ class ContrastWindow(QMainWindow):
         self._set_video_controls_enabled(False)
         self._set_live_incompatible_stages_enabled(mode != MODE_LIVE)
         self.video_stack.setCurrentWidget(self.video_placeholder_row)
+        self._update_video_stack_geometry()
         self._sync_trimmed_video_window()
         self._set_playback_limit(self.source_max_frame)
         self.current_frame_index = 0
         self.update_time_label()
         self.statusBar().showMessage("Select a video file by dragging it into a placeholder or clicking to browse.")
+
+    def _update_video_stack_geometry(self) -> None:
+        self.video_stack.updateGeometry()
+        parent = self.video_stack.parentWidget()
+        if parent is not None and parent.layout() is not None:
+            parent.layout().invalidate()
+            parent.updateGeometry()
+        QTimer.singleShot(0, self.video_stack.updateGeometry)
 
     def _request_placeholder_video(self, index: int) -> None:
         if self.pending_mode is None or index < 0 or index >= len(self.pending_video_paths):
@@ -3465,14 +3607,18 @@ class ContrastWindow(QMainWindow):
         self.overlay_mask_check.toggled.connect(self.on_segmentation_overlay_toggled)
 
         self.video_row = QWidget()
+        self.video_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self.video_layout = QHBoxLayout(self.video_row)
         self.video_layout.setContentsMargins(0, 0, 0, 0)
         self.video_layout.setSpacing(14)
+        self.video_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self.video_placeholder_row = QWidget()
+        self.video_placeholder_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self.video_placeholder_layout = QHBoxLayout(self.video_placeholder_row)
         self.video_placeholder_layout.setContentsMargins(0, 0, 0, 0)
         self.video_placeholder_layout.setSpacing(14)
+        self.video_placeholder_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self.mode_selection_page = QWidget()
         self.mode_selection_page.setObjectName("modeSelectionPage")
@@ -3549,7 +3695,8 @@ class ContrastWindow(QMainWindow):
         mode_layout.addWidget(mode_panel, 0, Qt.AlignmentFlag.AlignCenter)
         mode_layout.addStretch()
 
-        self.video_stack = QStackedWidget()
+        self.video_stack = CurrentPageStack()
+        self.video_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self.video_stack.addWidget(self.mode_selection_page)
         self.video_stack.addWidget(self.video_placeholder_row)
         self.video_stack.addWidget(self.video_row)
@@ -3557,6 +3704,7 @@ class ContrastWindow(QMainWindow):
         self._update_mode_selection_config_actions()
 
         playback_row = QWidget()
+        self.playback_row = playback_row
         playback_layout = QHBoxLayout(playback_row)
         playback_layout.setContentsMargins(0, 0, 0, 0)
         playback_layout.setSpacing(8)
@@ -3586,13 +3734,18 @@ class ContrastWindow(QMainWindow):
         plot_panel = self._build_plot_panel()
 
         video_panel = QWidget()
+        video_panel.setMinimumHeight(0)
+        video_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         video_layout = QVBoxLayout(video_panel)
         video_layout.setContentsMargins(0, 0, 0, 12)
         video_layout.setSpacing(14)
-        video_layout.addWidget(self.video_stack, 3)
-        video_layout.addWidget(playback_row)
+        video_layout.addWidget(self.video_stack, 0, Qt.AlignmentFlag.AlignTop)
+        video_layout.addWidget(playback_row, 0, Qt.AlignmentFlag.AlignTop)
+        video_layout.addStretch(1)
 
         self.graph_drawer = GraphDrawer("Analysis")
+        self.graph_drawer.setMinimumHeight(self.graph_drawer.header_height())
+        self.graph_drawer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.graph_drawer.content_layout.addWidget(plot_panel)
         self.graph_drawer.toggle_button.toggled.connect(self._set_graph_drawer_expanded)
 
@@ -3601,9 +3754,11 @@ class ContrastWindow(QMainWindow):
         right_splitter.addWidget(video_panel)
         right_splitter.addWidget(self.graph_drawer)
         right_splitter.setCollapsible(1, True)
+        right_splitter.setCollapsible(0, False)
         right_splitter.setHandleWidth(8)
         right_splitter.setStretchFactor(0, 1)
         right_splitter.setStretchFactor(1, 0)
+        right_splitter.splitterMoved.connect(self._remember_graph_drawer_height)
 
         right_column = QWidget()
         right_layout = QVBoxLayout(right_column)
@@ -4220,18 +4375,25 @@ class ContrastWindow(QMainWindow):
             return
 
         sizes = splitter.sizes()
-        drawer_height = max(1, drawer.sizeHint().height())
         header_height = max(1, drawer.header_height())
         if expanded:
             drawer.set_expanded(True)
-            target_height = max(drawer_height, getattr(self, "_graph_drawer_last_height", 260), header_height * 6)
             total_height = max(1, sum(sizes) or splitter.height())
+            target_height = max(getattr(self, "_graph_drawer_last_height", 260), header_height * 6)
+            target_height = min(target_height, max(header_height, total_height - 1))
             splitter.setSizes([max(1, total_height - target_height), target_height])
         else:
-            if len(sizes) > 1 and sizes[1] > header_height:
-                self._graph_drawer_last_height = sizes[1]
             drawer.set_expanded(False)
-            splitter.setSizes([max(1, sizes[0] if sizes else 1), header_height])
+            total_height = max(1, sum(sizes) or splitter.height())
+            splitter.setSizes([max(1, total_height - header_height), header_height])
+
+    def _remember_graph_drawer_height(self, _position: int, _index: int) -> None:
+        if not self.graph_drawer.toggle_button.isChecked():
+            return
+        sizes = self.graph_splitter.sizes()
+        header_height = max(1, self.graph_drawer.header_height())
+        if len(sizes) > 1 and sizes[1] > header_height:
+            self._graph_drawer_last_height = sizes[1]
 
     def _build_stage_drawer_controls(self) -> None:
         self._parameter_slider_pairs: list[tuple[QSpinBox | QDoubleSpinBox, QSlider]] = []
@@ -4684,11 +4846,13 @@ class ContrastWindow(QMainWindow):
             QFrame#modePreviewPane { background: #159bb0; border: 1px solid #67e8f9; border-radius: 5px; }
             QWidget#modeActionGlyph { background: transparent; border: none; }
             QLabel#modeSelectionLabel { color: #f8fafc; font-size: 16px; font-weight: 700; }
-            QFrame#videoDropPlaceholder { background: #000000; border: 1px solid #334155; border-radius: 8px; }
+            QFrame#videoDropPlaceholder { background: #111827; border: 1px solid #334155; border-radius: 8px; }
             QFrame#videoDropPlaceholder[dragActive="true"] { background: #072226; border: 1px solid #2dd4bf; }
+            QFrame#videoDropSurface { background: #000000; border: 1px solid #253044; border-radius: 8px; }
+            QFrame#videoDropSurface[dragActive="true"] { background: #0b1018; border: 1px solid #2dd4bf; }
             QPushButton#videoDropHintButton { background: #173244; border: 1px solid #253044; border-radius: 10px; padding: 0; }
-            QPushButton#videoDropHintButton:hover { background: #20435b; border-color: #253044; }
-            QPushButton#videoDropHintButton[dragActive="true"] { background: #1a4b5f; border-color: #253044; }
+            QPushButton#videoDropHintButton:hover { background: #20435b; border-color: #334155; }
+            QPushButton#videoDropHintButton[dragActive="true"] { background: #1a4b5f; border-color: #2dd4bf; }
             QWidget#videoDropGlyph { background: transparent; }
             QSlider::groove:horizontal { height: 6px; background: #273449; border-radius: 3px; }
             QSlider::handle:horizontal { background: #67e8f9; width: 16px; margin: -5px 0; border-radius: 8px; }

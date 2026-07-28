@@ -10,11 +10,34 @@ from threading import Thread
 import cv2
 import numpy as np
 
-from main import CollapsibleDrawer, ContrastWindow, EnhancementParameters, EnhancementStages
+from main import MODE_COMPARISON, CollapsibleDrawer, ContrastWindow, EnhancementParameters, EnhancementStages
 from stream_server import LiveStreamProcessor, StreamService, StreamSettings, create_http_server, load_stream_configuration
 
 
 class StreamServerTests(unittest.TestCase):
+    def test_playback_controls_move_up_after_selecting_comparison_mode(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        window.show()
+        QApplication.processEvents()
+        setup_page_playback_y = window.playback_row.y()
+
+        window._show_video_placeholders(MODE_COMPARISON)
+        QApplication.processEvents()
+
+        self.assertIs(window.video_stack.currentWidget(), window.video_placeholder_row)
+        self.assertGreater(window.video_stack.height(), 200)
+        self.assertLess(window.playback_row.y(), setup_page_playback_y)
+        self.assertEqual(
+            window.playback_row.y(),
+            window.video_stack.geometry().bottom() + window.video_stack.parentWidget().layout().spacing() + 1,
+        )
+
+        window.close()
+        app.quit()
+
     def test_window_keeps_pipeline_drawer_expanded_by_default(self) -> None:
         from PySide6.QtWidgets import QApplication
 
