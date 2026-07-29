@@ -10,7 +10,16 @@ from threading import Thread
 import cv2
 import numpy as np
 
-from main import MODE_COMPARISON, CollapsibleDrawer, ContrastWindow, EnhancementParameters, EnhancementStages
+from main import (
+    MODE_COMPARISON,
+    MODE_SINGLE,
+    CollapsibleDrawer,
+    ContrastWindow,
+    EnhancementParameters,
+    EnhancementStages,
+    VideoDropPlaceholder,
+    VideoPanel,
+)
 from stream_server import LiveStreamProcessor, StreamService, StreamSettings, create_http_server, load_stream_configuration
 
 
@@ -74,6 +83,37 @@ class StreamServerTests(unittest.TestCase):
             window.playback_row.y(),
             window.video_stack.geometry().bottom() + window.video_stack.parentWidget().layout().spacing() + 1,
         )
+
+        window.close()
+        app.quit()
+
+    def test_placeholder_selection_keeps_video_panel_inside_main_window(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        window.show()
+
+        with TemporaryDirectory() as directory:
+            video_path = Path(directory) / "sample.avi"
+            writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"MJPG"), 10, (32, 32), True)
+            writer.write(np.zeros((32, 32, 3), dtype=np.uint8))
+            writer.release()
+
+            window._show_video_placeholders(MODE_SINGLE)
+            top_level_widgets_before = set(QApplication.topLevelWidgets())
+            window._set_placeholder_video_path(0, video_path)
+            QApplication.processEvents()
+
+            self.assertEqual(len(window.panels), 1)
+            self.assertIs(window.panels[0].parentWidget(), window.video_row)
+            self.assertNotIn(window.panels[0], QApplication.topLevelWidgets())
+            self.assertFalse(
+                any(
+                    widget.isVisible() and isinstance(widget, (VideoDropPlaceholder, VideoPanel))
+                    for widget in set(QApplication.topLevelWidgets()) - top_level_widgets_before
+                )
+            )
 
         window.close()
         app.quit()

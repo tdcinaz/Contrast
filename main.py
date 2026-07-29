@@ -3330,9 +3330,9 @@ class ContrastWindow(QMainWindow):
 
     def _clear_video_panels(self) -> None:
         for panel in self.panels:
-            panel.close()
             self.video_layout.removeWidget(panel)
-            panel.setParent(None)
+            panel.hide()
+            panel.deleteLater()
         self.panels = []
         self.pre_panel = None
         self.post_panel = None
@@ -3360,9 +3360,9 @@ class ContrastWindow(QMainWindow):
         for index, path in enumerate(videos):
             color = PANEL_COLORS[min(index, len(PANEL_COLORS) - 1)]
             panel = (
-                VideoPanel(labels[index], color, path, live_input=True)
+                VideoPanel(labels[index], color, path, parent=self.video_row, live_input=True)
                 if live_input
-                else VideoPanel(labels[index], color, path)
+                else VideoPanel(labels[index], color, path, parent=self.video_row)
             )
             panel.roiChanged.connect(self.on_roi_changed)
             self.video_layout.addWidget(panel)
@@ -3429,15 +3429,15 @@ class ContrastWindow(QMainWindow):
         for placeholder in self.video_placeholders:
             if placeholder is None:
                 continue
-            placeholder.close()
             self.video_placeholder_layout.removeWidget(placeholder)
-            placeholder.setParent(None)
+            placeholder.hide()
+            placeholder.deleteLater()
         for panel in self.pending_preview_panels:
             if panel is None:
                 continue
-            panel.close()
             self.video_placeholder_layout.removeWidget(panel)
-            panel.setParent(None)
+            panel.hide()
+            panel.deleteLater()
         self.video_placeholders = []
         self.pending_preview_panels = []
         self.pending_slot_labels = []
@@ -3458,6 +3458,7 @@ class ContrastWindow(QMainWindow):
                 label,
                 color,
                 path,
+                parent=self.video_placeholder_row,
                 live_input=self.pending_mode == MODE_LIVE,
             )
             preview_panel.set_comparison(False, 0)
@@ -3491,7 +3492,7 @@ class ContrastWindow(QMainWindow):
 
         for index, label in enumerate(labels):
             color = PANEL_COLORS[min(index, len(PANEL_COLORS) - 1)]
-            placeholder = VideoDropPlaceholder(label, color)
+            placeholder = VideoDropPlaceholder(label, color, parent=self.video_placeholder_row)
             placeholder.fileDialogRequested.connect(lambda index=index: self._request_placeholder_video(index))
             placeholder.fileDropped.connect(lambda path, index=index: self._set_placeholder_video_path(index, cast(Path, path)))
             self.video_placeholder_layout.addWidget(placeholder)
