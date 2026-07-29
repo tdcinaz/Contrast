@@ -19,18 +19,6 @@ FFDNET_WEIGHTS_URL = "https://github.com/cszn/KAIR/releases/download/v1.0/ffdnet
 FFDNET_WEIGHTS_SHA256 = "3c592bc022b4ec609e5e3b03776267c6297eba2714fd3c5f5dae62c12f7ac9c3"
 MODEL_WEIGHTS = {
     "ffdnet": (FFDNET_WEIGHTS_URL, FFDNET_WEIGHTS_SHA256),
-    "dncnn-15": (
-        "https://github.com/cszn/KAIR/releases/download/v1.0/dncnn_15.pth",
-        "d1f48a581f42bd932de630a13e0b776ace33f6a24efa5572c112028f632a963f",
-    ),
-    "dncnn-25": (
-        "https://github.com/cszn/KAIR/releases/download/v1.0/dncnn_25.pth",
-        "0451a70de9b672ae037270498fbb1c17a1c1c4403785df586ff65df5b858e5b0",
-    ),
-    "dncnn-50": (
-        "https://github.com/cszn/KAIR/releases/download/v1.0/dncnn_50.pth",
-        "83c11202a88e7b238d08107060c909cb3e692f8177d3470d26d3f1a7b3475a83",
-    ),
 }
 
 
@@ -162,7 +150,11 @@ class ContainerDenoiser:
             raise RuntimeError(f"NGC worker exited unexpectedly. {self._error_output()}")
         response = json.loads(line)
         if response.get("status") == "error":
-            raise RuntimeError(str(response.get("message", "NGC worker error")))
+            message = str(response.get("message", "NGC worker error"))
+            traceback_text = response.get("traceback")
+            if traceback_text:
+                message = f"{message}\n{traceback_text}"
+            raise RuntimeError(message)
         return response
 
     def _request(self, request: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
@@ -264,8 +256,3 @@ class ContainerDenoiser:
             self.close()
         except Exception:
             pass
-
-
-class ContainerFFDNetDenoiser(ContainerDenoiser):
-    def __init__(self, weights_path: Path, image: str = NGC_IMAGE) -> None:
-        super().__init__("ffdnet", weights_path, image=image)

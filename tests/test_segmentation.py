@@ -35,8 +35,8 @@ class SegmentationTests(unittest.TestCase):
     def test_current_source_pipeline_skips_source_preparation(self) -> None:
         request = EnhancementRequest(
             generation=1,
-            mode="classical",
-            model_label="Classical",
+            mode="ffdnet-ngc",
+            model_label="NGC FFDNet (Docker)",
             stages=EnhancementStages(),
             parameters=EnhancementParameters(),
             noise_sigma=10,

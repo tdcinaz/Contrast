@@ -294,9 +294,6 @@ class EnhancementParameters:
     gain_max: float = 1.45
     scanline_bias_clip: float = 6.0
     scanline_sigma_y: float = 2.0
-    bilateral_diameter: int = 7
-    bilateral_sigma_color: float = 18.0
-    bilateral_sigma_space: float = 4.0
     temporal_motion_sigma: float = 12.0
     clahe_clip_limit: float = 1.0
     clahe_tile_size: int = 6
@@ -712,15 +709,6 @@ def correct_scanlines(gray: np.ndarray, bias_clip: float, sigma_y: float) -> np.
     row_bias -= np.median(row_bias)
     corrected -= np.clip(row_bias, -bias_clip, bias_clip)[:, np.newaxis]
     return np.clip(corrected, 0, 255).astype(np.uint8)
-
-
-def spatial_bilateral_filter(gray: np.ndarray, diameter: int, sigma_color: float, sigma_space: float) -> np.ndarray:
-    return cv2.bilateralFilter(
-        gray,
-        d=diameter,
-        sigmaColor=sigma_color,
-        sigmaSpace=sigma_space,
-    )
 
 
 def motion_aware_temporal_filter(
@@ -1851,16 +1839,6 @@ class VideoPanel(QFrame):
                 ),
             )
         if stage_key == "denoise":
-            if backend_id == "classical":
-                return (
-                    stage_key,
-                    (
-                        backend_id,
-                        int(parameters.bilateral_diameter),
-                        round(float(parameters.bilateral_sigma_color), 4),
-                        round(float(parameters.bilateral_sigma_space), 4),
-                    ),
-                )
             return (stage_key, (backend_id, int(noise_sigma)))
         if stage_key == "temporal_filter":
             return (stage_key, (round(float(parameters.temporal_motion_sigma), 4),))
@@ -1958,8 +1936,7 @@ class VideoPanel(QFrame):
         if stage_key == "scanline_correction":
             return 0.0025
         if stage_key == "denoise":
-            backend_id = str(stage_token[1][0]) if stage_token[1] else "classical"
-            return 0.0065 if backend_id != "classical" else 0.0035
+            return 0.0065
         if stage_key == "temporal_filter":
             return 0.0022
         if stage_key == "local_contrast":
@@ -1987,8 +1964,7 @@ class VideoPanel(QFrame):
         if stage_key == "scanline_correction":
             return 0.0035
         if stage_key == "denoise":
-            backend_id = str(stage_token[1][0]) if stage_token[1] else "classical"
-            return 0.0090 if backend_id != "classical" else 0.0050
+            return 0.0090
         if stage_key == "temporal_filter":
             return 0.0030
         if stage_key == "local_contrast":
@@ -2065,13 +2041,6 @@ class VideoPanel(QFrame):
             return np.clip(stabilize_frame_gain(frame, target_median, parameters.gain_min, parameters.gain_max), 0, 255)
         if stage_key == "scanline_correction":
             return correct_scanlines(frame, parameters.scanline_bias_clip, parameters.scanline_sigma_y)
-        if stage_key == "denoise":
-            return spatial_bilateral_filter(
-                np.clip(frame, 0, 255).astype(np.uint8),
-                parameters.bilateral_diameter,
-                parameters.bilateral_sigma_color,
-                parameters.bilateral_sigma_space,
-            )
         if stage_key == "local_contrast":
             return enhance_local_contrast(
                 np.clip(frame, 0, 255).astype(np.uint8),
@@ -2105,7 +2074,9 @@ class VideoPanel(QFrame):
         cancel_callback: Callable[[], bool] | None = None,
         frame_executor: AdaptiveFrameExecutor | None = None,
     ) -> bool:
-        backend_id = denoiser.backend_id if denoiser is not None else "classical"
+        if stages.denoise and denoiser is None:
+            raise ValueError("Spatial denoising requires an FFDNet backend.")
+        backend_id = denoiser.backend_id if denoiser is not None else "none"
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
         enabled_stages = stages.enabled_stage_instances(parameters)
         stage_parameters_by_prefix: dict[tuple[tuple[str, tuple[object, ...]], ...], EnhancementParameters] = {}
@@ -4075,9 +4046,6 @@ class ContrastWindow(QMainWindow):
             "roi_threshold_spin": "roiSofteningThreshold",
             "scanline_clip_spin": "scanlineBiasClip",
             "scanline_sigma_spin": "scanlineSigmaY",
-            "bilateral_diameter_spin": "bilateralDiameter",
-            "bilateral_sigma_color_spin": "bilateralSigmaColor",
-            "bilateral_sigma_space_spin": "bilateralSigmaSpace",
             "temporal_sigma_spin": "temporalMotionSigma",
             "clahe_clip_spin": "claheClipLimit",
             "clahe_tile_spin": "claheTileSize",
@@ -4298,9 +4266,6 @@ class ContrastWindow(QMainWindow):
             roi_softening_threshold=float(value("roiSofteningThreshold", 0.10)),
             scanline_bias_clip=float(value("scanlineBiasClip", 6.0)),
             scanline_sigma_y=float(value("scanlineSigmaY", 2.0)),
-            bilateral_diameter=int(value("bilateralDiameter", 7)),
-            bilateral_sigma_color=float(value("bilateralSigmaColor", 18.0)),
-            bilateral_sigma_space=float(value("bilateralSigmaSpace", 4.0)),
             temporal_motion_sigma=float(value("temporalMotionSigma", 12.0)),
             clahe_clip_limit=float(value("claheClipLimit", 1.0)),
             clahe_tile_size=int(value("claheTileSize", 6)),
@@ -4324,20 +4289,19 @@ class ContrastWindow(QMainWindow):
             strength = drawer.findChild(QSpinBox, "denoiseStrength")
             batch_size = drawer.findChild(QSpinBox, "denoiseBatchSize")
             precision = drawer.findChild(QComboBox, "denoisePrecision")
-            active_mode = str(mode.currentData()) if mode is not None else "classical"
+            active_mode = str(mode.currentData()) if mode is not None else "ffdnet-ngc"
             stage_enabled = drawer.enable_button.isChecked()
             uses_ffdnet = stage_enabled and active_mode.startswith("ffdnet")
-            uses_deep_model = stage_enabled and active_mode != "classical"
             if strength_label is not None:
                 strength_label.setEnabled(uses_ffdnet)
             if strength is not None:
                 strength.setEnabled(uses_ffdnet)
                 self._sync_parameter_slider_enabled(strength)
             if batch_size is not None:
-                batch_size.setEnabled(uses_deep_model)
+                batch_size.setEnabled(uses_ffdnet)
                 self._sync_parameter_slider_enabled(batch_size)
             if precision is not None:
-                precision.setEnabled(uses_deep_model)
+                precision.setEnabled(uses_ffdnet)
 
     def _pipeline_scrollbar_reserve_width(self) -> int:
         scrollbar = self.pipeline_controls_scroll.verticalScrollBar()
@@ -4479,11 +4443,7 @@ class ContrastWindow(QMainWindow):
         enhancement_mode_row.addWidget(QLabel("Enhancement model"))
         self.enhancement_mode_combo = QComboBox()
         self.enhancement_mode_combo.addItem("NGC FFDNet (Docker)", "ffdnet-ngc")
-        self.enhancement_mode_combo.addItem("NGC DnCNN 15 (mild)", "dncnn-15-ngc")
-        self.enhancement_mode_combo.addItem("NGC DnCNN 25 (balanced)", "dncnn-25-ngc")
-        self.enhancement_mode_combo.addItem("NGC DnCNN 50 (strong)", "dncnn-50-ngc")
         self.enhancement_mode_combo.addItem("Native FFDNet (GPU)", "ffdnet-native")
-        self.enhancement_mode_combo.addItem("Classical", "classical")
         enhancement_mode_row.addWidget(self.enhancement_mode_combo, 1)
         self.denoise_stage_drawer.content_layout.addLayout(enhancement_mode_row)
 
@@ -4634,35 +4594,6 @@ class ContrastWindow(QMainWindow):
         self.scanline_sigma_spin.setValue(2.0)
         scanline_sigma_row.addWidget(self.scanline_sigma_spin)
         self.scanline_stage_drawer.content_layout.addLayout(scanline_sigma_row)
-
-        denoise_d_row = QHBoxLayout()
-        denoise_d_row.addWidget(QLabel("Classical bilateral diameter"))
-        self.bilateral_diameter_spin = QSpinBox()
-        self.bilateral_diameter_spin.setRange(1, 31)
-        self.bilateral_diameter_spin.setSingleStep(2)
-        self.bilateral_diameter_spin.setValue(7)
-        denoise_d_row.addWidget(self.bilateral_diameter_spin)
-        self.denoise_stage_drawer.content_layout.addLayout(denoise_d_row)
-
-        denoise_sigma_color_row = QHBoxLayout()
-        denoise_sigma_color_row.addWidget(QLabel("Classical sigma color"))
-        self.bilateral_sigma_color_spin = QDoubleSpinBox()
-        self.bilateral_sigma_color_spin.setRange(1.0, 120.0)
-        self.bilateral_sigma_color_spin.setSingleStep(1.0)
-        self.bilateral_sigma_color_spin.setDecimals(1)
-        self.bilateral_sigma_color_spin.setValue(18.0)
-        denoise_sigma_color_row.addWidget(self.bilateral_sigma_color_spin)
-        self.denoise_stage_drawer.content_layout.addLayout(denoise_sigma_color_row)
-
-        denoise_sigma_space_row = QHBoxLayout()
-        denoise_sigma_space_row.addWidget(QLabel("Classical sigma space"))
-        self.bilateral_sigma_space_spin = QDoubleSpinBox()
-        self.bilateral_sigma_space_spin.setRange(1.0, 80.0)
-        self.bilateral_sigma_space_spin.setSingleStep(1.0)
-        self.bilateral_sigma_space_spin.setDecimals(1)
-        self.bilateral_sigma_space_spin.setValue(4.0)
-        denoise_sigma_space_row.addWidget(self.bilateral_sigma_space_spin)
-        self.denoise_stage_drawer.content_layout.addLayout(denoise_sigma_space_row)
 
         temporal_row = QHBoxLayout()
         temporal_row.addWidget(QLabel("Motion sensitivity sigma"))
@@ -4823,9 +4754,6 @@ class ContrastWindow(QMainWindow):
             self.roi_threshold_spin,
             self.scanline_clip_spin,
             self.scanline_sigma_spin,
-            self.bilateral_diameter_spin,
-            self.bilateral_sigma_color_spin,
-            self.bilateral_sigma_space_spin,
             self.temporal_sigma_spin,
             self.clahe_clip_spin,
             self.clahe_tile_spin,
@@ -5229,7 +5157,7 @@ class ContrastWindow(QMainWindow):
 
     def _live_denoiser_for(self, stages: EnhancementStages) -> FrameDenoiser | None:
         mode = str(self.enhancement_mode_combo.currentData())
-        if not stages.denoise or mode == "classical":
+        if not stages.denoise:
             return None
         key = self._denoiser_key(mode)
         denoiser = self.deep_denoisers.get(key)
@@ -5238,11 +5166,9 @@ class ContrastWindow(QMainWindow):
         if mode.endswith("-ngc"):
             from container_denoiser import ContainerDenoiser
 
-            model_name = mode.removesuffix("-ngc")
-            weights_name = "ffdnet_gray.pth" if model_name == "ffdnet" else f"{model_name.replace('-', '_')}.pth"
             denoiser = ContainerDenoiser(
-                model_name,
-                ROOT / "models" / weights_name,
+                "ffdnet",
+                ROOT / "models" / "ffdnet_gray.pth",
                 self.inference_batch_spin.value(),
                 str(self.inference_precision_combo.currentData()),
             )
@@ -5276,15 +5202,14 @@ class ContrastWindow(QMainWindow):
     def on_enhancement_settings_changed(self) -> None:
         active_mode = str(self.enhancement_mode_combo.currentData())
         stages = self.enhancement_stages()
-        use_deep_model = stages.denoise and active_mode != "classical"
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
         self.overlay_mask_check.setEnabled(bool(self.panels) and stages.segmentation)
         self.denoise_strength_label.setEnabled(uses_ffdnet)
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
-        self.inference_batch_spin.setEnabled(use_deep_model)
+        self.inference_batch_spin.setEnabled(uses_ffdnet)
         self._sync_parameter_slider_enabled(self.denoise_strength_spin)
         self._sync_parameter_slider_enabled(self.inference_batch_spin)
-        self.inference_precision_combo.setEnabled(use_deep_model)
+        self.inference_precision_combo.setEnabled(uses_ffdnet)
         self._sync_active_denoise_controls()
         if self.active_mode == MODE_LIVE:
             self._render_live_frame()
@@ -5338,8 +5263,8 @@ class ContrastWindow(QMainWindow):
 
     def _current_backend_id(self, stages: EnhancementStages) -> str:
         mode = str(self.enhancement_mode_combo.currentData())
-        if not stages.denoise or mode == "classical":
-            return "classical"
+        if not stages.denoise:
+            return "none"
         precision = str(self.inference_precision_combo.currentData())
         if mode.endswith("-ngc"):
             return f"{mode.removesuffix('-ngc')}-ngc-26.06-{precision}-batch{self.inference_batch_spin.value()}"
@@ -5504,9 +5429,6 @@ class ContrastWindow(QMainWindow):
             roi_softening_threshold=self.roi_threshold_spin.value(),
             scanline_bias_clip=self.scanline_clip_spin.value(),
             scanline_sigma_y=self.scanline_sigma_spin.value(),
-            bilateral_diameter=self.bilateral_diameter_spin.value(),
-            bilateral_sigma_color=self.bilateral_sigma_color_spin.value(),
-            bilateral_sigma_space=self.bilateral_sigma_space_spin.value(),
             temporal_motion_sigma=self.temporal_sigma_spin.value(),
             clahe_clip_limit=self.clahe_clip_spin.value(),
             clahe_tile_size=self.clahe_tile_spin.value(),
@@ -5526,13 +5448,12 @@ class ContrastWindow(QMainWindow):
     def on_pipeline_stages_changed(self) -> None:
         stages = self.enhancement_stages()
         active_mode = str(self.enhancement_mode_combo.currentData())
-        use_deep_model = stages.denoise and active_mode != "classical"
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
         self.overlay_mask_check.setEnabled(bool(self.panels) and stages.segmentation)
         self.denoise_strength_label.setEnabled(uses_ffdnet)
         self.denoise_strength_spin.setEnabled(uses_ffdnet)
-        self.inference_batch_spin.setEnabled(use_deep_model)
-        self.inference_precision_combo.setEnabled(use_deep_model)
+        self.inference_batch_spin.setEnabled(uses_ffdnet)
+        self.inference_precision_combo.setEnabled(uses_ffdnet)
         self._sync_active_denoise_controls()
         if self.active_mode == MODE_LIVE:
             self._apply_source_pipeline_stages()
@@ -5673,7 +5594,7 @@ class ContrastWindow(QMainWindow):
         if not request.stages.any_enabled:
             return True
 
-        use_deep_model = request.stages.denoise and request.mode != "classical"
+        use_deep_model = request.stages.denoise
         denoiser_base_key = (
             f"{request.mode}:{request.precision}:batch{request.batch_size}"
             if use_deep_model
@@ -5703,15 +5624,9 @@ class ContrastWindow(QMainWindow):
                     if request.mode.endswith("-ngc"):
                         from container_denoiser import ContainerDenoiser
 
-                        model_name = request.mode.removesuffix("-ngc")
-                        weights_name = (
-                            "ffdnet_gray.pth"
-                            if model_name == "ffdnet"
-                            else f"{model_name.replace('-', '_')}.pth"
-                        )
                         self.deep_denoisers[denoiser_key] = ContainerDenoiser(
-                            model_name,
-                            ROOT / "models" / weights_name,
+                            "ffdnet",
+                            ROOT / "models" / "ffdnet_gray.pth",
                             request.batch_size,
                             request.precision,
                         )
@@ -5726,7 +5641,7 @@ class ContrastWindow(QMainWindow):
 
         if cancel_event.is_set():
             return False
-        backend_id = denoisers[0].backend_id if denoisers else "classical"
+        backend_id = denoisers[0].backend_id if denoisers else "none"
         panel_work = [
             panel.estimate_prepare_work(backend_id, request.noise_sigma, request.stages, request.parameters)
             for panel in self.panels
@@ -5739,7 +5654,7 @@ class ContrastWindow(QMainWindow):
                     f"Running {request.model_label} on {denoisers[0].device_name}{worker_label}..."
                 )
             else:
-                self._enhancement_message = "Running classical video enhancement..."
+                self._enhancement_message = "Running video enhancement..."
 
         if len(denoisers) == 1:
             panel_denoisers: list[FrameDenoiser | None] = [SynchronizedFrameDenoiser(denoisers[0])] * len(self.panels)
@@ -6424,15 +6339,13 @@ def run_headless(config_path: Path) -> None:
 
     settings, stages, parameters, noise_sigma, auto_crop_enabled, denoiser_settings = load_stream_configuration(str(config_path))
     denoiser: FrameDenoiser | None = None
-    if stages.denoise and denoiser_settings.mode != "classical":
+    if stages.denoise:
         if denoiser_settings.mode.endswith("-ngc"):
             from container_denoiser import ContainerDenoiser
 
-            model_name = denoiser_settings.mode.removesuffix("-ngc")
-            weights_name = "ffdnet_gray.pth" if model_name == "ffdnet" else f"{model_name.replace('-', '_')}.pth"
             denoiser = ContainerDenoiser(
-                model_name,
-                ROOT / "models" / weights_name,
+                "ffdnet",
+                ROOT / "models" / "ffdnet_gray.pth",
                 denoiser_settings.batch_size,
                 denoiser_settings.precision,
             )

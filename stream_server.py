@@ -23,7 +23,6 @@ from main import (
     apply_image_adjustments,
     segment_dark_contrast,
     smooth_final_frame,
-    spatial_bilateral_filter,
     stabilize_frame_gain,
 )
 
@@ -51,7 +50,7 @@ class StreamSettings:
 
 @dataclass(frozen=True, slots=True)
 class DenoiserSettings:
-    mode: str = "classical"
+    mode: str = "ffdnet-ngc"
     precision: str = "fp16"
     batch_size: int = 1
 
@@ -71,9 +70,6 @@ def _parameters(controls: dict[str, object]) -> EnhancementParameters:
         gain_max=max(gain_min, gain_max),
         scanline_bias_clip=float(_control_value(controls, "scanlineBiasClip", 6.0)),
         scanline_sigma_y=float(_control_value(controls, "scanlineSigmaY", 2.0)),
-        bilateral_diameter=int(_control_value(controls, "bilateralDiameter", 7)),
-        bilateral_sigma_color=float(_control_value(controls, "bilateralSigmaColor", 18.0)),
-        bilateral_sigma_space=float(_control_value(controls, "bilateralSigmaSpace", 4.0)),
         clahe_clip_limit=float(_control_value(controls, "claheClipLimit", 1.0)),
         clahe_tile_size=int(_control_value(controls, "claheTileSize", 6)),
         adjustments_brightness_offset=int(_control_value(controls, "adjustmentsBrightness", 0)),
@@ -128,8 +124,11 @@ def load_stream_configuration(
         stage_parameters = _parameters(controls)
         if key == "denoise":
             noise_sigma = int(_control_value(controls, "denoiseStrength", noise_sigma))
+            mode = str(_control_value(controls, "denoiseMode", "ffdnet-ngc"))
+            if mode not in {"ffdnet-ngc", "ffdnet-native"}:
+                raise ValueError(f"Unsupported headless denoiser mode: {mode}")
             denoiser_settings = DenoiserSettings(
-                mode=str(_control_value(controls, "denoiseMode", "classical")),
+                mode=mode,
                 precision=str(_control_value(controls, "denoisePrecision", "fp16")),
                 batch_size=max(1, int(_control_value(controls, "denoiseBatchSize", 1))),
             )
@@ -196,18 +195,12 @@ class LiveStreamProcessor:
             for stage in self.stages.enabled_stage_instances(self.parameters):
                 stage_parameters = stage.parameters or self.parameters
                 if stage.key == "denoise":
-                    if self.denoiser is not None:
-                        enhanced = self.denoiser.denoise_batch(
-                            [np.clip(enhanced, 0, 255).astype(np.uint8)],
-                            stage.noise_sigma or self.noise_sigma,
-                        )[0]
-                    else:
-                        enhanced = spatial_bilateral_filter(
-                            np.clip(enhanced, 0, 255).astype(np.uint8),
-                            stage_parameters.bilateral_diameter,
-                            stage_parameters.bilateral_sigma_color,
-                            stage_parameters.bilateral_sigma_space,
-                        )
+                    if self.denoiser is None:
+                        raise ValueError("Spatial denoising requires an FFDNet backend.")
+                    enhanced = self.denoiser.denoise_batch(
+                        [np.clip(enhanced, 0, 255).astype(np.uint8)],
+                        stage.noise_sigma or self.noise_sigma,
+                    )[0]
                 elif stage.key == "gain_stabilization":
                     target = 128.0 if stage_parameters.gain_use_auto_target else float(stage_parameters.gain_target_median)
                     enhanced = stabilize_frame_gain(enhanced, target, stage_parameters.gain_min, stage_parameters.gain_max)
