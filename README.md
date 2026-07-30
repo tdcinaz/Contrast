@@ -16,6 +16,8 @@ The app loads these videos by default when they are present in the project folde
 
 Use the **File** menu to choose different videos if needed.
 
+Choose **File > Save as default pipeline settings** to make the current source and live pipeline stages, their order, enabled states, and parameter values the startup defaults. These defaults are stored in [configs/default_pipeline.json](configs/default_pipeline.json) and deliberately do not include video paths.
+
 For live fluoroscope enhancement, choose **File > Switch to live camera mode** and select a video to use as a looping camera simulation. The source crop is measured once from that stream and retained for every live frame. Sequence-dependent stages, including temporal alignment and motion-aware temporal filtering, are unavailable in this mode; the remaining compatible stages are applied directly to each incoming frame.
 
 ## Headless Streaming

@@ -1,0 +1,25 @@
+{
+  "pipeline": [
+    {
+      "controls": {
+        "autoCropSizeOffset": -60
+      },
+      "enabled": true,
+      "key": "auto_crop"
+    },
+    {
+      "controls": {
+        "comparisonSyncOffset": 0.0,
+        "temporalTrimOffset": -2.0
+      },
+      "enabled": true,
+      "key": "temporal_alignment"
+    },
+    {
+      "controls": {},
+      "enabled": true,
+      "key": "brightness_stabilization"
+    }
+  ],
+  "version": 1
+}

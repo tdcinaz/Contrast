@@ -59,6 +59,7 @@ from frame_scheduler import AdaptiveFrameExecutor
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIRECTORY = ROOT / "configs"
 RECENT_CONFIG_FILE = CONFIG_DIRECTORY / "recent.json"
+DEFAULT_PIPELINE_SETTINGS_FILE = CONFIG_DIRECTORY / "default_pipeline.json"
 CONFIG_VERSION = 1
 STREAM_END = object()
 PANEL_COLORS = [QColor("#38bdf8"), QColor("#f97316")]
@@ -3311,6 +3312,7 @@ class ContrastWindow(QMainWindow):
 
         self._build_actions()
         self._build_ui()
+        self._load_default_pipeline_settings()
         self._update_temporal_alignment_controls()
         self._apply_source_pipeline_stages()
         self._apply_style()
@@ -3611,6 +3613,8 @@ class ContrastWindow(QMainWindow):
         self.save_config_action.triggered.connect(self.save_config)
         self.load_config_action = QAction("Load configuration...", self)
         self.load_config_action.triggered.connect(self.load_config)
+        self.save_default_pipeline_settings_action = QAction("Save as default pipeline settings", self)
+        self.save_default_pipeline_settings_action.triggered.connect(self.save_default_pipeline_settings)
         self.export_action = QAction("Export analysis CSV...", self)
         self.export_action.triggered.connect(self.export_csv)
         self.export_action.setEnabled(False)
@@ -3625,6 +3629,7 @@ class ContrastWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.save_config_action)
         file_menu.addAction(self.load_config_action)
+        file_menu.addAction(self.save_default_pipeline_settings_action)
         file_menu.addSeparator()
         file_menu.addAction(self.export_action)
 
@@ -4081,10 +4086,6 @@ class ContrastWindow(QMainWindow):
         self.live_add_stage_button = self._create_add_stage_button("Add live stage")
         self.live_add_stage_button.clicked.connect(lambda: self._show_add_stage_menu("live"))
         self.add_stage_button = self.live_add_stage_button
-
-        self._add_pipeline_stage("auto_crop", pipeline="source")
-        self._add_pipeline_stage("temporal_alignment", pipeline="source")
-        self._add_pipeline_stage("brightness_stabilization", pipeline="live")
 
         self._refresh_pipeline_stage_ui()
         controls_layout.addStretch()
@@ -6327,6 +6328,19 @@ class ContrastWindow(QMainWindow):
             "analysis": {"clearance_threshold": self.threshold_spin.value()},
         }
 
+    def _pipeline_settings_data(self) -> dict[str, object]:
+        return {
+            "version": CONFIG_VERSION,
+            "pipeline": [
+                {
+                    "key": drawer.stage_key,
+                    "enabled": drawer.enable_button.isChecked(),
+                    "controls": self._drawer_control_values(drawer),
+                }
+                for drawer in self.pipeline_stage_drawers
+            ],
+        }
+
     def _set_drawer_control_values(self, drawer: StageDrawer, values: dict[str, object]) -> None:
         for name, value in values.items():
             widget = drawer.findChild(QWidget, name)
@@ -6347,12 +6361,26 @@ class ContrastWindow(QMainWindow):
             finally:
                 widget.blockSignals(False)
 
-    def _validate_config_data(self, config: object) -> tuple[dict[str, object], list[Path]]:
+    def _validate_pipeline_settings_data(self, config: object) -> dict[str, object]:
         if not isinstance(config, dict) or config.get("version") != CONFIG_VERSION:
             raise ValueError(f"Unsupported configuration version. Expected version {CONFIG_VERSION}.")
-        videos = config.get("videos")
         pipeline = config.get("pipeline")
-        if not isinstance(videos, dict) or not isinstance(pipeline, list):
+        if not isinstance(pipeline, list):
+            raise ValueError("Configuration must include a pipeline section.")
+        for stage in pipeline:
+            if not isinstance(stage, dict) or stage.get("key") not in self.stage_drawer_templates:
+                raise ValueError("Configuration contains an unknown pipeline stage.")
+            if not isinstance(stage.get("enabled"), bool):
+                raise ValueError("Each pipeline stage must define an enabled state.")
+            controls = stage.get("controls", {})
+            if not isinstance(controls, dict):
+                raise ValueError("Pipeline stage controls must be an object.")
+        return config
+
+    def _validate_config_data(self, config: object) -> tuple[dict[str, object], list[Path]]:
+        config = self._validate_pipeline_settings_data(config)
+        videos = config.get("videos")
+        if not isinstance(videos, dict):
             raise ValueError("Configuration must include videos and pipeline sections.")
 
         video_paths: list[Path]
@@ -6377,15 +6405,39 @@ class ContrastWindow(QMainWindow):
         missing = [str(path) for path in video_paths if not path.is_file()]
         if missing:
             raise ValueError("Configured video files are unavailable: " + ", ".join(missing))
-        for stage in pipeline:
-            if not isinstance(stage, dict) or stage.get("key") not in self.stage_drawer_templates:
-                raise ValueError("Configuration contains an unknown pipeline stage.")
-            if not isinstance(stage.get("enabled"), bool):
-                raise ValueError("Each pipeline stage must define an enabled state.")
-            controls = stage.get("controls", {})
-            if not isinstance(controls, dict):
-                raise ValueError("Pipeline stage controls must be an object.")
         return config, video_paths
+
+    def _apply_pipeline_settings(self, pipeline: list[dict[str, object]]) -> None:
+        for drawer in self.pipeline_stage_drawers:
+            self._pipeline_layout_for(drawer).removeWidget(drawer)
+            drawer.hide()
+            drawer.setParent(None)
+        self.pipeline_stage_drawers = []
+        self.source_pipeline_stage_drawers = []
+        self.live_pipeline_stage_drawers = []
+        self._sync_pipeline_stage_lists()
+
+        for stage in pipeline:
+            drawer = self._add_pipeline_stage(cast(str, stage["key"]))
+            self._set_drawer_control_values(drawer, cast(dict[str, object], stage.get("controls", {})))
+            drawer.enable_button.blockSignals(True)
+            drawer.enable_button.setChecked(cast(bool, stage["enabled"]))
+            drawer.enable_button.blockSignals(False)
+
+        self._sync_pipeline_stage_lists()
+        self._refresh_pipeline_stage_ui()
+        self._sync_active_denoise_controls()
+
+    def _load_default_pipeline_settings(self) -> None:
+        try:
+            config = self._validate_pipeline_settings_data(json.loads(DEFAULT_PIPELINE_SETTINGS_FILE.read_text()))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return
+        self._loading_config = True
+        try:
+            self._apply_pipeline_settings(cast(list[dict[str, object]], config["pipeline"]))
+        finally:
+            self._loading_config = False
 
     def _remember_recent_config(self, path: Path) -> None:
         CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -6433,6 +6485,17 @@ class ContrastWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"Saved configuration to {config_path}")
 
+    def save_default_pipeline_settings(self) -> None:
+        try:
+            CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+            DEFAULT_PIPELINE_SETTINGS_FILE.write_text(
+                json.dumps(self._pipeline_settings_data(), indent=2, sort_keys=True) + "\n"
+            )
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not save default pipeline settings", str(exc))
+            return
+        self.statusBar().showMessage(f"Saved default pipeline settings to {DEFAULT_PIPELINE_SETTINGS_FILE}")
+
     def load_config(self) -> None:
         CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getOpenFileName(
@@ -6472,22 +6535,8 @@ class ContrastWindow(QMainWindow):
         try:
             videos = cast(dict[str, object], config["videos"])
             self._set_video_panels(video_paths, live_input=videos.get("mode") == MODE_LIVE)
-            for drawer in self.pipeline_stage_drawers:
-                self._pipeline_layout_for(drawer).removeWidget(drawer)
-                drawer.hide()
-                drawer.setParent(None)
-            self.pipeline_stage_drawers = []
-            self.source_pipeline_stage_drawers = []
-            self.live_pipeline_stage_drawers = []
-            self._sync_pipeline_stage_lists()
-
             pipeline = cast(list[dict[str, object]], config["pipeline"])
-            for stage in pipeline:
-                drawer = self._add_pipeline_stage(cast(str, stage["key"]))
-                self._set_drawer_control_values(drawer, cast(dict[str, object], stage.get("controls", {})))
-                drawer.enable_button.blockSignals(True)
-                drawer.enable_button.setChecked(cast(bool, stage["enabled"]))
-                drawer.enable_button.blockSignals(False)
+            self._apply_pipeline_settings(pipeline)
 
             view = config.get("view", {})
             if isinstance(view, dict):
@@ -6503,10 +6552,7 @@ class ContrastWindow(QMainWindow):
                 if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
                     self.threshold_spin.setValue(float(threshold))
 
-            self._sync_pipeline_stage_lists()
-            self._refresh_pipeline_stage_ui()
             self._set_live_incompatible_stages_enabled(self.active_mode != MODE_LIVE)
-            self._sync_active_denoise_controls()
             self._sync_trimmed_video_window()
             frame_index = view.get("frame_index", 0) if isinstance(view, dict) else 0
             self.set_frame_index(frame_index if isinstance(frame_index, int) else 0)

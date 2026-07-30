@@ -14,6 +14,9 @@ models/
 
 # User configuration files
 configs/
+!configs/
+configs/*.json
+!configs/default_pipeline.json
 
 # Video
 *.mp4

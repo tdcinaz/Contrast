@@ -12,7 +12,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QFrame
+from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QFrame, QSpinBox
 
 import main
 from main import (
@@ -173,6 +173,35 @@ class SegmentationTests(unittest.TestCase):
 
         self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
         self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization"])
+
+    def test_default_pipeline_settings_restore_stages_without_video_paths(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        with TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "default_pipeline.json"
+            with patch.object(main, "DEFAULT_PIPELINE_SETTINGS_FILE", settings_path):
+                window = ContrastWindow()
+                self.addCleanup(window.close)
+                auto_crop = window._add_pipeline_stage("auto_crop")
+                auto_crop.findChild(QSpinBox, "autoCropSizeOffset").setValue(64)
+                brightness = window._add_pipeline_stage("brightness_stabilization")
+                brightness.enable_button.setChecked(False)
+
+                window.save_default_pipeline_settings()
+
+                saved = main.json.loads(settings_path.read_text())
+                self.assertEqual(set(saved), {"version", "pipeline"})
+                self.assertNotIn("videos", saved)
+
+                restored_window = ContrastWindow()
+                self.addCleanup(restored_window.close)
+
+        self.assertEqual([drawer.stage_key for drawer in restored_window.source_pipeline_stage_drawers], ["auto_crop"])
+        self.assertEqual([drawer.stage_key for drawer in restored_window.live_pipeline_stage_drawers], ["brightness_stabilization"])
+        self.assertEqual(
+            restored_window.source_pipeline_stage_drawers[0].findChild(QSpinBox, "autoCropSizeOffset").value(),
+            64,
+        )
+        self.assertFalse(restored_window.live_pipeline_stage_drawers[0].enable_button.isChecked())
 
     def test_video_selection_queues_pipeline_without_sync_source_work(self) -> None:
         app = QApplication.instance() or QApplication([])
