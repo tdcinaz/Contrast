@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QStyle,
+    QTabWidget,
     QToolButton,
     QToolBar,
     QVBoxLayout,
@@ -357,6 +358,10 @@ class AnalysisResult:
     residence_time: float | None
     peak_signal: float
     auc: float
+
+
+def average_frame_brightness(frames: list[np.ndarray]) -> np.ndarray:
+    return np.asarray([float(np.mean(frame)) for frame in frames], dtype=float)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3214,6 +3219,7 @@ class ContrastWindow(QMainWindow):
         self.is_playing = False
         self.current_frame_index = 0
         self.results: dict[str, AnalysisResult] = {}
+        self.frame_brightness_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self.deep_denoisers: dict[str, FrameDenoiser] = {}
         self._enhancement_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="enhancement-coordinator")
         self._enhancement_future: Future[bool] | None = None
@@ -3279,6 +3285,7 @@ class ContrastWindow(QMainWindow):
             "roi_extraction",
             "temporal_filter",
             "roi_residence_analysis",
+            "frame_brightness_analysis",
         ):
             for drawer in self._stage_drawers(stage_key):
                 if not enabled:
@@ -3892,6 +3899,11 @@ class ContrastWindow(QMainWindow):
             "ROI residence analysis",
             13,
         )
+        self.frame_brightness_analysis_stage_drawer = StageDrawer(
+            "frame_brightness_analysis",
+            "Frame brightness analysis",
+            14,
+        )
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
         self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
         self.gain_stage_check = self.gain_stage_drawer.enable_button
@@ -3905,6 +3917,7 @@ class ContrastWindow(QMainWindow):
         self.smoothing_stage_check = self.smoothing_stage_drawer.enable_button
         self.segmentation_stage_check = self.segmentation_stage_drawer.enable_button
         self.analysis_stage_check = self.analysis_stage_drawer.enable_button
+        self.frame_brightness_analysis_stage_check = self.frame_brightness_analysis_stage_drawer.enable_button
         self.source_pipeline_stage_checks = [
             self.auto_crop_stage_check,
             self.temporal_alignment_stage_check,
@@ -3925,6 +3938,7 @@ class ContrastWindow(QMainWindow):
             *self.source_pipeline_stage_checks,
             *self.frame_pipeline_stage_checks,
             self.analysis_stage_check,
+            self.frame_brightness_analysis_stage_check,
         ]
         self.source_pipeline_stage_drawers = [
             self.auto_crop_stage_drawer,
@@ -3945,6 +3959,7 @@ class ContrastWindow(QMainWindow):
         self.live_pipeline_stage_drawers = [
             *self.frame_pipeline_stage_drawers,
             self.analysis_stage_drawer,
+            self.frame_brightness_analysis_stage_drawer,
         ]
         self.pipeline_stage_drawers = [
             *self.source_pipeline_stage_drawers,
@@ -4181,6 +4196,7 @@ class ContrastWindow(QMainWindow):
                 "roi_extraction",
                 "temporal_filter",
                 "roi_residence_analysis",
+                "frame_brightness_analysis",
             }
             stage_keys = tuple(key for key in stage_keys if key not in unavailable)
         for key in stage_keys:
@@ -4346,8 +4362,18 @@ class ContrastWindow(QMainWindow):
         plot_layout.setContentsMargins(14, 14, 14, 14)
         plot_layout.setSpacing(10)
 
+        self.analysis_tabs = QTabWidget()
+        residence_panel = QWidget()
+        residence_layout = QGridLayout(residence_panel)
+        residence_layout.setContentsMargins(0, 0, 0, 0)
+        residence_layout.setSpacing(10)
         self.normalized_plot = pg.PlotWidget(title="Normalized Contrast Residence")
         self.raw_plot = pg.PlotWidget(title="Denoised ROI Brightness")
+        self.frame_brightness_panel = QWidget()
+        self.frame_brightness_layout = QVBoxLayout(self.frame_brightness_panel)
+        self.frame_brightness_layout.setContentsMargins(0, 0, 0, 0)
+        self.frame_brightness_layout.setSpacing(10)
+        self.frame_brightness_plots: dict[str, pg.PlotWidget] = {}
         for plot in [self.normalized_plot, self.raw_plot]:
             plot.setBackground("#111827")
             plot.showGrid(x=True, y=True, alpha=0.25)
@@ -4361,8 +4387,11 @@ class ContrastWindow(QMainWindow):
         self.raw_plot.setLabel("bottom", "Time", units="s")
         self.raw_plot.setLabel("left", "Mean pixel value")
 
-        plot_layout.addWidget(self.normalized_plot, 0, 0)
-        plot_layout.addWidget(self.raw_plot, 1, 0)
+        residence_layout.addWidget(self.normalized_plot, 0, 0)
+        residence_layout.addWidget(self.raw_plot, 1, 0)
+        self.analysis_tabs.addTab(residence_panel, "ROI residence")
+        self.analysis_tabs.addTab(self.frame_brightness_panel, "Frame brightness")
+        plot_layout.addWidget(self.analysis_tabs, 0, 0)
         return plot_group
 
     def _collapse_graph_panel_by_default(self) -> None:
@@ -5069,12 +5098,16 @@ class ContrastWindow(QMainWindow):
     def _update_stage_statuses(self) -> None:
         roi_drawers = self._stage_drawers("roi_extraction")
         analysis_drawers = self._stage_drawers("roi_residence_analysis")
+        frame_brightness_drawers = self._stage_drawers("frame_brightness_analysis")
         analysis_enabled = self._has_enabled_stage("roi_residence_analysis")
+        frame_brightness_enabled = self._has_enabled_stage("frame_brightness_analysis")
         if not self.panels:
             for drawer in roi_drawers:
                 drawer.set_status("Load video files to run ROI extraction.", analysis_enabled)
             for drawer in analysis_drawers:
                 drawer.set_status("Load video files to run ROI residence analysis.", analysis_enabled)
+            for drawer in frame_brightness_drawers:
+                drawer.set_status("Load video files to run frame brightness analysis.", frame_brightness_enabled)
             return
         if not self._has_enabled_stage("roi_extraction"):
             extraction_message = "Disabled. Enable this stage to extract aneurysm ROI masks from the current enhanced video."
@@ -5096,18 +5129,27 @@ class ContrastWindow(QMainWindow):
         if not analysis_enabled:
             for drawer in analysis_drawers:
                 drawer.set_status(None)
-            return
-        failure = self._analysis_requirement_failure()
-        if failure is not None:
-            for drawer in analysis_drawers:
-                drawer.set_status(failure, True)
-            return
-        if self._enhancement_future is not None:
-            for drawer in analysis_drawers:
-                drawer.set_status("Waiting for upstream ROI extraction to finish.", False)
-            return
-        for drawer in analysis_drawers:
-            drawer.set_status("Ready to analyze the current ROI masks.", False)
+        else:
+            failure = self._analysis_requirement_failure()
+            if failure is not None:
+                for drawer in analysis_drawers:
+                    drawer.set_status(failure, True)
+            elif self._enhancement_future is not None:
+                for drawer in analysis_drawers:
+                    drawer.set_status("Waiting for upstream ROI extraction to finish.", False)
+            else:
+                for drawer in analysis_drawers:
+                    drawer.set_status("Ready to analyze the current ROI masks.", False)
+
+        if not frame_brightness_enabled:
+            for drawer in frame_brightness_drawers:
+                drawer.set_status(None)
+        elif self._enhancement_future is not None:
+            for drawer in frame_brightness_drawers:
+                drawer.set_status("Waiting for enhanced video frames.", False)
+        else:
+            for drawer in frame_brightness_drawers:
+                drawer.set_status("Ready to compare original and enhanced frame brightness.", False)
 
     def on_roi_changed(self) -> None:
         if not self.panels:
@@ -5253,6 +5295,7 @@ class ContrastWindow(QMainWindow):
         return (
             self.enhancement_stages().any_enabled
             or self._has_enabled_stage("roi_residence_analysis")
+            or self._has_enabled_stage("frame_brightness_analysis")
             or self._has_enabled_stage("auto_crop")
             or self._has_enabled_stage("temporal_alignment")
             or any(
@@ -5279,7 +5322,9 @@ class ContrastWindow(QMainWindow):
             *self.live_pipeline_stage_drawers,
         ]
         self.frame_pipeline_stage_drawers = [
-            drawer for drawer in self.live_pipeline_stage_drawers if drawer.stage_key != "roi_residence_analysis"
+            drawer
+            for drawer in self.live_pipeline_stage_drawers
+            if drawer.stage_key not in {"roi_residence_analysis", "frame_brightness_analysis"}
         ]
         self.source_pipeline_stage_checks = [item.enable_button for item in self.source_pipeline_stage_drawers]
         self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
@@ -5823,7 +5868,11 @@ class ContrastWindow(QMainWindow):
             for panel in self.panels:
                 panel.seek(self.current_frame_index)
             self._update_stage_statuses()
-            if self._has_enabled_stage("roi_residence_analysis") and self.run_analysis():
+            roi_analysis_updated = self._has_enabled_stage("roi_residence_analysis") and self.run_analysis()
+            if self._has_enabled_stage("frame_brightness_analysis"):
+                self.run_frame_brightness_analysis()
+                return
+            if roi_analysis_updated:
                 return
             failure = self._analysis_requirement_failure()
             self.statusBar().showMessage(failure if failure is not None else "Video enhancement complete.")
@@ -5907,6 +5956,40 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage("ROI residence analysis updated from the current enhanced pipeline output.")
         return True
 
+    def run_frame_brightness_analysis(self) -> bool:
+        if not self.panels or self._enhancement_future is not None:
+            return False
+
+        stages = self.enhancement_stages()
+        parameters = self.enhancement_parameters()
+        backend_id = self._current_backend_id(stages)
+        results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for panel in self.panels:
+            source_frames = panel.source_gray_frames
+            enhanced_frames = panel.analysis_frames(
+                backend_id,
+                self.denoise_strength_spin.value(),
+                stages,
+                parameters,
+            )
+            if source_frames is None or enhanced_frames is None:
+                return False
+            frame_count = min(len(source_frames), len(enhanced_frames))
+            if frame_count == 0:
+                return False
+            time = np.arange(frame_count, dtype=float) / panel.info.fps
+            results[panel.label] = (
+                time,
+                average_frame_brightness(source_frames[:frame_count]),
+                average_frame_brightness(enhanced_frames[:frame_count]),
+            )
+
+        self.frame_brightness_results = results
+        self.refresh_frame_brightness_plot()
+        self._update_stage_statuses()
+        self.statusBar().showMessage("Frame brightness analysis updated from the current enhanced pipeline output.")
+        return True
+
     def refresh_analysis_from_existing(self) -> None:
         if not self.results:
             return
@@ -5917,6 +6000,8 @@ class ContrastWindow(QMainWindow):
     def clear_plots_and_metrics(self) -> None:
         self.normalized_plot.clear()
         self.raw_plot.clear()
+        self._clear_frame_brightness_plots()
+        self.frame_brightness_results.clear()
         self.pre_card.set_metric("--")
         self.post_card.set_metric("--")
         self.delta_card.set_metric("--")
@@ -5954,6 +6039,49 @@ class ContrastWindow(QMainWindow):
         if pre and post and pre.residence_time is not None and post.residence_time is not None:
             delta = post.residence_time - pre.residence_time
             self.delta_card.set_metric(f"{delta:+.2f} s", "post minus pre")
+
+    def refresh_frame_brightness_plot(self) -> None:
+        self._clear_frame_brightness_plots()
+        for panel in self.panels:
+            result = self.frame_brightness_results.get(panel.label)
+            if result is None:
+                continue
+            time, source_brightness, enhanced_brightness = result
+            color = panel.color.name()
+            plot = pg.PlotWidget(title=f"{panel.label} Average Frame Brightness")
+            plot.setBackground("#111827")
+            plot.showGrid(x=True, y=True, alpha=0.25)
+            plot.getAxis("bottom").setPen("#8aa0b8")
+            plot.getAxis("left").setPen("#8aa0b8")
+            plot.getAxis("bottom").setTextPen("#cbd5e1")
+            plot.getAxis("left").setTextPen("#cbd5e1")
+            plot.setLabel("bottom", "Time", units="s")
+            plot.setLabel("left", "Mean pixel value")
+            plot.addLegend(offset=(12, 12))
+            plot.plot(
+                time,
+                source_brightness,
+                pen=pg.mkPen(color, width=1.5, style=Qt.PenStyle.DashLine),
+                name="Original",
+            )
+            plot.plot(
+                time,
+                enhanced_brightness,
+                pen=pg.mkPen(color, width=2.5),
+                name="Enhanced",
+            )
+            if len(time):
+                plot.setXRange(0, time[-1], padding=0)
+            self.frame_brightness_layout.addWidget(plot)
+            self.frame_brightness_plots[panel.label] = plot
+
+    def _clear_frame_brightness_plots(self) -> None:
+        while self.frame_brightness_layout.count():
+            item = self.frame_brightness_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.frame_brightness_plots.clear()
 
     def _metric_detail(self, result: AnalysisResult) -> str:
         return f"arrival {format_seconds(result.arrival_time)} | peak {format_seconds(result.peak_time)} | clear {format_seconds(result.clear_time)}"

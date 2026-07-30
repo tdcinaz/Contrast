@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QFrame
 
 import main
@@ -22,6 +23,7 @@ from main import (
     MODE_LIVE,
     VideoPanel,
     analyze_gray_frames,
+    average_frame_brightness,
     compute_temporal_change_map,
     detect_aneurysm_roi,
     build_analysis_result,
@@ -34,6 +36,33 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_average_frame_brightness_uses_each_full_frame_mean(self) -> None:
+        frames = [
+            np.asarray([[0, 2], [4, 6]], dtype=np.uint8),
+            np.asarray([[10, 12], [14, 16]], dtype=np.uint8),
+        ]
+
+        np.testing.assert_array_equal(average_frame_brightness(frames), np.asarray([3.0, 13.0]))
+
+    def test_frame_brightness_analysis_uses_one_plot_per_comparison_video(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        window.panels = [
+            SimpleNamespace(label="Pre-deployment", color=QColor("#38bdf8")),
+            SimpleNamespace(label="Post-deployment", color=QColor("#f97316")),
+        ]
+        window.frame_brightness_results = {
+            "Pre-deployment": (np.asarray([0.0, 1.0]), np.asarray([80.0, 81.0]), np.asarray([90.0, 91.0])),
+            "Post-deployment": (np.asarray([0.0, 1.0]), np.asarray([82.0, 83.0]), np.asarray([92.0, 93.0])),
+        }
+
+        window.refresh_frame_brightness_plot()
+
+        self.assertEqual(set(window.frame_brightness_plots), {"Pre-deployment", "Post-deployment"})
+        self.assertEqual(window.frame_brightness_layout.count(), 2)
+
     def test_current_source_pipeline_skips_source_preparation(self) -> None:
         request = EnhancementRequest(
             generation=1,
