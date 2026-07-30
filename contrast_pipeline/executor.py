@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 import numpy as np
 
 from .models import EnhancementParameters, EnhancementStages
 from .stages import BUILTIN_STAGES, ExecutionShape, FrameContext, StageRegistry
+
+
+LOGGER = logging.getLogger("contrast.pipeline")
 
 
 class FramePipelineExecutor:
@@ -34,5 +38,10 @@ class FramePipelineExecutor:
                 noise_sigma=stage.noise_sigma if stage.noise_sigma is not None else context.noise_sigma,
                 denoise_batch=context.denoise_batch,
             )
-            output = definition.process_frame(output, parameters, stage_context)
+            try:
+                output = definition.process_frame(output, parameters, stage_context)
+            except Exception:
+                LOGGER.exception("Pipeline stage %s failed for frame shape=%s", stage.key, output.shape)
+                raise
+            LOGGER.debug("Applied pipeline stage %s to frame shape=%s", stage.key, output.shape)
         return output

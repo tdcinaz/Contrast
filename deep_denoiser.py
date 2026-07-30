@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import os
 import sys
 import urllib.request
@@ -10,6 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+
+LOGGER = logging.getLogger("contrast.denoiser.native")
 
 
 def _preload_arm_nvidia_libraries() -> None:
@@ -60,6 +64,7 @@ class FFDNet(nn.Module):
 
 
 def download_weights(destination: Path, url: str, expected_sha256: str) -> str:
+    LOGGER.info("Downloading FFDNet weights to %s", destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".download")
     try:
@@ -75,6 +80,7 @@ def download_weights(destination: Path, url: str, expected_sha256: str) -> str:
 
 def ensure_weights(destination: Path, url: str, expected_sha256: str) -> None:
     if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() == expected_sha256:
+        LOGGER.debug("Validated existing FFDNet weights at %s", destination)
         return
     download_weights(destination, url, expected_sha256)
 
@@ -138,6 +144,7 @@ class _CudaGraphRunner:
             return self._forward(image, sigma)
         state = self._graphs.get(key)
         if state is None:
+            LOGGER.debug("Capturing CUDA graph for input shape %s", key)
             state = self._capture(image, sigma)
             if len(self._graphs) >= self._graph_limit:
                 self._graphs.popitem(last=False)
@@ -167,6 +174,7 @@ class FFDNetDenoiser:
         self.model.eval().to(self.device, memory_format=torch.channels_last)
         torch.backends.cudnn.benchmark = True
         self._runner = _CudaGraphRunner(self.model, precision, uses_sigma=True)
+        LOGGER.info("Initialized native FFDNet denoiser on %s with precision=%s", self.device_name, precision)
 
     @property
     def device_name(self) -> str:
@@ -183,6 +191,7 @@ class FFDNetDenoiser:
     def denoise_array(self, images: np.ndarray, noise_sigma: float) -> list[np.ndarray]:
         if images.ndim != 3 or images.dtype != np.uint8:
             raise ValueError("FFDNet requires a uint8 grayscale frame batch.")
+        LOGGER.debug("Denoising native batch count=%s shape=%s sigma=%s", len(images), images.shape[1:], noise_sigma)
         tensor = torch.from_numpy(images).to(
             self.device,
             dtype=torch.float32,

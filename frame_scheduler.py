@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import count
 from pathlib import Path
@@ -12,6 +13,7 @@ Parameters = ParamSpec("Parameters")
 Result = TypeVar("Result")
 WORKER_COUNT_ENV = "CONTRAST_FRAME_WORKERS"
 CPU_SYSFS_ROOT = Path("/sys/devices/system/cpu")
+LOGGER = logging.getLogger("contrast.scheduler")
 
 
 def available_cpu_ids() -> tuple[int, ...]:
@@ -62,6 +64,12 @@ class AdaptiveFrameExecutor:
             raise ValueError("max_pending must be at least max_workers")
         performance_cpus = performance_cpu_ids()
         self.cpu_affinity = performance_cpus if self.max_workers <= len(performance_cpus) else available_cpu_ids()
+        LOGGER.info(
+            "Creating frame executor with %s workers, %s pending tasks, affinity CPUs=%s",
+            self.max_workers,
+            self.max_pending,
+            self.cpu_affinity,
+        )
         self._capacity = BoundedSemaphore(self.max_pending)
         affinity_counter = count()
         affinity_lock = Lock()
@@ -72,7 +80,7 @@ class AdaptiveFrameExecutor:
             try:
                 os.sched_setaffinity(0, {cpu_id})
             except (AttributeError, OSError):
-                pass
+                LOGGER.debug("Could not pin worker to CPU %s", cpu_id, exc_info=True)
 
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
@@ -97,6 +105,7 @@ class AdaptiveFrameExecutor:
         return future
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        LOGGER.info("Shutting down frame executor: wait=%s cancel_futures=%s", wait, cancel_futures)
         self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
 
     def __enter__(self) -> AdaptiveFrameExecutor:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,7 @@ from main import (
 
 
 JPEG_CONTENT_TYPES = {"image/jpeg", "image/jpg"}
+LOGGER = logging.getLogger("contrast.stream")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +127,17 @@ def load_stream_configuration(
             )
         instances.append(PipelineStage(key, enabled, stage_parameters, noise_sigma if key == "denoise" else None))
         parameters = stage_parameters
-    return settings, EnhancementStages(instances=tuple(instances)), parameters, noise_sigma, auto_crop_enabled, denoiser_settings
+    stages = EnhancementStages(instances=tuple(instances))
+    LOGGER.info(
+        "Loaded stream configuration %s: host=%s port=%s auto_crop=%s enabled_stages=%s denoiser=%s",
+        config_path,
+        settings.host,
+        settings.port,
+        auto_crop_enabled,
+        [stage.key for stage in stages.instances if stage.enabled],
+        denoiser_settings.mode,
+    )
+    return settings, stages, parameters, noise_sigma, auto_crop_enabled, denoiser_settings
 
 
 class LiveStreamProcessor:
@@ -153,6 +165,13 @@ class LiveStreamProcessor:
         self._crop_rect = None
         self._shape: tuple[int, int] | None = None
         self._lock = Lock()
+        LOGGER.info(
+            "Initialized live stream processor: auto_crop=%s crop_samples=%s jpeg_quality=%s denoiser=%s",
+            auto_crop_enabled,
+            crop_sample_frames,
+            jpeg_quality,
+            getattr(denoiser, "backend_id", "none"),
+        )
 
     @property
     def crop_ready(self) -> bool:
@@ -168,21 +187,25 @@ class LiveStreamProcessor:
         with self._lock:
             height, width = frame.shape[:2]
             if self._shape != (width, height):
+                LOGGER.info("Input dimensions changed from %s to %sx%s; resetting crop state", self._shape, width, height)
                 self._shape = (width, height)
                 self._crop_samples.clear()
                 self._crop_rect = None
             if self._crop_rect is None and self.auto_crop_enabled:
                 self._crop_samples.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
                 if len(self._crop_samples) < self.crop_sample_frames:
+                    LOGGER.debug("Collecting crop sample %s/%s", len(self._crop_samples), self.crop_sample_frames)
                     return None
                 self._crop_rect = _detect_aligned_field_crop(self._crop_samples) or _detect_pillarbox_crop(
                     self._crop_samples, width, height
                 )
                 self._crop_samples.clear()
+                LOGGER.info("Auto-crop selected rectangle %s", self._crop_rect)
             elif self._crop_rect is None:
                 from PySide6.QtCore import QRect
 
                 self._crop_rect = QRect(0, 0, width, height)
+                LOGGER.info("Using full-frame rectangle %s", self._crop_rect)
             enhanced = cv2.cvtColor(crop_frame(frame, self._crop_rect), cv2.COLOR_BGR2GRAY)
             enhanced = self.pipeline.process(
                 enhanced,
@@ -197,6 +220,7 @@ class LiveStreamProcessor:
             ok, output = cv2.imencode(".jpg", np.clip(enhanced, 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ok:
                 raise RuntimeError("Could not encode enhanced frame.")
+            LOGGER.debug("Enhanced frame %sx%s into %s JPEG bytes", width, height, len(output))
             return bytes(output)
 
 
@@ -219,6 +243,7 @@ class StreamService:
                 self._latest_frame = enhanced
                 self._frame_id += 1
                 self._condition.notify_all()
+            LOGGER.debug("Ingested frame=%s egress_ready=%s", self._ingested, enhanced is not None)
             return self._ingested, enhanced is not None
 
     def next_frame(self, last_frame_id: int, timeout: float = 15.0) -> tuple[int, bytes | None]:
@@ -246,9 +271,11 @@ def create_http_server(settings: StreamSettings, service: StreamService) -> Thre
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/health":
+                LOGGER.debug("Health check from %s", self.client_address[0])
                 self._json(HTTPStatus.OK, service.health())
                 return
             if self.path != "/egress.mjpg":
+                LOGGER.warning("Rejected GET %s from %s", self.path, self.client_address[0])
                 self._json(HTTPStatus.NOT_FOUND, {"error": "Use /health or /egress.mjpg."})
                 return
             boundary = b"frame"
@@ -257,6 +284,7 @@ def create_http_server(settings: StreamSettings, service: StreamService) -> Thre
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             frame_id = 0
+            LOGGER.info("MJPEG client connected from %s", self.client_address[0])
             try:
                 while True:
                     frame_id, frame = service.next_frame(frame_id)
@@ -265,15 +293,18 @@ def create_http_server(settings: StreamSettings, service: StreamService) -> Thre
                     self.wfile.write(b"--" + boundary + b"\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
+                LOGGER.info("MJPEG client disconnected from %s", self.client_address[0])
                 return
 
         def do_POST(self) -> None:  # noqa: N802
             if self.path != "/ingest":
+                LOGGER.warning("Rejected POST %s from %s", self.path, self.client_address[0])
                 self._json(HTTPStatus.NOT_FOUND, {"error": "Use POST /ingest with image/jpeg."})
                 return
             content_type = self.headers.get_content_type().lower()
             length = self.headers.get("Content-Length")
             if content_type not in JPEG_CONTENT_TYPES or length is None:
+                LOGGER.warning("Rejected ingest from %s with content type %s", self.client_address[0], content_type)
                 self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "POST one image/jpeg frame with Content-Length."})
                 return
             try:
@@ -281,7 +312,8 @@ def create_http_server(settings: StreamSettings, service: StreamService) -> Thre
                 if size < 1 or size > service.max_frame_bytes:
                     raise ValueError
                 frame_id, ready = service.ingest(self.rfile.read(size))
-            except ValueError:
+            except ValueError as exc:
+                LOGGER.warning("Rejected invalid ingest from %s: %s", self.client_address[0], exc)
                 self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JPEG frame body."})
                 return
             self._json(HTTPStatus.ACCEPTED, {"ingested_frame": frame_id, "egress_ready": ready})
@@ -289,4 +321,6 @@ def create_http_server(settings: StreamSettings, service: StreamService) -> Thre
         def log_message(self, _format: str, *_args: object) -> None:
             return
 
-    return ThreadingHTTPServer((settings.host, settings.port), StreamHandler)
+    server = ThreadingHTTPServer((settings.host, settings.port), StreamHandler)
+    LOGGER.info("Created HTTP stream server at %s:%s", *server.server_address[:2])
+    return server

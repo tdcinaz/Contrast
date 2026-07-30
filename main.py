@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
 import sys
 from collections import deque
@@ -64,6 +65,7 @@ from contrast_pipeline import (
     PipelineStage,
 )
 from frame_scheduler import AdaptiveFrameExecutor
+from logging_setup import configure_logging, install_exception_logging
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIRECTORY = ROOT / "configs"
@@ -77,6 +79,7 @@ MODE_COMPARISON = "comparison"
 MODE_LIVE = "live"
 MODE_RECENT = "recent"
 MODE_SELECT = "select"
+LOGGER = logging.getLogger("contrast.main")
 
 
 class ModeSelectionButton(QPushButton):
@@ -4852,8 +4855,10 @@ class ContrastWindow(QMainWindow):
         try:
             panel.set_video(Path(path))
         except RuntimeError as exc:
+            LOGGER.exception("Could not open %s video from %s", panel.label, path)
             QMessageBox.critical(self, "Could not open video", str(exc))
             return
+        LOGGER.info("Loaded %s video from %s", panel.label, path)
 
         self.results.clear()
         self._sync_trimmed_video_window()
@@ -5769,6 +5774,7 @@ class ContrastWindow(QMainWindow):
             prepared = future.result()
             error: Exception | None = None
         except Exception as exc:
+            LOGGER.exception("Enhancement pipeline failed")
             prepared = False
             error = exc
 
@@ -6201,6 +6207,7 @@ class ContrastWindow(QMainWindow):
         try:
             config = self._validate_pipeline_settings_data(json.loads(DEFAULT_PIPELINE_SETTINGS_FILE.read_text()))
         except (OSError, ValueError, json.JSONDecodeError):
+            LOGGER.warning("Could not load default pipeline settings from %s", DEFAULT_PIPELINE_SETTINGS_FILE, exc_info=True)
             return
         self._loading_config = True
         try:
@@ -6250,8 +6257,10 @@ class ContrastWindow(QMainWindow):
             self._remember_recent_config(config_path)
             self._update_mode_selection_config_actions()
         except OSError as exc:
+            LOGGER.exception("Could not save configuration to %s", config_path)
             QMessageBox.critical(self, "Could not save configuration", str(exc))
             return
+        LOGGER.info("Saved configuration to %s", config_path)
         self.statusBar().showMessage(f"Saved configuration to {config_path}")
 
     def save_default_pipeline_settings(self) -> None:
@@ -6261,8 +6270,10 @@ class ContrastWindow(QMainWindow):
                 json.dumps(self._pipeline_settings_data(), indent=2, sort_keys=True) + "\n"
             )
         except OSError as exc:
+            LOGGER.exception("Could not save default pipeline settings to %s", DEFAULT_PIPELINE_SETTINGS_FILE)
             QMessageBox.critical(self, "Could not save default pipeline settings", str(exc))
             return
+        LOGGER.info("Saved default pipeline settings to %s", DEFAULT_PIPELINE_SETTINGS_FILE)
         self.statusBar().showMessage(f"Saved default pipeline settings to {DEFAULT_PIPELINE_SETTINGS_FILE}")
 
     def load_config(self) -> None:
@@ -6292,10 +6303,12 @@ class ContrastWindow(QMainWindow):
             self._remember_recent_config(path)
             self._update_mode_selection_config_actions()
         except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            LOGGER.exception("Could not load configuration from %s", path)
             if show_error:
                 QMessageBox.critical(self, "Could not load configuration", str(exc))
             return False
         self.statusBar().showMessage(f"Loaded configuration from {path}")
+        LOGGER.info("Loaded configuration from %s", path)
         return True
 
     def _apply_config(self, config: dict[str, object], video_paths: list[Path]) -> None:
@@ -6332,6 +6345,7 @@ class ContrastWindow(QMainWindow):
         self.on_pipeline_stages_changed()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
+        LOGGER.info("Closing desktop application")
         self.enhancement_poll_timer.stop()
         if self._enhancement_cancel is not None:
             self._enhancement_cancel.set()
@@ -6461,6 +6475,7 @@ def normalize_analysis_results(
 def run_headless(config_path: Path) -> None:
     from stream_server import LiveStreamProcessor, StreamService, create_http_server, load_stream_configuration
 
+    LOGGER.info("Loading headless configuration from %s", config_path)
     settings, stages, parameters, noise_sigma, auto_crop_enabled, denoiser_settings = load_stream_configuration(str(config_path))
     denoiser: FrameDenoiser | None = None
     if stages.denoise:
@@ -6490,13 +6505,14 @@ def run_headless(config_path: Path) -> None:
     )
     service = StreamService(processor, settings.max_frame_bytes)
     server = create_http_server(settings, service)
-    print(f"Contrast stream service listening on http://{settings.host}:{settings.port}", flush=True)
-    print("POST JPEG frames to /ingest; read enhanced MJPEG from /egress.mjpg", flush=True)
+    LOGGER.info("Contrast stream service listening on http://%s:%s", settings.host, settings.port)
+    LOGGER.info("POST JPEG frames to /ingest; read enhanced MJPEG from /egress.mjpg")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        LOGGER.info("Headless stream service interrupted")
     finally:
+        LOGGER.info("Shutting down headless stream service")
         server.server_close()
         if denoiser is not None:
             close = getattr(denoiser, "close", None)
@@ -6508,7 +6524,12 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Contrast fluoroscopy enhancement")
     parser.add_argument("--headless", action="store_true", help="Run the HTTP live-stream service without the desktop UI")
     parser.add_argument("--config", type=Path, help="Configuration JSON used by --headless")
+    parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
+    parser.add_argument("--log-file", type=Path, default=ROOT / "logs" / "contrast.log")
     arguments = parser.parse_args(argv)
+    configure_logging(arguments.log_level, arguments.log_file)
+    install_exception_logging()
+    LOGGER.info("Starting Contrast in %s mode", "headless" if arguments.headless else "desktop")
     if arguments.headless:
         if arguments.config is None:
             parser.error("--headless requires --config PATH")

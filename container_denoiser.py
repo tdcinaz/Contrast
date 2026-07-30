@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import selectors
 import shutil
@@ -20,6 +21,7 @@ FFDNET_WEIGHTS_SHA256 = "3c592bc022b4ec609e5e3b03776267c6297eba2714fd3c5f5dae62c
 MODEL_WEIGHTS = {
     "ffdnet": (FFDNET_WEIGHTS_URL, FFDNET_WEIGHTS_SHA256),
 }
+LOGGER = logging.getLogger("contrast.denoiser.container")
 
 
 def ensure_model_weights(model_name: str, destination: Path) -> None:
@@ -28,8 +30,10 @@ def ensure_model_weights(model_name: str, destination: Path) -> None:
     except KeyError as exc:
         raise ValueError(f"Unsupported NGC model: {model_name}") from exc
     if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() == expected_sha256:
+        LOGGER.debug("Validated existing %s weights at %s", model_name, destination)
         return
 
+    LOGGER.info("Downloading %s weights to %s", model_name, destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".download")
     try:
@@ -59,6 +63,7 @@ class ContainerDenoiser:
             raise ValueError(f"Unsupported inference precision: {precision}")
         weights_path = weights_path.resolve()
         ensure_model_weights(model_name, weights_path)
+        LOGGER.info("Starting NGC %s worker: image=%s precision=%s batch_size=%s", model_name, image, precision, batch_size)
 
         image_check = subprocess.run(
             ["docker", "image", "inspect", image],
@@ -68,6 +73,7 @@ class ContainerDenoiser:
             check=False,
         )
         if image_check.returncode:
+            LOGGER.error("Required NGC image is unavailable: %s", image)
             raise RuntimeError(f"NGC image is not available locally: {image}")
 
         project_root = Path(__file__).resolve().parent
@@ -126,6 +132,7 @@ class ContainerDenoiser:
             self.close()
             raise RuntimeError(f"NGC worker failed to start: {ready}")
         self._device_name = str(ready["device"])
+        LOGGER.info("NGC %s worker ready on %s", model_name, self._device_name)
 
     @property
     def device_name(self) -> str:
@@ -194,6 +201,7 @@ class ContainerDenoiser:
             shape=(self.batch_size, *shape),
         )
         self._shape = shape
+        LOGGER.info("Allocating NGC shared buffers: shape=%s capacity=%s directory=%s", shape, self.batch_size, shared_directory)
         self._request(
             {
                 "command": "setup",
@@ -215,6 +223,7 @@ class ContainerDenoiser:
         shape = images[0].shape
         if any(image.shape != shape or image.dtype != np.uint8 for image in images):
             raise ValueError("NGC models require equally sized uint8 grayscale frames.")
+        LOGGER.debug("Sending NGC denoise request: count=%s shape=%s sigma=%s", len(images), shape, noise_sigma)
         self._ensure_buffers(shape)
         assert self._input is not None and self._output is not None
         self._input[: len(images)] = images
@@ -225,6 +234,8 @@ class ContainerDenoiser:
         return [self._output[index].copy() for index in range(len(images))]
 
     def _release_buffers(self) -> None:
+        if self._shape is not None:
+            LOGGER.debug("Releasing NGC shared buffers for shape=%s", self._shape)
         self._input = None
         self._output = None
         for path in (self._input_path, self._output_path):
@@ -235,6 +246,7 @@ class ContainerDenoiser:
         self._shape = None
 
     def close(self) -> None:
+        LOGGER.info("Closing NGC %s worker", getattr(self, "model_name", "denoiser"))
         process = getattr(self, "_process", None)
         if process is not None and process.poll() is None:
             try:
