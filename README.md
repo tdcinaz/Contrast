@@ -38,6 +38,16 @@ curl --data-binary @frame.jpg -H 'Content-Type: image/jpeg' http://localhost:808
 
 View the enhanced output at `http://localhost:8080/egress.mjpg`. [configs/headless_stream_config.json](configs/headless_stream_config.json) is a ready-to-edit example. Headless mode rejects stages that require a full temporal sequence, including temporal alignment, brightness stabilization, ROI extraction, motion-aware filtering, and ROI residence analysis.
 
+## Pipeline Architecture
+
+Pipeline contracts are frontend-neutral and live in `contrast_pipeline/`:
+
+- `models.py` defines immutable stage instances, parameters, and enhancement requests shared by the desktop and headless entry points.
+- `stages.py` is the stage registry. Each definition owns its key, display name, execution shape, cache signature, performance estimates, live compatibility, and optional frame processor.
+- `executor.py` runs live-compatible stages in order and injects runtime services such as denoising without coupling a stage to HTTP, Qt, or a concrete accelerator backend.
+
+To add a stateless filter, implement a frame processor in `contrast_pipeline/stages.py`, register one `StageDefinition`, and add its Qt parameter controls/template. The desktop scheduler and headless service then share its processing, cache metadata, display name, and compatibility rules. Batch, temporal, full-sequence, source, observer, and analysis stages declare an `ExecutionShape`; specialized sequence scheduling remains in the desktop orchestration until a dedicated executor is provided for that shape.
+
 ## Workflow
 
 1. Enable live processing stages in order. The default stage order now places **Aneurysm ROI extraction** second, immediately after gain / brightness stabilization.

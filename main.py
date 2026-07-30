@@ -54,6 +54,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from contrast_pipeline import (
+    BUILTIN_STAGES,
+    EnhancementParameters,
+    EnhancementRequest,
+    EnhancementStages,
+    ExecutionShape,
+    FrameContext,
+    PipelineStage,
+)
 from frame_scheduler import AdaptiveFrameExecutor
 
 ROOT = Path(__file__).resolve().parent
@@ -215,122 +224,6 @@ class VideoInfo:
     @property
     def duration(self) -> float:
         return self.frame_count / self.fps if self.fps else 0.0
-
-
-@dataclass(frozen=True, slots=True)
-class PipelineStage:
-    key: str
-    enabled: bool
-    parameters: EnhancementParameters | None = None
-    noise_sigma: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class EnhancementStages:
-    gain_stabilization: bool = False
-    brightness_stabilization: bool = False
-    roi_extraction: bool = False
-    scanline_correction: bool = False
-    denoise: bool = False
-    temporal_filter: bool = False
-    local_contrast: bool = False
-    image_adjustments: bool = False
-    final_smoothing: bool = False
-    segmentation: bool = False
-    stage_order: tuple[str, ...] = (
-        "brightness_stabilization",
-        "roi_extraction",
-        "gain_stabilization",
-        "scanline_correction",
-        "denoise",
-        "temporal_filter",
-        "local_contrast",
-        "image_adjustments",
-        "final_smoothing",
-        "segmentation",
-    )
-    instances: tuple[PipelineStage, ...] = ()
-
-    @property
-    def any_enabled(self) -> bool:
-        if self.instances:
-            return any(stage.enabled for stage in self.instances)
-        return any(
-            (
-                self.gain_stabilization,
-                self.brightness_stabilization,
-                self.roi_extraction,
-                self.scanline_correction,
-                self.denoise,
-                self.temporal_filter,
-                self.local_contrast,
-                self.image_adjustments,
-                self.final_smoothing,
-                self.segmentation,
-            )
-        )
-
-    @property
-    def enabled_stage_order(self) -> tuple[str, ...]:
-        if self.instances:
-            return tuple(stage.key for stage in self.instances if stage.enabled)
-        return tuple(stage for stage in self.stage_order if bool(getattr(self, stage, False)))
-
-    def enabled_stage_instances(
-        self,
-        default_parameters: EnhancementParameters,
-    ) -> tuple[PipelineStage, ...]:
-        if self.instances:
-            return tuple(stage for stage in self.instances if stage.enabled)
-        return tuple(
-            PipelineStage(key=stage_key, enabled=True, parameters=default_parameters)
-            for stage_key in self.enabled_stage_order
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class EnhancementParameters:
-    gain_use_auto_target: bool = True
-    gain_target_median: int = 128
-    gain_min: float = 0.70
-    gain_max: float = 1.45
-    scanline_bias_clip: float = 6.0
-    scanline_sigma_y: float = 2.0
-    temporal_motion_sigma: float = 12.0
-    clahe_clip_limit: float = 1.0
-    clahe_tile_size: int = 6
-    adjustments_brightness_offset: int = 0
-    adjustments_contrast_gain: float = 1.0
-    adjustments_sharpen_amount: float = 0.0
-    adjustments_gamma: float = 1.0
-    smoothing_sigma_x: float = 0.55
-    roi_softening_enabled: bool = False
-    roi_softening_radius_ratio: float = 0.12
-    roi_softening_threshold: float = 0.10
-    segmentation_mode: str = "dark_contrast"
-    segmentation_block_size: int = 51
-    segmentation_sensitivity: float = 7.0
-    segmentation_change_threshold: float = 12.0
-    segmentation_level_tolerance: int = 12
-    segmentation_min_area: int = 80
-
-
-@dataclass(frozen=True, slots=True)
-class EnhancementRequest:
-    generation: int
-    mode: str
-    model_label: str
-    stages: EnhancementStages
-    parameters: EnhancementParameters
-    noise_sigma: int
-    batch_size: int
-    precision: str
-    auto_crop: bool
-    temporal_alignment: bool
-    source_pipeline_current: bool
-    auto_crop_size_offset: int = 0
-    temporal_trim_offset_seconds: float = 0.0
-    comparison_sync_offset_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1877,62 +1770,7 @@ class VideoPanel(QFrame):
                     round(float(parameters.gain_max), 4),
                 ),
             )
-        if stage_key == "brightness_stabilization":
-            return (stage_key, tuple())
-        if stage_key == "roi_extraction":
-            return (
-                stage_key,
-                (
-                    bool(parameters.roi_softening_enabled),
-                    round(float(parameters.roi_softening_radius_ratio), 4),
-                    round(float(parameters.roi_softening_threshold), 4),
-                ),
-            )
-        if stage_key == "scanline_correction":
-            return (
-                stage_key,
-                (
-                    round(float(parameters.scanline_bias_clip), 4),
-                    round(float(parameters.scanline_sigma_y), 4),
-                ),
-            )
-        if stage_key == "denoise":
-            return (stage_key, (backend_id, int(noise_sigma)))
-        if stage_key == "temporal_filter":
-            return (stage_key, (round(float(parameters.temporal_motion_sigma), 4),))
-        if stage_key == "local_contrast":
-            return (
-                stage_key,
-                (
-                    round(float(parameters.clahe_clip_limit), 4),
-                    int(parameters.clahe_tile_size),
-                ),
-            )
-        if stage_key == "image_adjustments":
-            return (
-                stage_key,
-                (
-                    int(parameters.adjustments_brightness_offset),
-                    round(float(parameters.adjustments_contrast_gain), 4),
-                    round(float(parameters.adjustments_sharpen_amount), 4),
-                    round(float(parameters.adjustments_gamma), 4),
-                ),
-            )
-        if stage_key == "final_smoothing":
-            return (stage_key, (round(float(parameters.smoothing_sigma_x), 4),))
-        if stage_key == "segmentation":
-            return (
-                stage_key,
-                (
-                    str(parameters.segmentation_mode),
-                    int(parameters.segmentation_block_size),
-                    round(float(parameters.segmentation_sensitivity), 4),
-                    round(float(parameters.segmentation_change_threshold), 4),
-                    int(parameters.segmentation_level_tolerance),
-                    int(parameters.segmentation_min_area),
-                ),
-            )
-        return (stage_key, tuple())
+        return BUILTIN_STAGES.require(stage_key).cache_token(parameters, backend_id, noise_sigma)
 
     def _sequence_key(
         self,
@@ -1985,57 +1823,17 @@ class VideoPanel(QFrame):
         stage_key = stage_token[0]
         if stage_key == "source_decode":
             return 0.0025
-        if stage_key == "gain_stabilization":
-            return 0.0012
-        if stage_key == "brightness_stabilization":
-            return 0.0020
-        if stage_key == "roi_extraction":
-            return 0.0018
-        if stage_key == "scanline_correction":
-            return 0.0025
-        if stage_key == "denoise":
-            return 0.0065
-        if stage_key == "temporal_filter":
-            return 0.0022
-        if stage_key == "local_contrast":
-            return 0.0028
-        if stage_key == "image_adjustments":
-            return 0.0016
-        if stage_key == "final_smoothing":
-            return 0.0010
-        if stage_key == "segmentation":
-            return 0.0035
         if stage_key == "encode_enhanced":
             return 0.0018
-        return 0.0020
+        return BUILTIN_STAGES.require(stage_key).default_seconds_per_frame
 
     def _conservative_stage_seconds_per_frame(self, stage_token: tuple[str, tuple[object, ...]]) -> float:
         stage_key = stage_token[0]
         if stage_key == "source_decode":
             return 0.0035
-        if stage_key == "gain_stabilization":
-            return 0.0018
-        if stage_key == "brightness_stabilization":
-            return 0.0030
-        if stage_key == "roi_extraction":
-            return 0.0028
-        if stage_key == "scanline_correction":
-            return 0.0035
-        if stage_key == "denoise":
-            return 0.0090
-        if stage_key == "temporal_filter":
-            return 0.0030
-        if stage_key == "local_contrast":
-            return 0.0038
-        if stage_key == "image_adjustments":
-            return 0.0026
-        if stage_key == "final_smoothing":
-            return 0.0015
-        if stage_key == "segmentation":
-            return 0.0050
         if stage_key == "encode_enhanced":
             return 0.0025
-        return 0.0030
+        return BUILTIN_STAGES.require(stage_key).conservative_seconds_per_frame
 
     def _estimated_stage_duration(self, stage_token: tuple[str, tuple[object, ...]], frame_count: int) -> float:
         seconds_per_frame = self.stage_duration_per_frame.get(stage_token)
@@ -2074,19 +1872,7 @@ class VideoPanel(QFrame):
         return work_units
 
     def _stage_display_name(self, stage_key: str) -> str:
-        names = {
-            "gain_stabilization": "Median gain normalization",
-            "brightness_stabilization": "Gain / brightness stabilization",
-            "roi_extraction": "Aneurysm ROI extraction",
-            "scanline_correction": "Scanline correction",
-            "denoise": "Spatial denoising",
-            "temporal_filter": "Motion-aware temporal filtering",
-            "local_contrast": "Local contrast (CLAHE)",
-            "image_adjustments": "Image adjustments",
-            "final_smoothing": "Final Gaussian smoothing",
-            "segmentation": "Brightness-coded contrast segmentation",
-        }
-        return names.get(stage_key, stage_key.replace("_", " ").title())
+        return BUILTIN_STAGES.require(stage_key).display_name
 
     def _apply_frame_stage(
         self,
@@ -2094,28 +1880,14 @@ class VideoPanel(QFrame):
         frame: np.ndarray,
         parameters: EnhancementParameters,
     ) -> np.ndarray:
-        if stage_key == "gain_stabilization":
-            target_median = self.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
-            return np.clip(stabilize_frame_gain(frame, target_median, parameters.gain_min, parameters.gain_max), 0, 255)
-        if stage_key == "scanline_correction":
-            return correct_scanlines(frame, parameters.scanline_bias_clip, parameters.scanline_sigma_y)
-        if stage_key == "local_contrast":
-            return enhance_local_contrast(
-                np.clip(frame, 0, 255).astype(np.uint8),
-                parameters.clahe_clip_limit,
-                parameters.clahe_tile_size,
-            )
-        if stage_key == "image_adjustments":
-            return apply_image_adjustments(
-                np.clip(frame, 0, 255).astype(np.uint8),
-                parameters.adjustments_brightness_offset,
-                parameters.adjustments_contrast_gain,
-                parameters.adjustments_sharpen_amount,
-                parameters.adjustments_gamma,
-            )
-        if stage_key == "final_smoothing":
-            return smooth_final_frame(np.clip(frame, 0, 255).astype(np.uint8), parameters.smoothing_sigma_x)
-        return frame
+        definition = BUILTIN_STAGES.require(stage_key)
+        if definition.processor is None:
+            return frame
+        return definition.process_frame(
+            frame,
+            parameters,
+            FrameContext(target_median=self.target_median),
+        )
 
     def prepare_enhanced_frames(
         self,
@@ -2132,11 +1904,11 @@ class VideoPanel(QFrame):
         cancel_callback: Callable[[], bool] | None = None,
         frame_executor: AdaptiveFrameExecutor | None = None,
     ) -> bool:
-        if stages.denoise and denoiser is None:
+        enabled_stages = stages.enabled_stage_instances(parameters)
+        if denoiser is None and any(stage.key == "denoise" for stage in enabled_stages):
             raise ValueError("Spatial denoising requires an FFDNet backend.")
         backend_id = denoiser.backend_id if denoiser is not None else "none"
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
-        enabled_stages = stages.enabled_stage_instances(parameters)
         stage_parameters_by_prefix: dict[tuple[tuple[str, tuple[object, ...]], ...], EnhancementParameters] = {}
         prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
         stage_noise_by_prefix: dict[tuple[tuple[str, tuple[object, ...]], ...], int] = {}
@@ -3394,9 +3166,9 @@ class ContrastWindow(QMainWindow):
         for index, path in enumerate(videos):
             color = PANEL_COLORS[min(index, len(PANEL_COLORS) - 1)]
             panel = (
-                VideoPanel(labels[index], color, path, parent=self.video_row, live_input=True)
+                VideoPanel(labels[index], color, path, live_input=True)
                 if live_input
-                else VideoPanel(labels[index], color, path, parent=self.video_row)
+                else VideoPanel(labels[index], color, path)
             )
             panel.roiChanged.connect(self.on_roi_changed)
             self.video_layout.addWidget(panel)
@@ -4271,24 +4043,18 @@ class ContrastWindow(QMainWindow):
 
     def _show_add_stage_menu(self, pipeline: str) -> None:
         menu = QMenu(self)
-        stage_keys = (
-            ("auto_crop", "temporal_alignment")
-            if pipeline == "source"
-            else tuple(key for key in self.stage_drawer_templates if key not in {"auto_crop", "temporal_alignment"})
+        source_stage = pipeline == "source"
+        stage_keys = tuple(
+            key
+            for key in self.stage_drawer_templates
+            if (BUILTIN_STAGES.require(key).execution_shape == ExecutionShape.SOURCE) == source_stage
         )
         if self.active_mode == MODE_LIVE:
-            unavailable = {
-                "temporal_alignment",
-                "brightness_stabilization",
-                "roi_extraction",
-                "temporal_filter",
-                "roi_residence_analysis",
-                "frame_brightness_analysis",
-            }
-            stage_keys = tuple(key for key in stage_keys if key not in unavailable)
+            stage_keys = tuple(
+                key for key in stage_keys if BUILTIN_STAGES.require(key).supports_live(EnhancementParameters())
+            )
         for key in stage_keys:
-            drawer = self.stage_drawer_templates[key]
-            action = menu.addAction(drawer.stage_title)
+            action = menu.addAction(BUILTIN_STAGES.require(key).display_name)
             action.triggered.connect(
                 lambda _checked=False, stage_key=key, target=pipeline: self._add_pipeline_stage(stage_key, pipeline=target)
             )
@@ -4312,7 +4078,10 @@ class ContrastWindow(QMainWindow):
         pipeline: str | None = None,
     ) -> StageDrawer:
         template = self.stage_drawer_templates[stage_key]
-        stage_pipeline = pipeline or ("source" if stage_key in {"auto_crop", "temporal_alignment"} else "live")
+        definition = BUILTIN_STAGES.require(stage_key)
+        stage_pipeline = pipeline or (
+            "source" if definition.execution_shape == ExecutionShape.SOURCE else "live"
+        )
         drawers = self.source_pipeline_stage_drawers if stage_pipeline == "source" else self.live_pipeline_stage_drawers
         drawer = template if template not in drawers else self._copy_stage_drawer(template)
         if drawer not in drawers:

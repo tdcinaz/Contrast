@@ -10,32 +10,22 @@ from typing import Any
 import cv2
 import numpy as np
 
-from main import (
+from contrast_pipeline import (
+    BUILTIN_STAGES,
     EnhancementParameters,
     EnhancementStages,
-    FrameDenoiser,
+    FrameContext,
+    FramePipelineExecutor,
     PipelineStage,
+)
+from main import (
+    FrameDenoiser,
     _detect_aligned_field_crop,
     _detect_pillarbox_crop,
-    correct_scanlines,
     crop_frame,
-    enhance_local_contrast,
-    apply_image_adjustments,
-    segment_dark_contrast,
-    smooth_final_frame,
-    stabilize_frame_gain,
 )
 
 
-LIVE_UNSUPPORTED_STAGES = frozenset(
-    {
-        "temporal_alignment",
-        "brightness_stabilization",
-        "roi_extraction",
-        "temporal_filter",
-        "roi_residence_analysis",
-    }
-)
 JPEG_CONTENT_TYPES = {"image/jpeg", "image/jpg"}
 
 
@@ -116,12 +106,13 @@ def load_stream_configuration(
         controls = item.get("controls", {})
         if not isinstance(key, str) or not isinstance(enabled, bool) or not isinstance(controls, dict):
             raise ValueError("Each pipeline stage requires key, enabled, and controls values.")
-        if enabled and key in LIVE_UNSUPPORTED_STAGES:
-            raise ValueError(f"{key} is not supported for headless live streams.")
+        definition = BUILTIN_STAGES.require(key)
         if key == "auto_crop":
             auto_crop_enabled = enabled
             continue
         stage_parameters = _parameters(controls)
+        if enabled and not definition.supports_live(stage_parameters):
+            raise ValueError(f"{key} is not supported for headless live streams.")
         if key == "denoise":
             noise_sigma = int(_control_value(controls, "denoiseStrength", noise_sigma))
             mode = str(_control_value(controls, "denoiseMode", "ffdnet-ngc"))
@@ -157,6 +148,7 @@ class LiveStreamProcessor:
         self.jpeg_quality = jpeg_quality
         self.auto_crop_enabled = auto_crop_enabled
         self.denoiser = denoiser
+        self.pipeline = FramePipelineExecutor()
         self._crop_samples: list[np.ndarray] = []
         self._crop_rect = None
         self._shape: tuple[int, int] | None = None
@@ -192,28 +184,16 @@ class LiveStreamProcessor:
 
                 self._crop_rect = QRect(0, 0, width, height)
             enhanced = cv2.cvtColor(crop_frame(frame, self._crop_rect), cv2.COLOR_BGR2GRAY)
-            for stage in self.stages.enabled_stage_instances(self.parameters):
-                stage_parameters = stage.parameters or self.parameters
-                if stage.key == "denoise":
-                    if self.denoiser is None:
-                        raise ValueError("Spatial denoising requires an FFDNet backend.")
-                    enhanced = self.denoiser.denoise_batch(
-                        [np.clip(enhanced, 0, 255).astype(np.uint8)],
-                        stage.noise_sigma or self.noise_sigma,
-                    )[0]
-                elif stage.key == "gain_stabilization":
-                    target = 128.0 if stage_parameters.gain_use_auto_target else float(stage_parameters.gain_target_median)
-                    enhanced = stabilize_frame_gain(enhanced, target, stage_parameters.gain_min, stage_parameters.gain_max)
-                elif stage.key == "scanline_correction":
-                    enhanced = correct_scanlines(enhanced, stage_parameters.scanline_bias_clip, stage_parameters.scanline_sigma_y)
-                elif stage.key == "local_contrast":
-                    enhanced = enhance_local_contrast(np.clip(enhanced, 0, 255).astype(np.uint8), stage_parameters.clahe_clip_limit, stage_parameters.clahe_tile_size)
-                elif stage.key == "image_adjustments":
-                    enhanced = apply_image_adjustments(np.clip(enhanced, 0, 255).astype(np.uint8), stage_parameters.adjustments_brightness_offset, stage_parameters.adjustments_contrast_gain, stage_parameters.adjustments_sharpen_amount, stage_parameters.adjustments_gamma)
-                elif stage.key == "final_smoothing":
-                    enhanced = smooth_final_frame(np.clip(enhanced, 0, 255).astype(np.uint8), stage_parameters.smoothing_sigma_x)
-                elif stage.key == "segmentation" and stage_parameters.segmentation_mode == "dark_contrast":
-                    segment_dark_contrast(np.clip(enhanced, 0, 255).astype(np.uint8), stage_parameters.segmentation_block_size, stage_parameters.segmentation_sensitivity, stage_parameters.segmentation_level_tolerance, stage_parameters.segmentation_min_area)
+            enhanced = self.pipeline.process(
+                enhanced,
+                self.stages,
+                self.parameters,
+                FrameContext(
+                    target_median=128.0,
+                    noise_sigma=self.noise_sigma,
+                    denoise_batch=self.denoiser.denoise_batch if self.denoiser is not None else None,
+                ),
+            )
             ok, output = cv2.imencode(".jpg", np.clip(enhanced, 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ok:
                 raise RuntimeError("Could not encode enhanced frame.")
