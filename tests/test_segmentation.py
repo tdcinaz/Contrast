@@ -154,6 +154,7 @@ class SegmentationTests(unittest.TestCase):
                 self.assertTrue(window._load_config_file(config_path, show_error=False))
 
         self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
+        self.assertTrue(all(not drawer.isHidden() for drawer in window.source_pipeline_stage_drawers))
         self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization", "local_contrast", "local_contrast"])
         self.assertTrue(window.live_pipeline_stage_drawers[1].enable_button.isChecked())
         self.assertFalse(window.live_pipeline_stage_drawers[2].enable_button.isChecked())

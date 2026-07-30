@@ -5586,11 +5586,13 @@ class ContrastWindow(QMainWindow):
             drawer.set_stage_index(offset + 1)
             drawer.set_reorder_enabled(not self._is_fixed_pipeline_stage(drawer))
             self.source_pipeline_layout.insertWidget(offset, drawer)
+            drawer.show()
         self.source_pipeline_layout.insertWidget(len(self.source_pipeline_stage_drawers), self.source_add_stage_button)
         for offset, drawer in enumerate(self.live_pipeline_stage_drawers):
             drawer.set_stage_index(offset + 1)
             drawer.set_reorder_enabled(not self._is_fixed_pipeline_stage(drawer))
             self.live_pipeline_layout.insertWidget(offset, drawer)
+            drawer.show()
         self.live_pipeline_layout.insertWidget(len(self.live_pipeline_stage_drawers), self.live_add_stage_button)
         self._update_pipeline_column_width()
 
