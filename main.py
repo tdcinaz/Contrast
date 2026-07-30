@@ -4453,6 +4453,10 @@ class ContrastWindow(QMainWindow):
         residence_layout = QGridLayout(residence_panel)
         residence_layout.setContentsMargins(0, 0, 0, 0)
         residence_layout.setSpacing(10)
+        roi_brightness_panel = QWidget()
+        roi_brightness_layout = QGridLayout(roi_brightness_panel)
+        roi_brightness_layout.setContentsMargins(0, 0, 0, 0)
+        roi_brightness_layout.setSpacing(10)
         self.normalized_plot = pg.PlotWidget(title="Normalized Contrast Residence")
         self.raw_plot = pg.PlotWidget(title="Denoised ROI Brightness")
         self.frame_brightness_panel = QWidget()
@@ -4474,8 +4478,9 @@ class ContrastWindow(QMainWindow):
         self.raw_plot.setLabel("left", "Mean pixel value")
 
         residence_layout.addWidget(self.normalized_plot, 0, 0)
-        residence_layout.addWidget(self.raw_plot, 1, 0)
+        roi_brightness_layout.addWidget(self.raw_plot, 0, 0)
         self.analysis_tabs.addTab(residence_panel, "ROI residence")
+        self.analysis_tabs.addTab(roi_brightness_panel, "ROI brightness")
         self.analysis_tabs.addTab(self.frame_brightness_panel, "Frame brightness")
         plot_layout.addWidget(self.analysis_tabs, 0, 0)
         return plot_group
