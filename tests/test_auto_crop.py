@@ -11,6 +11,7 @@ from PySide6.QtCore import QRect
 
 import main
 from main import (
+    _adjust_auto_crop_square,
     _detect_aligned_field_crop,
     _detect_pillarbox_crop,
     detect_fluoroscope_crop_from_frames,
@@ -20,6 +21,13 @@ from main import (
 
 
 class AutoCropTests(unittest.TestCase):
+    def test_adjusted_crop_stays_square_centered_and_in_frame(self) -> None:
+        crop = QRect(120, 40, 160, 160)
+
+        self.assertEqual(_adjust_auto_crop_square(crop, 400, 240, 32).getRect(), (104, 24, 192, 192))
+        self.assertEqual(_adjust_auto_crop_square(crop, 400, 240, -32).getRect(), (136, 56, 128, 128))
+        self.assertEqual(_adjust_auto_crop_square(crop, 400, 240, 512).getRect(), (88, 8, 224, 224))
+
     def test_detects_aligned_square_inside_circular_field(self) -> None:
         frames: list[np.ndarray] = []
         for level in (150, 155, 160, 165, 170, 175):
@@ -71,8 +79,8 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(first.crop_rect.getRect(), expected_crop.getRect())
         self.assertEqual(second.crop_rect.getRect(), expected_crop.getRect())
-        self.assertEqual(first.configuration, (True, False))
-        self.assertEqual(second.configuration, (True, False))
+        self.assertEqual(first.configuration, (True, False, 0))
+        self.assertEqual(second.configuration, (True, False, 0))
         detect_crop.assert_called_once()
 
     def test_detects_trim_start_half_second_before_contrast_onset(self) -> None:

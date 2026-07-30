@@ -327,6 +327,7 @@ class EnhancementRequest:
     auto_crop: bool
     temporal_alignment: bool
     source_pipeline_current: bool
+    auto_crop_size_offset: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +336,7 @@ class SourcePipelineState:
     trim_start: int
     auto_crop_rect: QRect | None
     trim_cache_key: tuple[int, int, int, int] | None
-    configuration: tuple[bool, bool]
+    configuration: tuple[bool, bool, int]
 
 
 @dataclass(slots=True)
@@ -529,6 +530,23 @@ def _detect_aligned_field_crop(gray_frames: list[np.ndarray]) -> QRect | None:
         if occupancy >= 0.995:
             return QRect(x, y, size, size)
     return None
+
+
+def _adjust_auto_crop_square(crop_rect: QRect, width: int, height: int, size_offset: int) -> QRect:
+    """Resize an auto-crop around its center while retaining an in-frame square."""
+    alignment = 32
+    maximum_size = min(width, height) // alignment * alignment
+    if maximum_size <= 0:
+        size = max(1, min(width, height))
+        return QRect(0, 0, size, size)
+
+    base_size = min(crop_rect.width(), crop_rect.height()) // alignment * alignment
+    size = max(alignment, min(maximum_size, base_size + size_offset))
+    center_x = crop_rect.x() + crop_rect.width() / 2
+    center_y = crop_rect.y() + crop_rect.height() / 2
+    x = max(0, min(width - size, round(center_x - size / 2)))
+    y = max(0, min(height - size, round(center_y - size / 2)))
+    return QRect(x, y, size, size)
 
 
 def _detect_pillarbox_crop(gray_frames: list[np.ndarray], width: int, height: int) -> QRect:
@@ -1691,6 +1709,7 @@ class VideoPanel(QFrame):
         auto_crop_enabled: bool,
         temporal_alignment_enabled: bool,
         progress_callback: Callable[[str, float, float], bool] | None = None,
+        auto_crop_size_offset: int = 0,
     ) -> SourcePipelineState:
         temporal_alignment_enabled = temporal_alignment_enabled and not self.live_input
         full_rect = self._full_frame_rect()
@@ -1715,7 +1734,12 @@ class VideoPanel(QFrame):
                 )
                 if self.live_input:
                     self._auto_crop_rect_cache = QRect(auto_crop_rect)
-            next_crop_rect = QRect(auto_crop_rect)
+            next_crop_rect = _adjust_auto_crop_square(
+                auto_crop_rect,
+                self.info.width,
+                self.info.height,
+                auto_crop_size_offset,
+            )
             report("Auto-cropping", 1.0, 1.0)
             completed_stages += 1
 
@@ -1739,7 +1763,7 @@ class VideoPanel(QFrame):
             trim_start=next_trim_start,
             auto_crop_rect=auto_crop_rect,
             trim_cache_key=trim_cache_key,
-            configuration=(auto_crop_enabled, temporal_alignment_enabled),
+            configuration=(auto_crop_enabled, temporal_alignment_enabled, auto_crop_size_offset),
         )
 
     def apply_source_pipeline_state(self, state: SourcePipelineState) -> bool:
@@ -1762,9 +1786,18 @@ class VideoPanel(QFrame):
         self._activate_stage_roi_selection(None)
         return True
 
-    def apply_source_pipeline(self, auto_crop_enabled: bool, temporal_alignment_enabled: bool) -> bool:
+    def apply_source_pipeline(
+        self,
+        auto_crop_enabled: bool,
+        temporal_alignment_enabled: bool,
+        auto_crop_size_offset: int = 0,
+    ) -> bool:
         return self.apply_source_pipeline_state(
-            self.calculate_source_pipeline(auto_crop_enabled, temporal_alignment_enabled)
+            self.calculate_source_pipeline(
+                auto_crop_enabled,
+                temporal_alignment_enabled,
+                auto_crop_size_offset=auto_crop_size_offset,
+            )
         )
 
     def _sample_cropped_gray_frames(
@@ -3593,8 +3626,13 @@ class ContrastWindow(QMainWindow):
             return False
         auto_crop_enabled = self._has_enabled_stage("auto_crop")
         temporal_alignment_enabled = self._has_enabled_stage("temporal_alignment")
+        auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         states = [
-            panel.calculate_source_pipeline(auto_crop_enabled, temporal_alignment_enabled)
+            panel.calculate_source_pipeline(
+                auto_crop_enabled,
+                temporal_alignment_enabled,
+                auto_crop_size_offset=auto_crop_size_offset,
+            )
             for panel in self.panels
         ]
         return self._apply_source_pipeline_states(states)
@@ -3613,10 +3651,15 @@ class ContrastWindow(QMainWindow):
         self.set_frame_index(target_frame)
         return True
 
-    def _source_pipeline_is_current(self, auto_crop: bool, temporal_alignment: bool) -> bool:
+    def _source_pipeline_is_current(
+        self,
+        auto_crop: bool,
+        temporal_alignment: bool,
+        auto_crop_size_offset: int,
+    ) -> bool:
         if not self.panels:
             return True
-        configuration = (auto_crop, temporal_alignment)
+        configuration = (auto_crop, temporal_alignment, auto_crop_size_offset)
         return all(panel.source_pipeline_configuration == configuration for panel in self.panels)
 
     def _build_ui(self) -> None:
@@ -4047,6 +4090,7 @@ class ContrastWindow(QMainWindow):
 
     def _name_stage_parameter_widgets(self) -> None:
         widget_names = {
+            "auto_crop_size_offset_spin": "autoCropSizeOffset",
             "denoise_strength_label": "denoiseStrengthLabel",
             "enhancement_mode_combo": "denoiseMode",
             "denoise_strength_spin": "denoiseStrength",
@@ -4548,6 +4592,18 @@ class ContrastWindow(QMainWindow):
         auto_crop_hint.setWordWrap(True)
         self.auto_crop_stage_drawer.content_layout.addWidget(auto_crop_hint)
 
+        auto_crop_size_row = QHBoxLayout()
+        auto_crop_size_row.addWidget(QLabel("Square size offset"))
+        self.auto_crop_size_offset_spin = QSpinBox()
+        self.auto_crop_size_offset_spin.setRange(-512, 512)
+        self.auto_crop_size_offset_spin.setSingleStep(32)
+        self.auto_crop_size_offset_spin.setValue(0)
+        self.auto_crop_size_offset_spin.setSuffix(" px")
+        self.auto_crop_size_offset_spin.setToolTip("Increase or decrease the detected square crop size in 32-pixel steps")
+        auto_crop_size_row.addWidget(self.auto_crop_size_offset_spin)
+        self._add_parameter_slider(auto_crop_size_row, self.auto_crop_size_offset_spin)
+        self.auto_crop_stage_drawer.content_layout.addLayout(auto_crop_size_row)
+
         temporal_alignment_hint = QLabel(
             "Finds contrast onset and trims each video to start slightly before injection for timeline alignment."
         )
@@ -4776,6 +4832,7 @@ class ContrastWindow(QMainWindow):
         self.roi_soften_check.toggled.connect(self._on_roi_soften_toggled)
         self.segmentation_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         for spin in [
+            self.auto_crop_size_offset_spin,
             self.gain_target_spin,
             self.gain_min_spin,
             self.gain_max_spin,
@@ -5254,6 +5311,7 @@ class ContrastWindow(QMainWindow):
         self.inference_precision_combo.setEnabled(uses_ffdnet)
         self._sync_active_denoise_controls()
         if self.active_mode == MODE_LIVE:
+            self._apply_source_pipeline_stages()
             self._render_live_frame()
         elif self._pipeline_has_active_stage():
             self.rebuild_enhancement_pipeline()
@@ -5533,6 +5591,7 @@ class ContrastWindow(QMainWindow):
         mode = str(self.enhancement_mode_combo.currentData())
         auto_crop = self._has_enabled_stage("auto_crop")
         temporal_alignment = self._has_enabled_stage("temporal_alignment")
+        auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         self._enhancement_generation += 1
         request = EnhancementRequest(
             generation=self._enhancement_generation,
@@ -5545,7 +5604,12 @@ class ContrastWindow(QMainWindow):
             precision=str(self.inference_precision_combo.currentData()),
             auto_crop=auto_crop,
             temporal_alignment=temporal_alignment,
-            source_pipeline_current=self._source_pipeline_is_current(auto_crop, temporal_alignment),
+            source_pipeline_current=self._source_pipeline_is_current(
+                auto_crop,
+                temporal_alignment,
+                auto_crop_size_offset,
+            ),
+            auto_crop_size_offset=auto_crop_size_offset,
         )
         self._enhancement_pending_request = request
         if self._enhancement_cancel is not None:
@@ -5609,6 +5673,7 @@ class ContrastWindow(QMainWindow):
                 request.auto_crop,
                 request.temporal_alignment,
                 source_progress,
+                request.auto_crop_size_offset,
             )
 
         if not request.source_pipeline_current:
