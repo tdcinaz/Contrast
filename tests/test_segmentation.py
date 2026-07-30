@@ -20,6 +20,7 @@ from main import (
     EnhancementParameters,
     EnhancementRequest,
     EnhancementStages,
+    MODE_COMPARISON,
     MODE_LIVE,
     VideoPanel,
     analyze_gray_frames,
@@ -36,6 +37,16 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_comparison_sync_control_is_only_visible_in_comparison_mode(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+
+        self.assertFalse(window.comparison_sync_offset_row.isVisible())
+        window.active_mode = MODE_COMPARISON
+        window._update_temporal_alignment_controls()
+
+        self.assertTrue(window.comparison_sync_offset_row.isHidden() is False)
     def test_average_frame_brightness_uses_each_full_frame_mean(self) -> None:
         frames = [
             np.asarray([[0, 2], [4, 6]], dtype=np.uint8),
@@ -92,7 +103,7 @@ class SegmentationTests(unittest.TestCase):
             drawer.enable_button.setChecked(True)
             drawer.enable_button.blockSignals(False)
         for panel in window.panels:
-            panel.source_pipeline_configuration = (True, True, 0)
+            panel.source_pipeline_configuration = (True, True, 0, 0.0, 0.0)
 
         with patch.object(window, "_start_enhancement_request") as start_request:
             window.rebuild_enhancement_pipeline()
@@ -129,6 +140,8 @@ class SegmentationTests(unittest.TestCase):
         window.compare_view_check.setChecked(False)
         window.speed_slider.setValue(175)
         window.threshold_spin.setValue(0.35)
+        window.temporal_trim_offset_spin.setValue(-0.25)
+        window.comparison_sync_offset_spin.setValue(0.12)
 
         with TemporaryDirectory() as directory:
             config_path = Path(directory) / "pipeline.json"
@@ -149,6 +162,8 @@ class SegmentationTests(unittest.TestCase):
         self.assertFalse(window.compare_view_check.isChecked())
         self.assertEqual(window.speed_slider.value(), 175)
         self.assertEqual(window.threshold_spin.value(), 0.35)
+        self.assertEqual(window.temporal_trim_offset_spin.value(), -0.25)
+        self.assertEqual(window.comparison_sync_offset_spin.value(), 0.12)
 
     def test_source_and_live_pipeline_defaults_are_separate(self) -> None:
         app = QApplication.instance() or QApplication([])

@@ -79,9 +79,37 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(first.crop_rect.getRect(), expected_crop.getRect())
         self.assertEqual(second.crop_rect.getRect(), expected_crop.getRect())
-        self.assertEqual(first.configuration, (True, False, 0))
-        self.assertEqual(second.configuration, (True, False, 0))
+        self.assertEqual(first.configuration, (True, False, 0, 0.0, 0.0))
+        self.assertEqual(second.configuration, (True, False, 0, 0.0, 0.0))
         detect_crop.assert_called_once()
+
+    def test_temporal_offsets_adjust_detected_trim_without_changing_cache_key(self) -> None:
+        class TemporalSource:
+            _full_frame_rect = VideoPanel._full_frame_rect
+            _crop_rect_key = VideoPanel._crop_rect_key
+
+            def __init__(self) -> None:
+                self.info = SimpleNamespace(width=400, height=240, fps=10.0, frame_count=100)
+                self.live_input = False
+                self._auto_crop_rect_cache = None
+                self._trim_start_cache = {}
+
+            def _sample_cropped_gray_frames(self, crop_rect, progress_callback):  # noqa: ANN001
+                return [np.zeros((240, 400), dtype=np.uint8)] * 3
+
+        source = TemporalSource()
+        with patch.object(main, "detect_pre_injection_trim_start", return_value=30):
+            state = VideoPanel.calculate_source_pipeline(
+                source,
+                False,
+                True,
+                temporal_trim_offset_seconds=0.20,
+                comparison_sync_offset_seconds=0.30,
+            )
+
+        self.assertEqual(state.trim_start, 35)
+        self.assertEqual(state.detected_trim_start, 30)
+        self.assertEqual(state.configuration, (False, True, 0, 0.20, 0.30))
 
     def test_detects_trim_start_half_second_before_contrast_onset(self) -> None:
         frames: list[np.ndarray] = []

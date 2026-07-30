@@ -328,6 +328,8 @@ class EnhancementRequest:
     temporal_alignment: bool
     source_pipeline_current: bool
     auto_crop_size_offset: int = 0
+    temporal_trim_offset_seconds: float = 0.0
+    comparison_sync_offset_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,7 +338,8 @@ class SourcePipelineState:
     trim_start: int
     auto_crop_rect: QRect | None
     trim_cache_key: tuple[int, int, int, int] | None
-    configuration: tuple[bool, bool, int]
+    detected_trim_start: int | None
+    configuration: tuple[bool, bool, int, float, float]
 
 
 @dataclass(slots=True)
@@ -1710,6 +1713,8 @@ class VideoPanel(QFrame):
         temporal_alignment_enabled: bool,
         progress_callback: Callable[[str, float, float], bool] | None = None,
         auto_crop_size_offset: int = 0,
+        temporal_trim_offset_seconds: float = 0.0,
+        comparison_sync_offset_seconds: float = 0.0,
     ) -> SourcePipelineState:
         temporal_alignment_enabled = temporal_alignment_enabled and not self.live_input
         full_rect = self._full_frame_rect()
@@ -1745,6 +1750,7 @@ class VideoPanel(QFrame):
 
         next_trim_start = 0
         trim_cache_key: tuple[int, int, int, int] | None = None
+        detected_trim_start: int | None = None
         if temporal_alignment_enabled:
             crop_key = self._crop_rect_key(next_crop_rect)
             trim_cache_key = crop_key
@@ -1755,7 +1761,9 @@ class VideoPanel(QFrame):
                     lambda done, total: report("Aligning contrast timing", done, total),
                 )
                 cached_trim_start = detect_pre_injection_trim_start(gray_frames, self.info.fps)
-            next_trim_start = cached_trim_start
+            detected_trim_start = cached_trim_start
+            trim_offset_frames = round((temporal_trim_offset_seconds + comparison_sync_offset_seconds) * self.info.fps)
+            next_trim_start = max(0, min(self.info.frame_count - 1, cached_trim_start + trim_offset_frames))
             report("Aligning contrast timing", 1.0, 1.0)
 
         return SourcePipelineState(
@@ -1763,15 +1771,22 @@ class VideoPanel(QFrame):
             trim_start=next_trim_start,
             auto_crop_rect=auto_crop_rect,
             trim_cache_key=trim_cache_key,
-            configuration=(auto_crop_enabled, temporal_alignment_enabled, auto_crop_size_offset),
+            detected_trim_start=detected_trim_start,
+            configuration=(
+                auto_crop_enabled,
+                temporal_alignment_enabled,
+                auto_crop_size_offset,
+                temporal_trim_offset_seconds,
+                comparison_sync_offset_seconds,
+            ),
         )
 
     def apply_source_pipeline_state(self, state: SourcePipelineState) -> bool:
         self.source_pipeline_configuration = state.configuration
         if state.auto_crop_rect is not None:
             self._auto_crop_rect_cache = QRect(state.auto_crop_rect)
-        if state.trim_cache_key is not None:
-            self._trim_start_cache[state.trim_cache_key] = state.trim_start
+        if state.trim_cache_key is not None and state.detected_trim_start is not None:
+            self._trim_start_cache[state.trim_cache_key] = state.detected_trim_start
 
         available_frames = max(1, self.info.frame_count - state.trim_start)
         if (
@@ -1791,12 +1806,16 @@ class VideoPanel(QFrame):
         auto_crop_enabled: bool,
         temporal_alignment_enabled: bool,
         auto_crop_size_offset: int = 0,
+        temporal_trim_offset_seconds: float = 0.0,
+        comparison_sync_offset_seconds: float = 0.0,
     ) -> bool:
         return self.apply_source_pipeline_state(
             self.calculate_source_pipeline(
                 auto_crop_enabled,
                 temporal_alignment_enabled,
                 auto_crop_size_offset=auto_crop_size_offset,
+                temporal_trim_offset_seconds=temporal_trim_offset_seconds,
+                comparison_sync_offset_seconds=comparison_sync_offset_seconds,
             )
         )
 
@@ -3292,6 +3311,7 @@ class ContrastWindow(QMainWindow):
 
         self._build_actions()
         self._build_ui()
+        self._update_temporal_alignment_controls()
         self._apply_source_pipeline_stages()
         self._apply_style()
         self.on_enhancement_settings_changed()
@@ -3353,6 +3373,7 @@ class ContrastWindow(QMainWindow):
             self._clear_video_panels()
             self._clear_video_placeholders()
             self.active_mode = MODE_SINGLE
+            self._update_temporal_alignment_controls()
             self.enhancement_progress.configure_panels(["Video 1"])
             self._set_video_controls_enabled(False)
             self.video_stack.setCurrentWidget(self.mode_selection_page)
@@ -3381,6 +3402,7 @@ class ContrastWindow(QMainWindow):
         self.pre_panel = self.panels[0] if self.panels else None
         self.post_panel = self.panels[1] if len(self.panels) > 1 else None
         self.active_mode = MODE_LIVE if live_input else (MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE)
+        self._update_temporal_alignment_controls()
         self.open_pre_action.setText(f"Open {self.pre_panel.label.lower()} video..." if self.pre_panel else "Open video 1...")
         self.open_post_action.setText(f"Open {self.post_panel.label.lower()} video..." if self.post_panel else "Open video 2...")
         self.compare_view_check.setEnabled(True)
@@ -3500,6 +3522,7 @@ class ContrastWindow(QMainWindow):
         self.pending_preview_panels = [None] * len(labels)
         self.enhancement_progress.configure_panels(labels)
         self.active_mode = mode
+        self._update_temporal_alignment_controls()
 
         for index, label in enumerate(labels):
             color = PANEL_COLORS[min(index, len(PANEL_COLORS) - 1)]
@@ -3632,8 +3655,14 @@ class ContrastWindow(QMainWindow):
                 auto_crop_enabled,
                 temporal_alignment_enabled,
                 auto_crop_size_offset=auto_crop_size_offset,
+                temporal_trim_offset_seconds=self.temporal_trim_offset_spin.value(),
+                comparison_sync_offset_seconds=(
+                    self.comparison_sync_offset_spin.value()
+                    if self.active_mode == MODE_COMPARISON and panel_index == 1
+                    else 0.0
+                ),
             )
-            for panel in self.panels
+            for panel_index, panel in enumerate(self.panels)
         ]
         return self._apply_source_pipeline_states(states)
 
@@ -3656,11 +3685,22 @@ class ContrastWindow(QMainWindow):
         auto_crop: bool,
         temporal_alignment: bool,
         auto_crop_size_offset: int,
+        temporal_trim_offset_seconds: float,
+        comparison_sync_offset_seconds: float,
     ) -> bool:
         if not self.panels:
             return True
-        configuration = (auto_crop, temporal_alignment, auto_crop_size_offset)
-        return all(panel.source_pipeline_configuration == configuration for panel in self.panels)
+        return all(
+            panel.source_pipeline_configuration
+            == (
+                auto_crop,
+                temporal_alignment,
+                auto_crop_size_offset,
+                temporal_trim_offset_seconds,
+                comparison_sync_offset_seconds if self.active_mode == MODE_COMPARISON and panel_index == 1 else 0.0,
+            )
+            for panel_index, panel in enumerate(self.panels)
+        )
 
     def _build_ui(self) -> None:
         self.play_button = QPushButton()
@@ -4091,6 +4131,8 @@ class ContrastWindow(QMainWindow):
     def _name_stage_parameter_widgets(self) -> None:
         widget_names = {
             "auto_crop_size_offset_spin": "autoCropSizeOffset",
+            "temporal_trim_offset_spin": "temporalTrimOffset",
+            "comparison_sync_offset_spin": "comparisonSyncOffset",
             "denoise_strength_label": "denoiseStrengthLabel",
             "enhancement_mode_combo": "denoiseMode",
             "denoise_strength_spin": "denoiseStrength",
@@ -4611,6 +4653,34 @@ class ContrastWindow(QMainWindow):
         temporal_alignment_hint.setWordWrap(True)
         self.temporal_alignment_stage_drawer.content_layout.addWidget(temporal_alignment_hint)
 
+        temporal_trim_row = QHBoxLayout()
+        temporal_trim_row.addWidget(QLabel("Start trim offset"))
+        self.temporal_trim_offset_spin = QDoubleSpinBox()
+        self.temporal_trim_offset_spin.setRange(-2.0, 2.0)
+        self.temporal_trim_offset_spin.setSingleStep(0.05)
+        self.temporal_trim_offset_spin.setDecimals(2)
+        self.temporal_trim_offset_spin.setValue(0.0)
+        self.temporal_trim_offset_spin.setSuffix(" s")
+        self.temporal_trim_offset_spin.setToolTip("Shift each video start earlier or later relative to its detected contrast injection")
+        temporal_trim_row.addWidget(self.temporal_trim_offset_spin)
+        self._add_parameter_slider(temporal_trim_row, self.temporal_trim_offset_spin)
+        self.temporal_alignment_stage_drawer.content_layout.addLayout(temporal_trim_row)
+
+        self.comparison_sync_offset_row = QWidget()
+        comparison_sync_layout = QHBoxLayout(self.comparison_sync_offset_row)
+        comparison_sync_layout.setContentsMargins(0, 0, 0, 0)
+        comparison_sync_layout.addWidget(QLabel("Post-video sync offset"))
+        self.comparison_sync_offset_spin = QDoubleSpinBox()
+        self.comparison_sync_offset_spin.setRange(-2.0, 2.0)
+        self.comparison_sync_offset_spin.setSingleStep(0.01)
+        self.comparison_sync_offset_spin.setDecimals(2)
+        self.comparison_sync_offset_spin.setValue(0.0)
+        self.comparison_sync_offset_spin.setSuffix(" s")
+        self.comparison_sync_offset_spin.setToolTip("Shift only the post-deployment video to fine-tune contrast injection synchronization")
+        comparison_sync_layout.addWidget(self.comparison_sync_offset_spin)
+        self._add_parameter_slider(comparison_sync_layout, self.comparison_sync_offset_spin)
+        self.temporal_alignment_stage_drawer.content_layout.addWidget(self.comparison_sync_offset_row)
+
         brightness_hint = QLabel(
             "Corrects frame-wide gain and brightness jitter from robust, temporally stable image probes."
         )
@@ -4833,6 +4903,8 @@ class ContrastWindow(QMainWindow):
         self.segmentation_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         for spin in [
             self.auto_crop_size_offset_spin,
+            self.temporal_trim_offset_spin,
+            self.comparison_sync_offset_spin,
             self.gain_target_spin,
             self.gain_min_spin,
             self.gain_max_spin,
@@ -5517,6 +5589,9 @@ class ContrastWindow(QMainWindow):
         self.live_pipeline_layout.insertWidget(len(self.live_pipeline_stage_drawers), self.live_add_stage_button)
         self._update_pipeline_column_width()
 
+    def _update_temporal_alignment_controls(self) -> None:
+        self.comparison_sync_offset_row.setVisible(self.active_mode == MODE_COMPARISON)
+
     def enhancement_parameters(self) -> EnhancementParameters:
         gain_min = self.gain_min_spin.value()
         gain_max = self.gain_max_spin.value()
@@ -5592,6 +5667,8 @@ class ContrastWindow(QMainWindow):
         auto_crop = self._has_enabled_stage("auto_crop")
         temporal_alignment = self._has_enabled_stage("temporal_alignment")
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
+        temporal_trim_offset_seconds = self.temporal_trim_offset_spin.value()
+        comparison_sync_offset_seconds = self.comparison_sync_offset_spin.value()
         self._enhancement_generation += 1
         request = EnhancementRequest(
             generation=self._enhancement_generation,
@@ -5608,8 +5685,12 @@ class ContrastWindow(QMainWindow):
                 auto_crop,
                 temporal_alignment,
                 auto_crop_size_offset,
+                temporal_trim_offset_seconds,
+                comparison_sync_offset_seconds,
             ),
             auto_crop_size_offset=auto_crop_size_offset,
+            temporal_trim_offset_seconds=temporal_trim_offset_seconds,
+            comparison_sync_offset_seconds=comparison_sync_offset_seconds,
         )
         self._enhancement_pending_request = request
         if self._enhancement_cancel is not None:
@@ -5674,6 +5755,10 @@ class ContrastWindow(QMainWindow):
                 request.temporal_alignment,
                 source_progress,
                 request.auto_crop_size_offset,
+                request.temporal_trim_offset_seconds,
+                request.comparison_sync_offset_seconds
+                if self.active_mode == MODE_COMPARISON and panel_index == 1
+                else 0.0,
             )
 
         if not request.source_pipeline_current:
