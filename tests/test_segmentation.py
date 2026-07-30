@@ -24,6 +24,8 @@ from main import (
     analyze_gray_frames,
     compute_temporal_change_map,
     detect_aneurysm_roi,
+    build_analysis_result,
+    normalize_analysis_results,
     overlay_segmentation_mask,
     segment_dark_contrast,
     segment_temporal_change_map,
@@ -251,6 +253,34 @@ class SegmentationTests(unittest.TestCase):
         full_box_mean = float(np.mean(analysis_frame[roi.rect.y() : roi.rect.y() + roi.rect.height(), roi.rect.x() : roi.rect.x() + roi.rect.width()]))
         self.assertGreaterEqual(result.mean_intensity[0], 60.0)
         self.assertLess(result.mean_intensity[0], full_box_mean - 5.0)
+
+    def test_analysis_normalizes_multiple_videos_to_the_shared_peak(self) -> None:
+        roi = main.QRect(0, 0, 1, 1)
+        pre = build_analysis_result(
+            "Pre-deployment",
+            Path("pre.mov"),
+            1.0,
+            roi,
+            np.asarray([100.0, 100.0, 60.0, 100.0]),
+            np.asarray([], dtype=float),
+            0.20,
+            False,
+        )
+        post = build_analysis_result(
+            "Post-deployment",
+            Path("post.mov"),
+            1.0,
+            roi,
+            np.asarray([100.0, 100.0, 20.0, 100.0]),
+            np.asarray([], dtype=float),
+            0.20,
+            False,
+        )
+
+        results = normalize_analysis_results({pre.label: pre, post.label: post}, 0.20)
+
+        np.testing.assert_allclose(results[pre.label].normalized_signal, [0.0, 0.0, 0.5, 0.0])
+        np.testing.assert_allclose(results[post.label].normalized_signal, [0.0, 0.0, 1.0, 0.0])
 
     def test_detected_roi_mask_is_softened_and_expanded_when_enabled(self) -> None:
         frames: list[np.ndarray] = []

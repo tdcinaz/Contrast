@@ -75,7 +75,7 @@ The validated GB10 runtime is NGC 26.06 (`aarch64`, CUDA 13.3, cuDNN 9.23). NGC 
 
 ## Measurement
 
-For each ROI, the app computes mean grayscale brightness frame by frame. When gain correction is enabled, the ROI brightness is first normalized against a surrounding reference region to reduce frame-to-frame fluoroscopy gain fluctuation. The reference and corrected ROI traces are then despiked with a short median filter and smoothed with a symmetric Gaussian filter. This reduces analog noise without adding the timing lag of a causal filter, though it intentionally trades a small amount of temporal precision for cleaner curves.
+For each ROI, the app computes mean grayscale brightness frame by frame. The enhanced ROI trace is then despiked with a short median filter and smoothed with a symmetric Gaussian filter. This reduces analog noise without adding the timing lag of a causal filter, though it intentionally trades a small amount of temporal precision for cleaner curves.
 
 Because iodinated contrast appears darker in fluoroscopy, the contrast signal is calculated as:
 
@@ -83,4 +83,12 @@ Because iodinated contrast appears darker in fluoroscopy, the contrast signal is
 baseline ROI brightness - current ROI brightness
 ```
 
-The signal is normalized by its peak. Residence time is measured from first threshold crossing to clearance below the selected normalized threshold after the peak. The default threshold is `0.20`.
+For each video, the pre-injection baseline is the median brightness from the initial baseline window. Subtracting that baseline aligns the pre-injection signal to `0.0`:
+
+```text
+contrast signal = max(baseline ROI brightness - current ROI brightness, 0)
+```
+
+When comparing videos, the app finds the strongest contrast-darkening moment across the complete set of analyzed videos and maps that one shared peak to `1.0`. Every other curve uses the same scale, so a weaker peak remains proportionally below `1.0` instead of being independently stretched to the top of the graph. For a single-video analysis, that video's own peak is the shared peak.
+
+Residence time is measured from the first crossing of the selected shared normalized threshold to clearance below it after the peak. The default threshold is `0.20`.

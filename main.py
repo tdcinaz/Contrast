@@ -5899,7 +5899,7 @@ class ContrastWindow(QMainWindow):
                 gain_corrected,
             )
 
-        self.results = results
+        self.results = normalize_analysis_results(results, threshold)
         self.refresh_plots_and_metrics()
         self.export_action.setEnabled(True)
         self.export_button.setEnabled(True)
@@ -5911,10 +5911,7 @@ class ContrastWindow(QMainWindow):
         if not self.results:
             return
         threshold = self.threshold_spin.value()
-        self.results = {
-            label: recompute_threshold_metrics(result, threshold)
-            for label, result in self.results.items()
-        }
+        self.results = normalize_analysis_results(self.results, threshold)
         self.refresh_plots_and_metrics()
 
     def clear_plots_and_metrics(self) -> None:
@@ -6281,6 +6278,7 @@ def build_analysis_result(
     reference_intensity: np.ndarray,
     threshold_fraction: float,
     gain_corrected: bool,
+    normalization_peak: float | None = None,
 ) -> AnalysisResult:
     time = np.arange(len(mean_intensity), dtype=float) / fps
     if len(mean_intensity) == 0:
@@ -6291,7 +6289,8 @@ def build_analysis_result(
     baseline = float(np.median(mean_intensity[:baseline_count]))
     contrast_signal = np.clip(baseline - mean_intensity, 0, None)
     peak_signal = float(np.max(contrast_signal))
-    normalized = contrast_signal / peak_signal if peak_signal > 0 else np.zeros_like(contrast_signal)
+    scale_peak = peak_signal if normalization_peak is None else normalization_peak
+    normalized = contrast_signal / scale_peak if scale_peak > 0 else np.zeros_like(contrast_signal)
     threshold_value = threshold_fraction
     above = normalized >= threshold_value
 
@@ -6330,8 +6329,33 @@ def build_analysis_result(
     )
 
 
-def recompute_threshold_metrics(result: AnalysisResult, threshold_fraction: float) -> AnalysisResult:
-    return build_analysis_result(result.label, result.path, result.fps, result.roi, result.mean_intensity, result.reference_intensity, threshold_fraction, result.gain_corrected)
+def recompute_threshold_metrics(
+    result: AnalysisResult,
+    threshold_fraction: float,
+    normalization_peak: float | None = None,
+) -> AnalysisResult:
+    return build_analysis_result(
+        result.label,
+        result.path,
+        result.fps,
+        result.roi,
+        result.mean_intensity,
+        result.reference_intensity,
+        threshold_fraction,
+        result.gain_corrected,
+        normalization_peak,
+    )
+
+
+def normalize_analysis_results(
+    results: dict[str, AnalysisResult],
+    threshold_fraction: float,
+) -> dict[str, AnalysisResult]:
+    shared_peak = max((result.peak_signal for result in results.values()), default=0.0)
+    return {
+        label: recompute_threshold_metrics(result, threshold_fraction, shared_peak)
+        for label, result in results.items()
+    }
 
 
 def run_headless(config_path: Path) -> None:
