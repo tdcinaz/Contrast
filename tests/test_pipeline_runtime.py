@@ -35,6 +35,10 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertNotEqual(definition.cache_token(first), definition.cache_token(second))
         self.assertEqual(definition.display_name, "Local contrast (CLAHE)")
 
+    def test_roi_extraction_does_not_modify_frame_data(self) -> None:
+        self.assertFalse(BUILTIN_STAGES.require("roi_extraction").modifies_frame_data)
+        self.assertTrue(BUILTIN_STAGES.require("local_contrast").modifies_frame_data)
+
     def test_frame_executor_preserves_stage_order_and_instance_settings(self) -> None:
         calls: list[int] = []
 

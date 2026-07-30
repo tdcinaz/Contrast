@@ -514,6 +514,116 @@ class SegmentationTests(unittest.TestCase):
         self.assertIs(cache_ref, panel.temporal_change_map_cache[input_prefix])
         self.assertGreater(np.count_nonzero(mask_a), np.count_nonzero(mask_b))
 
+    def test_frame_cache_excludes_roi_and_keeps_one_undo_branch(self) -> None:
+        panel = VideoPanel.__new__(VideoPanel)
+        gain = ("gain_stabilization", (128.0, 0.7, 1.45))
+        roi = ("roi_extraction", (False, 0.12, 0.1))
+        contrast_a = ("local_contrast", (1.0, 6))
+        contrast_b = ("local_contrast", (2.0, 6))
+        smoothing = ("final_smoothing", (0.55,))
+        first = (gain, roi, contrast_a)
+        second = (gain, roi, contrast_b)
+        third = (gain, roi, smoothing)
+        panel.stage_frame_cache = {
+            (gain,): [np.zeros((1, 1), dtype=np.uint8)],
+            (gain, contrast_a): [np.zeros((1, 1), dtype=np.uint8)],
+            (gain, contrast_b): [np.zeros((1, 1), dtype=np.uint8)],
+            (gain, smoothing): [np.zeros((1, 1), dtype=np.uint8)],
+        }
+        panel.encoded_frame_cache = {
+            (gain, contrast_a): [],
+            (gain, contrast_b): [],
+            (gain, smoothing): [],
+        }
+        panel.segmentation_mask_cache = {}
+        panel.roi_selection_cache = {(gain, roi): None}
+        panel.temporal_change_map_cache = {}
+        panel.active_sequence_key = first
+        panel.inactive_sequence_key = second
+
+        self.assertEqual(panel._frame_sequence_key(first), (gain, contrast_a))
+
+        panel._begin_cache_branch(third)
+
+        self.assertIsNone(panel.inactive_sequence_key)
+        self.assertEqual(set(panel.encoded_frame_cache), {(gain, contrast_a)})
+        self.assertEqual(set(panel.stage_frame_cache), {(gain,), (gain, contrast_a)})
+
+        panel.encoded_frame_cache[(gain, smoothing)] = []
+        panel.stage_frame_cache[(gain, smoothing)] = [np.zeros((1, 1), dtype=np.uint8)]
+        panel._activate_cache_branch(third)
+
+        self.assertEqual(panel.active_sequence_key, third)
+        self.assertEqual(panel.inactive_sequence_key, first)
+        self.assertEqual(set(panel.encoded_frame_cache), {(gain, contrast_a), (gain, smoothing)})
+
+    def test_prepare_reuses_upstream_frames_and_roi_does_not_rebuild_downstream(self) -> None:
+        panel = VideoPanel.__new__(VideoPanel)
+        panel.path = Path("synthetic.mov")
+        panel.info = SimpleNamespace(fps=10.0)
+        panel.trim_frame_count = 3
+        panel.target_median = 128.0
+        panel.source_gray_frames = [np.full((16, 16), level, dtype=np.uint8) for level in (80, 90, 100)]
+        panel.stage_frame_cache = {}
+        panel.encoded_frame_cache = {}
+        panel.segmentation_mask_cache = {}
+        panel.roi_selection_cache = {}
+        panel.temporal_change_map_cache = {}
+        panel.active_sequence_key = None
+        panel.inactive_sequence_key = None
+        panel.stage_duration_per_frame = {}
+        panel.enhanced_frames = None
+        panel.segmentation_masks = None
+        panel.stage_roi_selection = None
+        panel.display = SimpleNamespace(set_roi=lambda *_args: None)
+
+        first_parameters = EnhancementParameters(
+            gain_use_auto_target=False,
+            gain_target_median=120,
+            clahe_clip_limit=1.0,
+        )
+        second_parameters = EnhancementParameters(
+            gain_use_auto_target=False,
+            gain_target_median=120,
+            clahe_clip_limit=2.0,
+        )
+        first_stages = EnhancementStages(
+            instances=(
+                main.PipelineStage("gain_stabilization", True, first_parameters),
+                main.PipelineStage("local_contrast", True, first_parameters),
+            )
+        )
+        second_stages = EnhancementStages(
+            instances=(
+                main.PipelineStage("gain_stabilization", True, second_parameters),
+                main.PipelineStage("local_contrast", True, second_parameters),
+            )
+        )
+
+        with patch.object(panel, "_apply_frame_stage", wraps=panel._apply_frame_stage) as apply_stage:
+            self.assertTrue(panel.prepare_enhanced_frames(stages=first_stages, parameters=first_parameters))
+            self.assertTrue(panel.prepare_enhanced_frames(stages=second_stages, parameters=second_parameters))
+
+            applied_stage_keys = [call.args[0] for call in apply_stage.call_args_list]
+            self.assertEqual(applied_stage_keys.count("gain_stabilization"), 3)
+            self.assertEqual(applied_stage_keys.count("local_contrast"), 6)
+            calls_before_roi = apply_stage.call_count
+            encoded_before_roi = panel.enhanced_frames
+
+            roi_stages = EnhancementStages(
+                instances=(
+                    main.PipelineStage("gain_stabilization", True, second_parameters),
+                    main.PipelineStage("roi_extraction", True, second_parameters),
+                    main.PipelineStage("local_contrast", True, second_parameters),
+                )
+            )
+            with patch.object(main, "detect_aneurysm_roi", return_value=None) as detect_roi:
+                self.assertTrue(panel.prepare_enhanced_frames(stages=roi_stages, parameters=second_parameters))
+
+            self.assertEqual(apply_stage.call_count, calls_before_roi)
+            self.assertIs(panel.enhanced_frames, encoded_before_roi)
+            detect_roi.assert_called_once()
+
     def test_poll_attaches_mask_before_pipeline_future_completes(self) -> None:
         encoded_mask = np.array([1, 2, 3], dtype=np.uint8)
         seeks: list[int] = []

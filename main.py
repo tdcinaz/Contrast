@@ -1547,11 +1547,13 @@ class VideoPanel(QFrame):
         self.enhanced_frames: list[np.ndarray] | None = None
         self.segmentation_masks: list[np.ndarray] | None = None
         self.source_gray_frames: list[np.ndarray] | None = None
+        self.stage_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.encoded_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.segmentation_mask_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.roi_selection_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], ROISelection | None] = {}
         self.temporal_change_map_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], np.ndarray] = {}
         self.active_sequence_key: tuple[tuple[str, tuple[object, ...]], ...] | None = None
+        self.inactive_sequence_key: tuple[tuple[str, tuple[object, ...]], ...] | None = None
         self.stage_duration_per_frame: dict[tuple[str, tuple[object, ...]], float] = {}
         self.stage_roi_selection: ROISelection | None = None
 
@@ -1792,6 +1794,98 @@ class VideoPanel(QFrame):
             for stage in stages.enabled_stage_instances(parameters)
         )
 
+    def _frame_sequence_key(
+        self,
+        sequence_key: tuple[tuple[str, tuple[object, ...]], ...],
+    ) -> tuple[tuple[str, tuple[object, ...]], ...]:
+        return tuple(
+            token
+            for token in sequence_key
+            if BUILTIN_STAGES.require(token[0]).modifies_frame_data
+        )
+
+    def _frame_prefixes(
+        self,
+        sequence_key: tuple[tuple[str, tuple[object, ...]], ...],
+    ) -> set[tuple[tuple[str, tuple[object, ...]], ...]]:
+        prefixes: set[tuple[tuple[str, tuple[object, ...]], ...]] = set()
+        prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        for token in sequence_key:
+            if not BUILTIN_STAGES.require(token[0]).modifies_frame_data:
+                continue
+            prefix += (token,)
+            prefixes.add(prefix)
+        return prefixes
+
+    def _prune_cache_branches(
+        self,
+        sequence_keys: tuple[tuple[tuple[str, tuple[object, ...]], ...], ...],
+    ) -> None:
+        retained_frame_keys = {self._frame_sequence_key(key) for key in sequence_keys}
+        retained_frame_prefixes: set[tuple[tuple[str, tuple[object, ...]], ...]] = set()
+        for key in sequence_keys:
+            retained_frame_prefixes.update(self._frame_prefixes(key))
+
+        self.encoded_frame_cache = {
+            key: frames
+            for key, frames in self.encoded_frame_cache.items()
+            if key in retained_frame_keys
+        }
+        self.stage_frame_cache = {
+            key: frames
+            for key, frames in self.stage_frame_cache.items()
+            if key in retained_frame_prefixes
+        }
+
+        retained_artifact_keys = {
+            self._artifact_cache_key(sequence_key[: index + 1])
+            for sequence_key in sequence_keys
+            for index, token in enumerate(sequence_key)
+            if not BUILTIN_STAGES.require(token[0]).modifies_frame_data
+        }
+
+        self.segmentation_mask_cache = {
+            key: masks
+            for key, masks in self.segmentation_mask_cache.items()
+            if key in retained_artifact_keys
+        }
+        self.roi_selection_cache = {
+            key: selection
+            for key, selection in self.roi_selection_cache.items()
+            if key in retained_artifact_keys
+        }
+        self.temporal_change_map_cache = {
+            key: change_map
+            for key, change_map in self.temporal_change_map_cache.items()
+            if key in retained_frame_prefixes or not key
+        }
+
+    def _begin_cache_branch(
+        self,
+        sequence_key: tuple[tuple[str, tuple[object, ...]], ...],
+    ) -> None:
+        if self.active_sequence_key is None or sequence_key in {
+            self.active_sequence_key,
+            self.inactive_sequence_key,
+        }:
+            return
+        self._prune_cache_branches((self.active_sequence_key,))
+        self.inactive_sequence_key = None
+
+    def _activate_cache_branch(
+        self,
+        sequence_key: tuple[tuple[str, tuple[object, ...]], ...],
+    ) -> None:
+        if sequence_key != self.active_sequence_key:
+            self.inactive_sequence_key = self.active_sequence_key
+            self.active_sequence_key = sequence_key
+        retained = tuple(
+            key
+            for key in (self.active_sequence_key, self.inactive_sequence_key)
+            if key is not None
+        )
+        self._prune_cache_branches(retained)
+
     def _source_stage_token(self) -> tuple[str, tuple[object, ...]]:
         return ("source_decode", tuple())
 
@@ -1804,7 +1898,7 @@ class VideoPanel(QFrame):
     ) -> list[np.ndarray] | None:
         for index, token in enumerate(sequence_key):
             if token[0] == "segmentation":
-                return self.segmentation_mask_cache.get(sequence_key[: index + 1])
+                return self.segmentation_mask_cache.get(self._artifact_cache_key(sequence_key[: index + 1]))
         return None
 
     def _roi_selection_for_sequence(
@@ -1813,8 +1907,76 @@ class VideoPanel(QFrame):
     ) -> ROISelection | None:
         for index, token in enumerate(sequence_key):
             if token[0] == "roi_extraction":
-                return self.roi_selection_cache.get(sequence_key[: index + 1])
+                return self.roi_selection_cache.get(self._artifact_cache_key(sequence_key[: index + 1]))
         return None
+
+    def _artifact_cache_key(
+        self,
+        stage_prefix: tuple[tuple[str, tuple[object, ...]], ...],
+    ) -> tuple[tuple[str, tuple[object, ...]], ...]:
+        return self._frame_sequence_key(stage_prefix[:-1]) + (stage_prefix[-1],)
+
+    def _ensure_cached_artifacts(
+        self,
+        enabled_stages: tuple[PipelineStage, ...],
+        sequence_key: tuple[tuple[str, tuple[object, ...]], ...],
+        default_parameters: EnhancementParameters,
+        cancel_callback: Callable[[], bool] | None = None,
+    ) -> bool:
+        frame_prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        for index, (stage, token) in enumerate(zip(enabled_stages, sequence_key)):
+            definition = BUILTIN_STAGES.require(stage.key)
+            if definition.modifies_frame_data:
+                frame_prefix += (token,)
+                continue
+            artifact_key = self._artifact_cache_key(sequence_key[: index + 1])
+            frames = self.source_gray_frames if not frame_prefix else self.stage_frame_cache.get(frame_prefix)
+            if frames is None:
+                return False
+            if cancel_callback is not None and cancel_callback():
+                return False
+            parameters = stage.parameters or default_parameters
+            if stage.key == "roi_extraction" and artifact_key not in self.roi_selection_cache:
+                self.roi_selection_cache[artifact_key] = detect_aneurysm_roi(
+                    frames,
+                    self.info.fps,
+                    soften_mask=bool(parameters.roi_softening_enabled),
+                    soften_radius_ratio=float(parameters.roi_softening_radius_ratio),
+                    soften_threshold=float(parameters.roi_softening_threshold),
+                )
+            elif stage.key == "segmentation" and artifact_key not in self.segmentation_mask_cache:
+                if parameters.segmentation_mode == "temporal_change":
+                    temporal_change = self.temporal_change_map_cache.get(frame_prefix)
+                    if temporal_change is None:
+                        temporal_change = compute_temporal_change_map(frames)
+                        self.temporal_change_map_cache[frame_prefix] = temporal_change
+                    mask = segment_temporal_change_map(
+                        temporal_change,
+                        parameters.segmentation_change_threshold,
+                        parameters.segmentation_level_tolerance,
+                        parameters.segmentation_min_area,
+                        parameters.segmentation_block_size,
+                    )
+                    encoded_ok, encoded_mask = cv2.imencode(".png", mask)
+                    if not encoded_ok:
+                        raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
+                    self.segmentation_mask_cache[artifact_key] = [encoded_mask] * len(frames)
+                else:
+                    encoded_masks: list[np.ndarray] = []
+                    for frame in frames:
+                        mask = segment_dark_contrast(
+                            frame,
+                            parameters.segmentation_block_size,
+                            parameters.segmentation_sensitivity,
+                            parameters.segmentation_level_tolerance,
+                            parameters.segmentation_min_area,
+                        )
+                        encoded_ok, encoded_mask = cv2.imencode(".png", mask)
+                        if not encoded_ok:
+                            raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
+                        encoded_masks.append(encoded_mask)
+                    self.segmentation_mask_cache[artifact_key] = encoded_masks
+        return True
 
     def _sequence_has_roi_extraction(
         self,
@@ -1863,13 +2025,20 @@ class VideoPanel(QFrame):
         parameters: EnhancementParameters,
     ) -> float:
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
+        frame_sequence_key = self._frame_sequence_key(sequence_key)
         frame_count = self.playback_frame_count
         work_units = 0.0
-        if sequence_key in self.encoded_frame_cache:
+        if frame_sequence_key in self.encoded_frame_cache:
             return work_units
         if self.source_gray_frames is None:
             work_units += self._estimated_stage_duration(self._source_stage_token(), frame_count)
-        for token in sequence_key:
+        reusable_prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        for token in frame_sequence_key:
+            candidate = reusable_prefix + (token,)
+            if candidate not in self.stage_frame_cache:
+                break
+            reusable_prefix = candidate
+        for token in frame_sequence_key[len(reusable_prefix) :]:
             work_units += self._estimated_stage_duration(token, frame_count)
         work_units += self._estimated_stage_duration(self._encode_stage_token(), frame_count)
         return work_units
@@ -1912,6 +2081,8 @@ class VideoPanel(QFrame):
             raise ValueError("Spatial denoising requires an FFDNet backend.")
         backend_id = denoiser.backend_id if denoiser is not None else "none"
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
+        frame_sequence_key = self._frame_sequence_key(sequence_key)
+        self._begin_cache_branch(sequence_key)
         stage_parameters_by_prefix: dict[tuple[tuple[str, tuple[object, ...]], ...], EnhancementParameters] = {}
         prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
         stage_noise_by_prefix: dict[tuple[tuple[str, tuple[object, ...]], ...], int] = {}
@@ -1919,8 +2090,14 @@ class VideoPanel(QFrame):
             prefix += (token,)
             stage_parameters_by_prefix[prefix] = stage.parameters or parameters
             stage_noise_by_prefix[prefix] = stage.noise_sigma if stage.noise_sigma is not None else noise_sigma
-        if sequence_key in self.encoded_frame_cache:
-            encoded_frames = self.encoded_frame_cache[sequence_key]
+        artifacts_ready = self._ensure_cached_artifacts(
+            enabled_stages,
+            sequence_key,
+            parameters,
+            cancel_callback,
+        )
+        if frame_sequence_key in self.encoded_frame_cache and artifacts_ready:
+            encoded_frames = self.encoded_frame_cache[frame_sequence_key]
             segmentation_masks = self._segmentation_masks_for_sequence(sequence_key)
             roi_selection = self._roi_selection_for_sequence(sequence_key)
             if encoded_frame_callback is not None or segmentation_mask_callback is not None:
@@ -1934,7 +2111,7 @@ class VideoPanel(QFrame):
             if activate_result:
                 self.enhanced_frames = encoded_frames
             self.segmentation_masks = segmentation_masks
-            self.active_sequence_key = sequence_key
+            self._activate_cache_branch(sequence_key)
             if self._sequence_has_roi_extraction(sequence_key):
                 self._activate_stage_roi_selection(roi_selection)
             else:
@@ -1959,17 +2136,45 @@ class VideoPanel(QFrame):
                 )
 
         frame_count = self.playback_frame_count
-        source_missing = self.source_gray_frames is None
+        reusable_frames = self.source_gray_frames
         missing_stages: list[
-            tuple[tuple[str, tuple[object, ...]], tuple[tuple[str, tuple[object, ...]], ...]]
+            tuple[
+                tuple[str, tuple[object, ...]],
+                tuple[tuple[str, tuple[object, ...]], ...],
+                tuple[tuple[str, tuple[object, ...]], ...],
+            ]
         ] = []
-        prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
-        for token in sequence_key:
-            prefix += (token,)
-            missing_stages.append((token, prefix))
+        frame_prefix: tuple[tuple[str, tuple[object, ...]], ...] = tuple()
+        start_index = 0
+        for index, token in enumerate(sequence_key):
+            definition = BUILTIN_STAGES.require(token[0])
+            stage_prefix = sequence_key[: index + 1]
+            if definition.modifies_frame_data:
+                candidate = frame_prefix + (token,)
+                cached_frames = self.stage_frame_cache.get(candidate)
+                if cached_frames is None:
+                    break
+                frame_prefix = candidate
+                reusable_frames = cached_frames
+            else:
+                artifact_key = self._artifact_cache_key(stage_prefix)
+                if token[0] == "roi_extraction" and artifact_key not in self.roi_selection_cache:
+                    break
+                if token[0] == "segmentation" and artifact_key not in self.segmentation_mask_cache:
+                    break
+            start_index = index + 1
+
+        frame_prefix = self._frame_sequence_key(sequence_key[:start_index])
+        for index in range(start_index, len(sequence_key)):
+            token = sequence_key[index]
+            if BUILTIN_STAGES.require(token[0]).modifies_frame_data:
+                frame_prefix += (token,)
+            missing_stages.append((token, sequence_key[: index + 1], frame_prefix))
+
+        source_missing = reusable_frames is None
 
         work_tokens = ([self._source_stage_token()] if source_missing else []) + [
-            token for token, _ in missing_stages
+            token for token, _, _ in missing_stages
         ] + [self._encode_stage_token()]
         estimates = [self._estimated_stage_duration(token, frame_count) for token in work_tokens]
         completed_frames = [0] * len(work_tokens)
@@ -2025,7 +2230,7 @@ class VideoPanel(QFrame):
 
         def produce_frames() -> None:
             if not source_missing:
-                for index, frame in enumerate(self.source_gray_frames or []):
+                for index, frame in enumerate(reusable_frames or []):
                     if not enqueue(queues[0], (index, frame)):
                         break
                 close_queue(queues[0])
@@ -2064,7 +2269,7 @@ class VideoPanel(QFrame):
         stage_work_offset = 1 if source_missing else 0
 
         def run_stage(stage_index: int) -> None:
-            token, stage_prefix = missing_stages[stage_index]
+            token, stage_prefix, stage_frame_prefix = missing_stages[stage_index]
             stage_key = token[0]
             stage_parameters = stage_parameters_by_prefix[stage_prefix]
             stage_noise_sigma = stage_noise_by_prefix[stage_prefix]
@@ -2233,7 +2438,8 @@ class VideoPanel(QFrame):
                             if not emit(frame_number, transformed):
                                 break
                 elif stage_key == "segmentation":
-                    encoded_masks = segmentation_outputs.setdefault(stage_prefix, [])
+                    artifact_key = self._artifact_cache_key(stage_prefix)
+                    encoded_masks = segmentation_outputs.setdefault(artifact_key, [])
                     segmentation_mode = str(stage_parameters.segmentation_mode)
                     if segmentation_mode == "temporal_change":
                         stage_frames: list[tuple[int, np.ndarray]] = []
@@ -2246,7 +2452,7 @@ class VideoPanel(QFrame):
                             frame_index, frame = cast(tuple[int, np.ndarray], item)
                             stage_frames.append((frame_index, frame))
                         if stage_frames and not cancelled.is_set():
-                            input_prefix = stage_prefix[:-1]
+                            input_prefix = stage_frame_prefix
                             started_at = perf_counter()
                             temporal_change = self.temporal_change_map_cache.get(input_prefix)
                             if temporal_change is None:
@@ -2321,7 +2527,7 @@ class VideoPanel(QFrame):
 
                     if stage_frames and not cancelled.is_set():
                         started_at = perf_counter()
-                        roi_outputs[stage_prefix] = detect_aneurysm_roi(
+                        roi_outputs[self._artifact_cache_key(stage_prefix)] = detect_aneurysm_roi(
                             [frame for _, frame in stage_frames],
                             self.info.fps,
                             soften_mask=bool(stage_parameters.roi_softening_enabled),
@@ -2412,14 +2618,17 @@ class VideoPanel(QFrame):
             return False
         if source_missing:
             self.source_gray_frames = source_output
+        for (token, _, stage_frame_prefix), output in zip(missing_stages, stage_outputs):
+            if BUILTIN_STAGES.require(token[0]).modifies_frame_data:
+                self.stage_frame_cache[stage_frame_prefix] = output
         self.segmentation_mask_cache.update(segmentation_outputs)
         self.roi_selection_cache.update(roi_outputs)
-        self.encoded_frame_cache[sequence_key] = encoded_frames
+        self.encoded_frame_cache[frame_sequence_key] = encoded_frames
 
         if activate_result:
-            self.enhanced_frames = self.encoded_frame_cache[sequence_key]
+            self.enhanced_frames = self.encoded_frame_cache[frame_sequence_key]
         self.segmentation_masks = self._segmentation_masks_for_sequence(sequence_key)
-        self.active_sequence_key = sequence_key
+        self._activate_cache_branch(sequence_key)
         if self._sequence_has_roi_extraction(sequence_key):
             self._activate_stage_roi_selection(self._roi_selection_for_sequence(sequence_key))
         else:
@@ -2581,11 +2790,13 @@ class VideoPanel(QFrame):
         self.segmentation_masks = None
         self.source_gray_frames = None
         self.stage_roi_selection = None
+        self.stage_frame_cache.clear()
         self.encoded_frame_cache.clear()
         self.segmentation_mask_cache.clear()
         self.roi_selection_cache.clear()
         self.temporal_change_map_cache.clear()
         self.active_sequence_key = None
+        self.inactive_sequence_key = None
         self.stage_duration_per_frame.clear()
 
     def analysis_frames(
@@ -2596,9 +2807,10 @@ class VideoPanel(QFrame):
         parameters: EnhancementParameters,
     ) -> list[np.ndarray] | None:
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
-        if not sequence_key:
+        frame_sequence_key = self._frame_sequence_key(sequence_key)
+        if not frame_sequence_key:
             return self.source_gray_frames
-        encoded_frames = self.encoded_frame_cache.get(sequence_key)
+        encoded_frames = self.encoded_frame_cache.get(frame_sequence_key)
         if encoded_frames is None:
             return None
         frames = [cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE) for encoded in encoded_frames]

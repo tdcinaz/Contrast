@@ -43,6 +43,7 @@ class StageDefinition:
     processor: FrameProcessor | None = None
     token_builder: TokenBuilder = lambda _parameters, _backend_id, _noise_sigma: ()
     live_supported: bool | LivePredicate = True
+    modifies_frame_data: bool = True
 
     def cache_token(
         self,
@@ -203,7 +204,16 @@ BUILTIN_STAGES = StageRegistry(
         StageDefinition("auto_crop", "Auto-crop fluoroscope field", ExecutionShape.SOURCE, 0.0, 0.0, live_supported=True),
         StageDefinition("temporal_alignment", "Temporal alignment (trim onset)", ExecutionShape.SOURCE, 0.0, 0.0, live_supported=False),
         StageDefinition("brightness_stabilization", "Gain / brightness stabilization", ExecutionShape.SEQUENCE, 0.0020, 0.0030, live_supported=False),
-        StageDefinition("roi_extraction", "Aneurysm ROI extraction", ExecutionShape.SEQUENCE, 0.0018, 0.0028, token_builder=_roi_token, live_supported=False),
+        StageDefinition(
+            "roi_extraction",
+            "Aneurysm ROI extraction",
+            ExecutionShape.SEQUENCE,
+            0.0018,
+            0.0028,
+            modifies_frame_data=False,
+            token_builder=_roi_token,
+            live_supported=False,
+        ),
         StageDefinition("gain_stabilization", "Median gain normalization", ExecutionShape.FRAME, 0.0012, 0.0018, processor=_gain, token_builder=_gain_token),
         StageDefinition("scanline_correction", "Scanline correction", ExecutionShape.FRAME, 0.0025, 0.0035, processor=_scanline, token_builder=_scanline_token),
         StageDefinition("denoise", "Spatial denoising", ExecutionShape.BATCH, 0.0065, 0.0090, processor=_denoise, token_builder=_denoise_token),
@@ -211,8 +221,33 @@ BUILTIN_STAGES = StageRegistry(
         StageDefinition("local_contrast", "Local contrast (CLAHE)", ExecutionShape.FRAME, 0.0028, 0.0038, processor=_local_contrast, token_builder=_contrast_token),
         StageDefinition("image_adjustments", "Image adjustments", ExecutionShape.FRAME, 0.0016, 0.0026, processor=_image_adjustments, token_builder=_adjustments_token),
         StageDefinition("final_smoothing", "Final Gaussian smoothing", ExecutionShape.FRAME, 0.0010, 0.0015, processor=_smooth, token_builder=_smoothing_token),
-        StageDefinition("segmentation", "Brightness-coded contrast segmentation", ExecutionShape.OBSERVER, 0.0035, 0.0050, token_builder=_segmentation_token, live_supported=lambda parameters: parameters.segmentation_mode == "dark_contrast"),
-        StageDefinition("roi_residence_analysis", "ROI residence analysis", ExecutionShape.ANALYSIS, 0.0, 0.0, live_supported=False),
-        StageDefinition("frame_brightness_analysis", "Frame brightness analysis", ExecutionShape.ANALYSIS, 0.0, 0.0, live_supported=False),
+        StageDefinition(
+            "segmentation",
+            "Brightness-coded contrast segmentation",
+            ExecutionShape.OBSERVER,
+            0.0035,
+            0.0050,
+            modifies_frame_data=False,
+            token_builder=_segmentation_token,
+            live_supported=lambda parameters: parameters.segmentation_mode == "dark_contrast",
+        ),
+        StageDefinition(
+            "roi_residence_analysis",
+            "ROI residence analysis",
+            ExecutionShape.ANALYSIS,
+            0.0,
+            0.0,
+            modifies_frame_data=False,
+            live_supported=False,
+        ),
+        StageDefinition(
+            "frame_brightness_analysis",
+            "Frame brightness analysis",
+            ExecutionShape.ANALYSIS,
+            0.0,
+            0.0,
+            modifies_frame_data=False,
+            live_supported=False,
+        ),
     )
 )
