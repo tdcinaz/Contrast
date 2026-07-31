@@ -40,15 +40,15 @@ View the enhanced output at `http://localhost:8080/egress.mjpg`. [configs/headle
 
 ### Desktop Streaming
 
-Run the desktop application and the same HTTP ingest/egress service together:
+Run the desktop application normally:
 
 ```bash
-uv run python main.py --stream-config configs/headless_stream_config.json
+uv run python main.py
 ```
 
-The stream configuration supplies the listener address, port, crop sampling, JPEG quality, and frame-size limit. The desktop pipeline drawer controls the processing applied to subsequent `/ingest` frames, and updates take effect without restarting the service. Stages that need a full temporal sequence remain available for file analysis in the GUI but are omitted from the single-frame network stream.
+Select **Live camera** to start the network stream service. It listens on `0.0.0.0:8080`, samples 24 frames for auto-crop, emits JPEG at quality 92, and accepts frames up to 16 MiB. The desktop pipeline drawer controls the processing applied to subsequent `/ingest` frames, and updates take effect without restarting the service. Stages that need a full temporal sequence remain available for file analysis in the GUI but are omitted from the single-frame network stream.
 
-With `--stream-config`, select **Live camera** in the setup screen to activate the network source directly; no looping video file is required. Without `--stream-config`, Live camera continues to use the existing looping-video simulation.
+The service stops when the desktop application closes. Use [configs/headless_stream_config.json](configs/headless_stream_config.json) only for the standalone `--headless` service when you need to customize its listener or encoding settings.
 
 ## Pipeline Architecture
 

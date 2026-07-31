@@ -147,17 +147,19 @@ class StreamServerTests(unittest.TestCase):
         window.close()
         app.quit()
 
-    def test_live_mode_uses_configured_network_stream_without_file_selection(self) -> None:
+    def test_live_mode_starts_network_stream_without_file_selection(self) -> None:
         from PySide6.QtWidgets import QApplication
 
         app = QApplication.instance() or QApplication([])
         window = ContrastWindow()
-        window._stream_server = MagicMock()
         self.addCleanup(window.close)
 
-        with patch.object(window, "_show_video_placeholders") as show_placeholders:
+        with patch.object(window, "_start_desktop_stream_service", return_value=True) as start_stream, patch.object(
+            window, "_show_video_placeholders"
+        ) as show_placeholders:
             self.assertTrue(window._select_mode_and_videos("live"))
 
+        start_stream.assert_called_once()
         show_placeholders.assert_not_called()
         self.assertEqual(window.active_mode, "live")
         self.assertIs(window.video_stack.currentWidget(), window.video_row)

@@ -3249,11 +3249,10 @@ class GraphDrawer(QFrame):
 
 
 class ContrastWindow(QMainWindow):
-    def __init__(self, stream_settings: object | None = None) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Contrast Residence Analyzer")
         self.resize(1500, 940)
-        self._stream_settings = stream_settings
         self._stream_processor: object | None = None
         self._stream_service: object | None = None
         self._stream_server: object | None = None
@@ -3317,15 +3316,13 @@ class ContrastWindow(QMainWindow):
         self.update_time_label()
         self._update_stage_statuses()
         self._set_video_controls_enabled(False)
-        if self._stream_settings is not None:
-            self._start_desktop_stream_service()
 
-    def _start_desktop_stream_service(self) -> None:
-        from stream_server import LiveStreamProcessor, StreamService, create_http_server
+    def _start_desktop_stream_service(self) -> bool:
+        from stream_server import LiveStreamProcessor, StreamService, StreamSettings, create_http_server
 
-        settings = self._stream_settings
-        if settings is None:
-            return
+        if self._stream_server is not None:
+            return True
+        settings = StreamSettings()
         processor = LiveStreamProcessor(
             EnhancementStages(),
             EnhancementParameters(),
@@ -3340,7 +3337,7 @@ class ContrastWindow(QMainWindow):
         except OSError as exc:
             LOGGER.exception("Could not start desktop stream service")
             QMessageBox.critical(self, "Could not start stream service", str(exc))
-            return
+            return False
         self._stream_processor = processor
         self._stream_service = service
         self._stream_server = server
@@ -3355,6 +3352,7 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Desktop stream service listening on http://{settings.host}:{settings.port}"
         )
+        return True
 
     def _refresh_desktop_stream_pipeline(self) -> None:
         processor = self._stream_processor
@@ -3515,7 +3513,9 @@ class ContrastWindow(QMainWindow):
         self.rebuild_enhancement_pipeline()
 
     def _select_mode_and_videos(self, mode: str) -> bool:
-        if mode == MODE_LIVE and self._stream_server is not None:
+        if mode == MODE_LIVE:
+            if not self._start_desktop_stream_service():
+                return False
             self._activate_network_stream_mode()
             return True
         self._show_video_placeholders(mode)
@@ -6873,11 +6873,6 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Contrast fluoroscopy enhancement")
     parser.add_argument("--headless", action="store_true", help="Run the HTTP live-stream service without the desktop UI")
     parser.add_argument("--config", type=Path, help="Configuration JSON used by --headless")
-    parser.add_argument(
-        "--stream-config",
-        type=Path,
-        help="Configuration JSON for the HTTP stream service used alongside the desktop UI",
-    )
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--log-file", type=Path, default=ROOT / "logs" / "contrast.log")
     arguments = parser.parse_args(argv)
@@ -6885,21 +6880,14 @@ def main(argv: list[str] | None = None) -> None:
     install_exception_logging()
     LOGGER.info("Starting Contrast in %s mode", "headless" if arguments.headless else "desktop")
     if arguments.headless:
-        if arguments.stream_config is not None:
-            parser.error("--stream-config cannot be used with --headless")
         if arguments.config is None:
             parser.error("--headless requires --config PATH")
         run_headless(arguments.config)
         return
     if arguments.config is not None:
         parser.error("--config is only supported with --headless")
-    stream_settings = None
-    if arguments.stream_config is not None:
-        from stream_server import load_stream_configuration
-
-        stream_settings, *_ = load_stream_configuration(str(arguments.stream_config))
     app = QApplication(sys.argv)
-    window = ContrastWindow(stream_settings)
+    window = ContrastWindow()
     window.show()
     sys.exit(app.exec())
 
