@@ -18,6 +18,7 @@ from main import (
     ContrastWindow,
     EnhancementParameters,
     EnhancementStages,
+    PipelineStage,
     VideoDropPlaceholder,
     VideoPanel,
 )
@@ -194,6 +195,22 @@ class StreamServerTests(unittest.TestCase):
         assert display is not None
         self.assertFalse(display._left_pixmap.isNull())
         self.assertFalse(display._right_pixmap.isNull())
+        app.quit()
+
+    def test_network_pipeline_creates_denoiser_for_enabled_stage_instance(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        stage_instances = EnhancementStages(instances=(PipelineStage("denoise", True),))
+        denoiser = MagicMock()
+        denoiser.backend_id = "ffdnet-ngc-test"
+
+        with patch("container_denoiser.ContainerDenoiser", return_value=denoiser) as container:
+            self.assertIs(window._live_denoiser_for(stage_instances), denoiser)
+
+        container.assert_called_once()
         app.quit()
 
     def test_pipeline_drawer_toggle_hides_content(self) -> None:

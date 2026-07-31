@@ -5447,7 +5447,7 @@ class ContrastWindow(QMainWindow):
 
     def _live_denoiser_for(self, stages: EnhancementStages) -> FrameDenoiser | None:
         mode = str(self.enhancement_mode_combo.currentData())
-        if not stages.denoise:
+        if "denoise" not in stages.enabled_stage_order:
             return None
         key = self._denoiser_key(mode)
         denoiser = self.deep_denoisers.get(key)
