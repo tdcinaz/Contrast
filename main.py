@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue, SimpleQueue
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from time import perf_counter
 from typing import Callable, Generator, Protocol, cast
 
@@ -199,7 +199,6 @@ class FrameDenoiser(Protocol):
     def device_name(self) -> str: ...
 
     def denoise_batch(self, images: list[np.ndarray], noise_sigma: float) -> list[np.ndarray]: ...
-
 
 class SynchronizedFrameDenoiser:
     def __init__(self, denoiser: FrameDenoiser) -> None:
@@ -3250,10 +3249,17 @@ class GraphDrawer(QFrame):
 
 
 class ContrastWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, stream_settings: object | None = None) -> None:
         super().__init__()
         self.setWindowTitle("Contrast Residence Analyzer")
         self.resize(1500, 940)
+        self._stream_settings = stream_settings
+        self._stream_processor: object | None = None
+        self._stream_service: object | None = None
+        self._stream_server: object | None = None
+        self._stream_server_thread: Thread | None = None
+        self._network_stream_display: VideoDisplay | None = None
+        self._network_stream_frame_id = 0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.advance_frame)
         self.is_playing = False
@@ -3279,6 +3285,9 @@ class ContrastWindow(QMainWindow):
         self.enhancement_poll_timer = QTimer(self)
         self.enhancement_poll_timer.setInterval(30)
         self.enhancement_poll_timer.timeout.connect(self._poll_enhancement)
+        self.network_stream_poll_timer = QTimer(self)
+        self.network_stream_poll_timer.setInterval(30)
+        self.network_stream_poll_timer.timeout.connect(self._poll_network_stream)
 
         self.pre_panel: VideoPanel | None = None
         self.post_panel: VideoPanel | None = None
@@ -3308,6 +3317,65 @@ class ContrastWindow(QMainWindow):
         self.update_time_label()
         self._update_stage_statuses()
         self._set_video_controls_enabled(False)
+        if self._stream_settings is not None:
+            self._start_desktop_stream_service()
+
+    def _start_desktop_stream_service(self) -> None:
+        from stream_server import LiveStreamProcessor, StreamService, create_http_server
+
+        settings = self._stream_settings
+        if settings is None:
+            return
+        processor = LiveStreamProcessor(
+            EnhancementStages(),
+            EnhancementParameters(),
+            self.denoise_strength_spin.value(),
+            settings.crop_sample_frames,
+            settings.jpeg_quality,
+            self._has_enabled_stage("auto_crop"),
+        )
+        service = StreamService(processor, settings.max_frame_bytes)
+        try:
+            server = create_http_server(settings, service)
+        except OSError as exc:
+            LOGGER.exception("Could not start desktop stream service")
+            QMessageBox.critical(self, "Could not start stream service", str(exc))
+            return
+        self._stream_processor = processor
+        self._stream_service = service
+        self._stream_server = server
+        self._stream_server_thread = Thread(
+            target=server.serve_forever,
+            name="desktop-stream-server",
+            daemon=True,
+        )
+        self._stream_server_thread.start()
+        self._refresh_desktop_stream_pipeline()
+        LOGGER.info("Desktop stream service listening on http://%s:%s", settings.host, settings.port)
+        self.statusBar().showMessage(
+            f"Desktop stream service listening on http://{settings.host}:{settings.port}"
+        )
+
+    def _refresh_desktop_stream_pipeline(self) -> None:
+        processor = self._stream_processor
+        if processor is None:
+            return
+        parameters = self.enhancement_parameters()
+        configured_stages = self.enhancement_stages()
+        live_stages = EnhancementStages(
+            instances=tuple(
+                stage
+                for stage in configured_stages.instances
+                if not stage.enabled or BUILTIN_STAGES.require(stage.key).supports_live(stage.parameters or parameters)
+            )
+        )
+        processor.configure(
+            live_stages,
+            parameters,
+            self.denoise_strength_spin.value(),
+            self._has_enabled_stage("auto_crop"),
+            self._live_denoiser_for(live_stages),
+        )
 
     def _set_video_controls_enabled(self, enabled: bool) -> None:
         live_input = self.active_mode == MODE_LIVE
@@ -3349,6 +3417,7 @@ class ContrastWindow(QMainWindow):
         return Path(path) if path else None
 
     def _clear_video_panels(self) -> None:
+        self._clear_network_stream_display()
         for panel in self.panels:
             self.video_layout.removeWidget(panel)
             panel.hide()
@@ -3356,6 +3425,15 @@ class ContrastWindow(QMainWindow):
         self.panels = []
         self.pre_panel = None
         self.post_panel = None
+
+    def _clear_network_stream_display(self) -> None:
+        self.network_stream_poll_timer.stop()
+        if self._network_stream_display is not None:
+            self.video_layout.removeWidget(self._network_stream_display)
+            self._network_stream_display.hide()
+            self._network_stream_display.deleteLater()
+            self._network_stream_display = None
+        self._network_stream_frame_id = 0
 
     def _set_video_panels(self, videos: list[Path], live_input: bool = False) -> None:
         if not videos:
@@ -3437,8 +3515,57 @@ class ContrastWindow(QMainWindow):
         self.rebuild_enhancement_pipeline()
 
     def _select_mode_and_videos(self, mode: str) -> bool:
+        if mode == MODE_LIVE and self._stream_server is not None:
+            self._activate_network_stream_mode()
+            return True
         self._show_video_placeholders(mode)
         return True
+
+    def _activate_network_stream_mode(self) -> None:
+        self.pause()
+        self._clear_video_panels()
+        self._clear_video_placeholders()
+        self.pending_mode = None
+        self.pending_video_paths = []
+        self.active_mode = MODE_LIVE
+        self._network_stream_display = VideoDisplay("Network live camera", PANEL_COLORS[0], self.video_row)
+        self._network_stream_display.set_comparison_enabled(self.compare_view_check.isChecked())
+        self.video_layout.addWidget(self._network_stream_display)
+        self.video_layout.setStretch(0, 1)
+        self._update_temporal_alignment_controls()
+        self._set_live_incompatible_stages_enabled(False)
+        self._set_video_controls_enabled(False)
+        self.compare_view_check.setEnabled(True)
+        self.video_stack.setCurrentWidget(self.video_row)
+        self._update_video_stack_geometry()
+        self._sync_trimmed_video_window()
+        self._set_playback_limit(self.source_max_frame)
+        self.current_frame_index = 0
+        self.update_time_label()
+        self._refresh_desktop_stream_pipeline()
+        self.network_stream_poll_timer.start()
+        self._poll_network_stream()
+        self.statusBar().showMessage(
+            "Network live stream active. Send JPEG frames to /ingest; pipeline changes apply to new frames."
+        )
+
+    def _poll_network_stream(self) -> None:
+        if self.active_mode != MODE_LIVE or self._network_stream_display is None:
+            return
+        service = self._stream_service
+        if service is None:
+            return
+        frame_id, encoded_source, encoded_enhanced = service.latest_frames()
+        if frame_id == self._network_stream_frame_id or encoded_source is None or encoded_enhanced is None:
+            return
+        source = cv2.imdecode(np.frombuffer(encoded_source, dtype=np.uint8), cv2.IMREAD_COLOR)
+        enhanced = cv2.imdecode(np.frombuffer(encoded_enhanced, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if source is None or enhanced is None:
+            LOGGER.warning("Could not decode network live frame %s for display", frame_id)
+            self._network_stream_frame_id = frame_id
+            return
+        self._network_stream_display.set_frames(source, cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR))
+        self._network_stream_frame_id = frame_id
 
     def _placeholder_labels(self, mode: str) -> list[str]:
         if mode == MODE_COMPARISON:
@@ -5348,6 +5475,8 @@ class ContrastWindow(QMainWindow):
     def on_compare_view_toggled(self, enabled: bool) -> None:
         for panel in self.panels:
             panel.set_comparison(enabled, self.current_frame_index)
+        if self._network_stream_display is not None:
+            self._network_stream_display.set_comparison_enabled(enabled)
         if enabled:
             self.statusBar().showMessage("Showing source beside enhanced output.")
         else:
@@ -5374,6 +5503,7 @@ class ContrastWindow(QMainWindow):
         self._sync_parameter_slider_enabled(self.inference_batch_spin)
         self.inference_precision_combo.setEnabled(uses_ffdnet)
         self._sync_active_denoise_controls()
+        self._refresh_desktop_stream_pipeline()
         if self.active_mode == MODE_LIVE:
             self._apply_source_pipeline_stages()
             self._render_live_frame()
@@ -5627,6 +5757,7 @@ class ContrastWindow(QMainWindow):
         self.inference_batch_spin.setEnabled(uses_ffdnet)
         self.inference_precision_combo.setEnabled(uses_ffdnet)
         self._sync_active_denoise_controls()
+        self._refresh_desktop_stream_pipeline()
         if self.active_mode == MODE_LIVE:
             self._apply_source_pipeline_stages()
             self._render_live_frame()
@@ -6559,6 +6690,7 @@ class ContrastWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: ANN001
         LOGGER.info("Closing desktop application")
         self.enhancement_poll_timer.stop()
+        self.network_stream_poll_timer.stop()
         if self._enhancement_cancel is not None:
             self._enhancement_cancel.set()
         self._enhancement_executor.shutdown(wait=True, cancel_futures=True)
@@ -6568,6 +6700,11 @@ class ContrastWindow(QMainWindow):
             close = getattr(denoiser, "close", None)
             if close is not None:
                 close()
+        if self._stream_server is not None:
+            self._stream_server.shutdown()
+            self._stream_server.server_close()
+        if self._stream_server_thread is not None:
+            self._stream_server_thread.join()
         super().closeEvent(event)
 
 
@@ -6736,6 +6873,11 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Contrast fluoroscopy enhancement")
     parser.add_argument("--headless", action="store_true", help="Run the HTTP live-stream service without the desktop UI")
     parser.add_argument("--config", type=Path, help="Configuration JSON used by --headless")
+    parser.add_argument(
+        "--stream-config",
+        type=Path,
+        help="Configuration JSON for the HTTP stream service used alongside the desktop UI",
+    )
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--log-file", type=Path, default=ROOT / "logs" / "contrast.log")
     arguments = parser.parse_args(argv)
@@ -6743,14 +6885,21 @@ def main(argv: list[str] | None = None) -> None:
     install_exception_logging()
     LOGGER.info("Starting Contrast in %s mode", "headless" if arguments.headless else "desktop")
     if arguments.headless:
+        if arguments.stream_config is not None:
+            parser.error("--stream-config cannot be used with --headless")
         if arguments.config is None:
             parser.error("--headless requires --config PATH")
         run_headless(arguments.config)
         return
     if arguments.config is not None:
         parser.error("--config is only supported with --headless")
+    stream_settings = None
+    if arguments.stream_config is not None:
+        from stream_server import load_stream_configuration
+
+        stream_settings, *_ = load_stream_configuration(str(arguments.stream_config))
     app = QApplication(sys.argv)
-    window = ContrastWindow()
+    window = ContrastWindow(stream_settings)
     window.show()
     sys.exit(app.exec())
 

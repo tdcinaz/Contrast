@@ -177,6 +177,32 @@ class LiveStreamProcessor:
     def crop_ready(self) -> bool:
         return self._crop_rect is not None
 
+    def configure(
+        self,
+        stages: EnhancementStages,
+        parameters: EnhancementParameters,
+        noise_sigma: int,
+        auto_crop_enabled: bool,
+        denoiser: FrameDenoiser | None,
+    ) -> None:
+        """Apply updated desktop controls before processing the next frame."""
+        with self._lock:
+            reset_crop = self.auto_crop_enabled != auto_crop_enabled
+            self.stages = stages
+            self.parameters = parameters
+            self.noise_sigma = noise_sigma
+            self.auto_crop_enabled = auto_crop_enabled
+            self.denoiser = denoiser
+            if reset_crop:
+                self._crop_samples.clear()
+                self._crop_rect = None
+        LOGGER.info(
+            "Updated live stream pipeline: auto_crop=%s enabled_stages=%s denoiser=%s",
+            auto_crop_enabled,
+            [stage.key for stage in stages.instances if stage.enabled],
+            getattr(denoiser, "backend_id", "none"),
+        )
+
     def process_jpeg(self, encoded: bytes) -> bytes | None:
         frame = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
@@ -229,6 +255,7 @@ class StreamService:
         self.processor = processor
         self.max_frame_bytes = max_frame_bytes
         self._condition = Condition()
+        self._latest_source: bytes | None = None
         self._latest_frame: bytes | None = None
         self._frame_id = 0
         self._ingested = 0
@@ -240,6 +267,7 @@ class StreamService:
         with self._condition:
             self._ingested += 1
             if enhanced is not None:
+                self._latest_source = encoded
                 self._latest_frame = enhanced
                 self._frame_id += 1
                 self._condition.notify_all()
@@ -255,6 +283,11 @@ class StreamService:
     def health(self) -> dict[str, object]:
         with self._condition:
             return {"ingested_frames": self._ingested, "egress_frames": self._frame_id, "crop_ready": self.processor.crop_ready}
+
+    def latest_frames(self) -> tuple[int, bytes | None, bytes | None]:
+        """Return the most recent matched source and enhanced JPEG frames."""
+        with self._condition:
+            return self._frame_id, self._latest_source, self._latest_frame
 
 
 def create_http_server(settings: StreamSettings, service: StreamService) -> ThreadingHTTPServer:

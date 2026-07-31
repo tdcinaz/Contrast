@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
+from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
@@ -143,6 +144,56 @@ class StreamServerTests(unittest.TestCase):
         self.assertFalse(window.compare_view_check.isChecked())
 
         window.close()
+        app.quit()
+
+    def test_live_mode_uses_configured_network_stream_without_file_selection(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        window._stream_server = MagicMock()
+        self.addCleanup(window.close)
+
+        with patch.object(window, "_show_video_placeholders") as show_placeholders:
+            self.assertTrue(window._select_mode_and_videos("live"))
+
+        show_placeholders.assert_not_called()
+        self.assertEqual(window.active_mode, "live")
+        self.assertIs(window.video_stack.currentWidget(), window.video_row)
+        self.assertIsNotNone(window._network_stream_display)
+        self.assertIn("Network live stream active", window.statusBar().currentMessage())
+        app.quit()
+
+    def test_network_live_mode_renders_matched_source_and_enhanced_frames(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        processor = LiveStreamProcessor(
+            EnhancementStages(),
+            EnhancementParameters(),
+            noise_sigma=10,
+            crop_sample_frames=3,
+            jpeg_quality=92,
+            auto_crop_enabled=False,
+        )
+        service = StreamService(processor, max_frame_bytes=1024 * 1024)
+        frame = np.full((48, 64, 3), 150, dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", frame)
+        self.assertTrue(ok)
+        service.ingest(bytes(encoded))
+
+        window = ContrastWindow()
+        window._stream_server = MagicMock()
+        window._stream_service = service
+        self.addCleanup(window.close)
+        window._select_mode_and_videos("live")
+        window._poll_network_stream()
+
+        display = window._network_stream_display
+        self.assertIsNotNone(display)
+        assert display is not None
+        self.assertFalse(display._left_pixmap.isNull())
+        self.assertFalse(display._right_pixmap.isNull())
         app.quit()
 
     def test_pipeline_drawer_toggle_hides_content(self) -> None:

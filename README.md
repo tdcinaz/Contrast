@@ -38,6 +38,18 @@ curl --data-binary @frame.jpg -H 'Content-Type: image/jpeg' http://localhost:808
 
 View the enhanced output at `http://localhost:8080/egress.mjpg`. [configs/headless_stream_config.json](configs/headless_stream_config.json) is a ready-to-edit example. Headless mode rejects stages that require a full temporal sequence, including temporal alignment, brightness stabilization, ROI extraction, motion-aware filtering, and ROI residence analysis.
 
+### Desktop Streaming
+
+Run the desktop application and the same HTTP ingest/egress service together:
+
+```bash
+uv run python main.py --stream-config configs/headless_stream_config.json
+```
+
+The stream configuration supplies the listener address, port, crop sampling, JPEG quality, and frame-size limit. The desktop pipeline drawer controls the processing applied to subsequent `/ingest` frames, and updates take effect without restarting the service. Stages that need a full temporal sequence remain available for file analysis in the GUI but are omitted from the single-frame network stream.
+
+With `--stream-config`, select **Live camera** in the setup screen to activate the network source directly; no looping video file is required. Without `--stream-config`, Live camera continues to use the existing looping-video simulation.
+
 ## Pipeline Architecture
 
 Pipeline contracts are frontend-neutral and live in `contrast_pipeline/`:
