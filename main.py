@@ -3319,7 +3319,7 @@ class ContrastWindow(QMainWindow):
         self._set_video_controls_enabled(False)
 
     def _start_desktop_stream_service(self) -> bool:
-        from stream_server import LiveStreamProcessor, StreamService, StreamSettings, create_http_server
+        from stream_server import RawFrameRecorder, LiveStreamProcessor, StreamService, StreamSettings, create_http_server
 
         if self._stream_server is not None:
             return True
@@ -3332,7 +3332,11 @@ class ContrastWindow(QMainWindow):
             settings.jpeg_quality,
             self._has_enabled_stage("auto_crop"),
         )
-        service = StreamService(processor, settings.max_frame_bytes)
+        service = StreamService(
+            processor,
+            settings.max_frame_bytes,
+            RawFrameRecorder(settings.recording_directory, settings.recording_fps),
+        )
         try:
             server = create_http_server(settings, service)
         except OSError as exc:
@@ -6811,6 +6815,10 @@ class ContrastWindow(QMainWindow):
             close = getattr(denoiser, "close", None)
             if close is not None:
                 close()
+        if self._stream_service is not None:
+            close = getattr(self._stream_service, "close", None)
+            if close is not None:
+                close()
         if self._stream_server is not None:
             self._stream_server.shutdown()
             self._stream_server.server_close()
@@ -6933,7 +6941,7 @@ def normalize_analysis_results(
 
 
 def run_headless(config_path: Path) -> None:
-    from stream_server import LiveStreamProcessor, StreamService, create_http_server, load_stream_configuration
+    from stream_server import RawFrameRecorder, LiveStreamProcessor, StreamService, create_http_server, load_stream_configuration
 
     LOGGER.info("Loading headless configuration from %s", config_path)
     settings, stages, parameters, noise_sigma, auto_crop_enabled, denoiser_settings = load_stream_configuration(str(config_path))
@@ -6963,7 +6971,11 @@ def run_headless(config_path: Path) -> None:
         auto_crop_enabled,
         denoiser,
     )
-    service = StreamService(processor, settings.max_frame_bytes)
+    service = StreamService(
+        processor,
+        settings.max_frame_bytes,
+        RawFrameRecorder(settings.recording_directory, settings.recording_fps),
+    )
     server = create_http_server(settings, service)
     LOGGER.info("Contrast stream service listening on http://%s:%s", settings.host, settings.port)
     LOGGER.info("POST JPEG frames to /ingest; read enhanced MJPEG from /egress.mjpg")
@@ -6973,6 +6985,7 @@ def run_headless(config_path: Path) -> None:
         LOGGER.info("Headless stream service interrupted")
     finally:
         LOGGER.info("Shutting down headless stream service")
+        service.close()
         server.server_close()
         if denoiser is not None:
             close = getattr(denoiser, "close", None)

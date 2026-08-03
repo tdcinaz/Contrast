@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Condition, Lock
 from typing import Any
 
@@ -38,6 +40,8 @@ class StreamSettings:
     crop_sample_frames: int = 24
     jpeg_quality: int = 92
     max_frame_bytes: int = 16 * 1024 * 1024
+    recording_directory: str = "recordings"
+    recording_fps: float = 15.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +98,8 @@ def load_stream_configuration(
         crop_sample_frames=max(3, int(stream.get("crop_sample_frames", 24))),
         jpeg_quality=max(1, min(100, int(stream.get("jpeg_quality", 92)))),
         max_frame_bytes=max(1024, int(stream.get("max_frame_bytes", 16 * 1024 * 1024))),
+        recording_directory=str(stream.get("recording_directory", "recordings")),
+        recording_fps=max(1.0, float(stream.get("recording_fps", 15.0))),
     )
     instances: list[PipelineStage] = []
     parameters = EnhancementParameters()
@@ -250,11 +256,71 @@ class LiveStreamProcessor:
             return bytes(output)
 
 
+class RawFrameRecorder:
+    """Writes each contiguous sequence of distinct raw source frames to its own video."""
+
+    def __init__(self, directory: str | Path, fps: float) -> None:
+        self.directory = Path(directory)
+        self.fps = fps
+        self._last_frame: np.ndarray | None = None
+        self._writer: cv2.VideoWriter | None = None
+        self._recording_path: Path | None = None
+        self.completed_paths: list[Path] = []
+
+    def record(self, frame: np.ndarray) -> None:
+        if self._last_frame is not None and np.array_equal(frame, self._last_frame):
+            self.close_recording()
+            return
+        if self._writer is None:
+            self._open_recording(frame)
+        elif frame.shape[:2] != self._last_frame.shape[:2]:
+            self.close_recording()
+            self._open_recording(frame)
+        assert self._writer is not None
+        self._writer.write(frame)
+        self._last_frame = frame.copy()
+
+    def _open_recording(self, frame: np.ndarray) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        self._recording_path = self.directory / f"fluoroscopy_{timestamp}.avi"
+        height, width = frame.shape[:2]
+        self._writer = cv2.VideoWriter(
+            str(self._recording_path),
+            cv2.VideoWriter_fourcc(*"MJPG"),
+            self.fps,
+            (width, height),
+            True,
+        )
+        if not self._writer.isOpened():
+            self._writer.release()
+            self._writer = None
+            raise RuntimeError(f"Could not open recording file: {self._recording_path}")
+        LOGGER.info("Started raw fluoroscopy recording %s", self._recording_path)
+
+    def close_recording(self) -> None:
+        if self._writer is None:
+            return
+        self._writer.release()
+        self._writer = None
+        assert self._recording_path is not None
+        self.completed_paths.append(self._recording_path)
+        LOGGER.info("Saved raw fluoroscopy recording %s", self._recording_path)
+        self._recording_path = None
+
+
 class StreamService:
-    def __init__(self, processor: LiveStreamProcessor, max_frame_bytes: int) -> None:
+    def __init__(
+        self,
+        processor: LiveStreamProcessor,
+        max_frame_bytes: int,
+        recorder: RawFrameRecorder | None = None,
+    ) -> None:
         self.processor = processor
         self.max_frame_bytes = max_frame_bytes
+        self.recorder = recorder
         self._condition = Condition()
+        self._ingest_lock = Lock()
         self._latest_source: bytes | None = None
         self._latest_frame: bytes | None = None
         self._frame_id = 0
@@ -263,16 +329,26 @@ class StreamService:
     def ingest(self, encoded: bytes) -> tuple[int, bool]:
         if not encoded or len(encoded) > self.max_frame_bytes:
             raise ValueError(f"JPEG frame must be between 1 and {self.max_frame_bytes} bytes.")
-        enhanced = self.processor.process_jpeg(encoded)
-        with self._condition:
-            self._ingested += 1
-            if enhanced is not None:
-                self._latest_source = encoded
-                self._latest_frame = enhanced
-                self._frame_id += 1
-                self._condition.notify_all()
-            LOGGER.debug("Ingested frame=%s egress_ready=%s", self._ingested, enhanced is not None)
-            return self._ingested, enhanced is not None
+        frame = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Ingest body is not a valid JPEG frame.")
+        with self._ingest_lock:
+            if self.recorder is not None:
+                self.recorder.record(frame)
+            enhanced = self.processor.process_frame(frame)
+            with self._condition:
+                self._ingested += 1
+                if enhanced is not None:
+                    self._latest_source = encoded
+                    self._latest_frame = enhanced
+                    self._frame_id += 1
+                    self._condition.notify_all()
+                LOGGER.debug("Ingested frame=%s egress_ready=%s", self._ingested, enhanced is not None)
+                return self._ingested, enhanced is not None
+
+    def close(self) -> None:
+        if self.recorder is not None:
+            self.recorder.close_recording()
 
     def next_frame(self, last_frame_id: int, timeout: float = 15.0) -> tuple[int, bytes | None]:
         with self._condition:
@@ -282,7 +358,12 @@ class StreamService:
 
     def health(self) -> dict[str, object]:
         with self._condition:
-            return {"ingested_frames": self._ingested, "egress_frames": self._frame_id, "crop_ready": self.processor.crop_ready}
+            return {
+                "ingested_frames": self._ingested,
+                "egress_frames": self._frame_id,
+                "crop_ready": self.processor.crop_ready,
+                "saved_recordings": len(self.recorder.completed_paths) if self.recorder is not None else 0,
+            }
 
     def latest_frames(self) -> tuple[int, bytes | None, bytes | None]:
         """Return the most recent matched source and enhanced JPEG frames."""

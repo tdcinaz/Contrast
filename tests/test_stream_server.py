@@ -23,7 +23,7 @@ from main import (
     VideoDropPlaceholder,
     VideoPanel,
 )
-from stream_server import LiveStreamProcessor, StreamService, StreamSettings, create_http_server, load_stream_configuration
+from stream_server import RawFrameRecorder, LiveStreamProcessor, StreamService, StreamSettings, create_http_server, load_stream_configuration
 
 
 class StreamServerTests(unittest.TestCase):
@@ -166,6 +166,19 @@ class StreamServerTests(unittest.TestCase):
         self.assertIs(window.video_stack.currentWidget(), window.video_row)
         self.assertIsNotNone(window._network_stream_display)
         self.assertIn("Network live stream active", window.statusBar().currentMessage())
+        app.quit()
+
+    def test_window_close_finalizes_active_stream_recording(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        service = MagicMock()
+        window._stream_service = service
+
+        window.close()
+
+        service.close.assert_called_once()
         app.quit()
 
     def test_network_live_mode_renders_matched_source_and_enhanced_frames(self) -> None:
@@ -317,6 +330,47 @@ class StreamServerTests(unittest.TestCase):
 
         self.assertIsNotNone(enhanced)
         self.assertTrue(processor.crop_ready)
+
+    def test_raw_recorder_saves_distinct_frame_sequences_separately(self) -> None:
+        processor = LiveStreamProcessor(
+            EnhancementStages(),
+            EnhancementParameters(),
+            noise_sigma=10,
+            crop_sample_frames=3,
+            jpeg_quality=92,
+            auto_crop_enabled=False,
+        )
+        first = np.full((48, 64, 3), 40, dtype=np.uint8)
+        second = np.full((48, 64, 3), 120, dtype=np.uint8)
+        third = np.full((48, 64, 3), 200, dtype=np.uint8)
+        with TemporaryDirectory() as directory:
+            recorder = RawFrameRecorder(directory, fps=15.0)
+            service = StreamService(processor, max_frame_bytes=1024 * 1024, recorder=recorder)
+            for frame in (first, second, second, third, third):
+                ok, encoded = cv2.imencode(".jpg", frame)
+                self.assertTrue(ok)
+                service.ingest(bytes(encoded))
+            service.close()
+
+            self.assertEqual(len(recorder.completed_paths), 2)
+            counts: list[int] = []
+            values: list[list[float]] = []
+            for path in recorder.completed_paths:
+                capture = cv2.VideoCapture(str(path))
+                frames: list[np.ndarray] = []
+                while True:
+                    ok, frame = capture.read()
+                    if not ok:
+                        break
+                    frames.append(frame)
+                capture.release()
+                counts.append(len(frames))
+                values.append([float(frame.mean()) for frame in frames])
+
+            self.assertEqual(counts, [2, 1])
+            self.assertLess(abs(values[0][0] - 40), 5)
+            self.assertLess(abs(values[0][1] - 120), 5)
+            self.assertLess(abs(values[1][0] - 200), 5)
 
     def test_http_ingest_and_mjpeg_egress(self) -> None:
         processor = LiveStreamProcessor(
