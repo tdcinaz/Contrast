@@ -48,6 +48,8 @@ uv run python main.py
 
 Select **Live camera** to start the network stream service. It listens on `0.0.0.0:8080`, samples 24 frames for auto-crop, emits JPEG at quality 92, and accepts frames up to 16 MiB. The desktop pipeline drawer controls the processing applied to subsequent `/ingest` frames, and updates take effect without restarting the service. Stages that need a full temporal sequence remain available for file analysis in the GUI but are omitted from the single-frame network stream.
 
+Live camera opens with source and enhanced views side by side. Drag on the source image to select the legacy rectangular ROI; temporal ROI extraction remains unavailable for live input. Add and enable **ROI residence analysis** and/or **Frame brightness analysis** in the pipeline drawer to update their plots from the latest 60 seconds of received frames.
+
 The service stops when the desktop application closes. Use [configs/headless_stream_config.json](configs/headless_stream_config.json) only for the standalone `--headless` service when you need to customize its listener or encoding settings.
 
 ## Pipeline Architecture

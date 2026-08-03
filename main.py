@@ -3259,6 +3259,7 @@ class ContrastWindow(QMainWindow):
         self._stream_server_thread: Thread | None = None
         self._network_stream_display: VideoDisplay | None = None
         self._network_stream_frame_id = 0
+        self._live_measurements: deque[tuple[float, float, float, float, float]] = deque()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.advance_frame)
         self.is_playing = False
@@ -3392,8 +3393,6 @@ class ContrastWindow(QMainWindow):
             "brightness_stabilization",
             "roi_extraction",
             "temporal_filter",
-            "roi_residence_analysis",
-            "frame_brightness_analysis",
         ):
             for drawer in self._stage_drawers(stage_key):
                 if not enabled:
@@ -3432,6 +3431,7 @@ class ContrastWindow(QMainWindow):
             self._network_stream_display.deleteLater()
             self._network_stream_display = None
         self._network_stream_frame_id = 0
+        self._live_measurements.clear()
 
     def _set_video_panels(self, videos: list[Path], live_input: bool = False) -> None:
         if not videos:
@@ -3528,8 +3528,10 @@ class ContrastWindow(QMainWindow):
         self.pending_mode = None
         self.pending_video_paths = []
         self.active_mode = MODE_LIVE
+        self.compare_view_check.setChecked(True)
         self._network_stream_display = VideoDisplay("Network live camera", PANEL_COLORS[0], self.video_row)
         self._network_stream_display.set_comparison_enabled(self.compare_view_check.isChecked())
+        self._network_stream_display.roiChanged.connect(lambda _roi: self.on_roi_changed())
         self.video_layout.addWidget(self._network_stream_display)
         self.video_layout.setStretch(0, 1)
         self._update_temporal_alignment_controls()
@@ -3546,7 +3548,7 @@ class ContrastWindow(QMainWindow):
         self.network_stream_poll_timer.start()
         self._poll_network_stream()
         self.statusBar().showMessage(
-            "Network live stream active. Send JPEG frames to /ingest; pipeline changes apply to new frames."
+            "Network live stream active. Drag to select an ROI; live plots retain the latest 60 seconds."
         )
 
     def _poll_network_stream(self) -> None:
@@ -3566,6 +3568,81 @@ class ContrastWindow(QMainWindow):
             return
         self._network_stream_display.set_frames(source, cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR))
         self._network_stream_frame_id = frame_id
+        self._record_live_measurements(source, enhanced)
+
+    def _record_live_measurements(self, source: np.ndarray, enhanced: np.ndarray) -> None:
+        timestamp = perf_counter()
+        source_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+        roi = self._network_stream_display.roi() if self._network_stream_display is not None else None
+        roi_mask = self._network_stream_display.roi_mask() if self._network_stream_display is not None else None
+        roi_value = roi_mean(enhanced, roi, roi_mask) if roi is not None else math.nan
+        reference_value = reference_mean(enhanced, roi, roi_mask) if roi is not None else math.nan
+        self._live_measurements.append(
+            (timestamp, average_frame_brightness([source_gray])[0], average_frame_brightness([enhanced])[0], roi_value, reference_value)
+        )
+        while self._live_measurements and timestamp - self._live_measurements[0][0] > 60.0:
+            self._live_measurements.popleft()
+        self._refresh_live_analysis()
+
+    def _refresh_live_analysis(self) -> None:
+        if not self._live_measurements:
+            return
+        values = np.asarray(self._live_measurements, dtype=float)
+        time = values[:, 0] - values[-1, 0]
+        source_brightness = values[:, 1]
+        enhanced_brightness = values[:, 2]
+        roi_values = values[:, 3]
+        reference_values = values[:, 4]
+        label = "Live camera"
+
+        if self._has_enabled_stage("frame_brightness_analysis"):
+            self.frame_brightness_results = {label: (time, source_brightness, enhanced_brightness)}
+            self.refresh_frame_brightness_plot()
+
+        if self._has_enabled_stage("roi_residence_analysis") and np.any(np.isfinite(roi_values)):
+            selected = np.isfinite(roi_values) & np.isfinite(reference_values)
+            sample_time = time[selected]
+            sample_roi = roi_values[selected]
+            sample_reference = reference_values[selected]
+            if len(sample_roi) >= 2:
+                duration = max(0.001, sample_time[-1] - sample_time[0])
+                fps = max(1.0, (len(sample_roi) - 1) / duration)
+                result = build_analysis_result(
+                    label,
+                    Path("network-live"),
+                    fps,
+                    self._network_stream_display.roi() if self._network_stream_display is not None else QRect(),
+                    sample_roi,
+                    sample_reference,
+                    self.threshold_spin.value(),
+                    self._has_enabled_stage("gain_stabilization"),
+                )
+                result.time = sample_time
+                self.results = {label: result}
+                self._refresh_live_roi_plots(time, roi_values)
+                self.pre_card.set_metric(format_seconds(result.residence_time), self._metric_detail(result))
+                self.export_action.setEnabled(True)
+                self.export_button.setEnabled(True)
+
+    def _refresh_live_roi_plots(self, time: np.ndarray, roi_values: np.ndarray) -> None:
+        selected = np.isfinite(roi_values)
+        self.normalized_plot.clear()
+        self.raw_plot.clear()
+        if not np.any(selected):
+            return
+        raw = roi_values[selected]
+        baseline = float(np.median(raw[: max(1, min(len(raw), 30))]))
+        contrast = np.clip(baseline - raw, 0, None)
+        peak = float(np.max(contrast))
+        normalized = contrast / peak if peak > 0 else np.zeros_like(contrast)
+        live_time = time[selected]
+        self.normalized_plot.plot(live_time, normalized, pen=pg.mkPen(PANEL_COLORS[0].name(), width=2.5), name="Live ROI")
+        self.normalized_plot.addItem(
+            pg.InfiniteLine(pos=self.threshold_spin.value(), angle=0, pen=pg.mkPen("#e2e8f0", width=1, style=Qt.PenStyle.DashLine))
+        )
+        self.raw_plot.plot(live_time, raw, pen=pg.mkPen(PANEL_COLORS[0].name(), width=2.5), name="Live ROI")
+        self.normalized_plot.setXRange(-60, 0, padding=0)
+        self.raw_plot.setXRange(-60, 0, padding=0)
 
     def _placeholder_labels(self, mode: str) -> list[str]:
         if mode == MODE_COMPARISON:
@@ -5349,6 +5426,24 @@ class ContrastWindow(QMainWindow):
         frame_brightness_drawers = self._stage_drawers("frame_brightness_analysis")
         analysis_enabled = self._has_enabled_stage("roi_residence_analysis")
         frame_brightness_enabled = self._has_enabled_stage("frame_brightness_analysis")
+        if self.active_mode == MODE_LIVE and self._network_stream_display is not None:
+            for drawer in roi_drawers:
+                drawer.set_status("Unavailable for live input. Drag on the source image to select an ROI.", False)
+            for drawer in analysis_drawers:
+                drawer.set_status(
+                    "Collecting the latest 60 seconds from the manually selected ROI."
+                    if analysis_enabled
+                    else None,
+                    False,
+                )
+            for drawer in frame_brightness_drawers:
+                drawer.set_status(
+                    "Collecting the latest 60 seconds of source and enhanced brightness."
+                    if frame_brightness_enabled
+                    else None,
+                    False,
+                )
+            return
         if not self.panels:
             for drawer in roi_drawers:
                 drawer.set_status("Load video files to run ROI extraction.", analysis_enabled)
@@ -5400,6 +5495,13 @@ class ContrastWindow(QMainWindow):
                 drawer.set_status("Ready to compare original and enhanced frame brightness.", False)
 
     def on_roi_changed(self) -> None:
+        if self.active_mode == MODE_LIVE and self._network_stream_display is not None:
+            self._live_measurements.clear()
+            self.results.clear()
+            self.clear_plots_and_metrics()
+            self._update_stage_statuses()
+            self.statusBar().showMessage("Live ROI selected. Collecting measurements for the latest 60 seconds.")
+            return
         if not self.panels:
             self.statusBar().showMessage("Load a video to begin processing.")
             return
@@ -6173,6 +6275,9 @@ class ContrastWindow(QMainWindow):
         self._update_stage_statuses()
 
     def on_analysis_threshold_changed(self) -> None:
+        if self.active_mode == MODE_LIVE and self._network_stream_display is not None:
+            self._refresh_live_analysis()
+            return
         if self.results:
             self.refresh_analysis_from_existing()
         elif self._has_enabled_stage("roi_residence_analysis") and self._enhancement_future is None:
@@ -6318,13 +6423,16 @@ class ContrastWindow(QMainWindow):
 
     def refresh_frame_brightness_plot(self) -> None:
         self._clear_frame_brightness_plots()
-        for panel in self.panels:
-            result = self.frame_brightness_results.get(panel.label)
+        if self.active_mode == MODE_LIVE and self._network_stream_display is not None:
+            labels_and_colors = [("Live camera", PANEL_COLORS[0].name())]
+        else:
+            labels_and_colors = [(panel.label, panel.color.name()) for panel in self.panels]
+        for label, color in labels_and_colors:
+            result = self.frame_brightness_results.get(label)
             if result is None:
                 continue
             time, source_brightness, enhanced_brightness = result
-            color = panel.color.name()
-            plot = pg.PlotWidget(title=f"{panel.label} Average Frame Brightness")
+            plot = pg.PlotWidget(title=f"{label} Average Frame Brightness")
             plot.setBackground("#111827")
             plot.showGrid(x=True, y=True, alpha=0.25)
             plot.getAxis("bottom").setPen("#8aa0b8")
@@ -6347,9 +6455,12 @@ class ContrastWindow(QMainWindow):
                 name="Enhanced",
             )
             if len(time):
-                plot.setXRange(0, time[-1], padding=0)
+                if self.active_mode == MODE_LIVE:
+                    plot.setXRange(-60, 0, padding=0)
+                else:
+                    plot.setXRange(0, time[-1], padding=0)
             self.frame_brightness_layout.addWidget(plot)
-            self.frame_brightness_plots[panel.label] = plot
+            self.frame_brightness_plots[label] = plot
 
     def _clear_frame_brightness_plots(self) -> None:
         while self.frame_brightness_layout.count():

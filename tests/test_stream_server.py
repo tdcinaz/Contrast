@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
+from PySide6.QtCore import QRect
 
 from main import (
     MODE_COMPARISON,
@@ -197,6 +198,45 @@ class StreamServerTests(unittest.TestCase):
         assert display is not None
         self.assertFalse(display._left_pixmap.isNull())
         self.assertFalse(display._right_pixmap.isNull())
+        app.quit()
+
+    def test_network_live_mode_updates_manual_roi_and_frame_brightness_analysis(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        window._stream_server = MagicMock()
+        self.addCleanup(window.close)
+        window._select_mode_and_videos("live")
+        display = window._network_stream_display
+        assert display is not None
+        display.set_roi(QRect(8, 8, 24, 24))
+        for stage_key in ("roi_residence_analysis", "frame_brightness_analysis"):
+            window._add_pipeline_stage(stage_key).enable_button.setChecked(True)
+
+        source = np.full((48, 64, 3), 150, dtype=np.uint8)
+        enhanced = np.full((48, 64), 120, dtype=np.uint8)
+        window._record_live_measurements(source, enhanced)
+        window._record_live_measurements(source, enhanced)
+
+        self.assertIn("Live camera", window.frame_brightness_results)
+        self.assertIn("Live camera", window.results)
+        self.assertIn("Live camera", window.frame_brightness_plots)
+        app.quit()
+
+    def test_live_add_stage_menu_includes_analysis_stages(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        window._stream_server = MagicMock()
+        self.addCleanup(window.close)
+        window._select_mode_and_videos("live")
+        window._show_add_stage_menu("live")
+
+        action_labels = {action.text() for action in window._stage_menu.actions()}
+        self.assertIn("ROI residence analysis", action_labels)
+        self.assertIn("Frame brightness analysis", action_labels)
         app.quit()
 
     def test_network_pipeline_creates_denoiser_for_enabled_stage_instance(self) -> None:

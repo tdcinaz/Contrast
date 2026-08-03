@@ -238,7 +238,6 @@ BUILTIN_STAGES = StageRegistry(
             0.0,
             0.0,
             modifies_frame_data=False,
-            live_supported=False,
         ),
         StageDefinition(
             "frame_brightness_analysis",
@@ -247,7 +246,6 @@ BUILTIN_STAGES = StageRegistry(
             0.0,
             0.0,
             modifies_frame_data=False,
-            live_supported=False,
         ),
     )
 )
