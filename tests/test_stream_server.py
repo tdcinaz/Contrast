@@ -343,10 +343,11 @@ class StreamServerTests(unittest.TestCase):
         first = np.full((48, 64, 3), 40, dtype=np.uint8)
         second = np.full((48, 64, 3), 120, dtype=np.uint8)
         third = np.full((48, 64, 3), 200, dtype=np.uint8)
+        fourth = np.full((48, 64, 3), 230, dtype=np.uint8)
         with TemporaryDirectory() as directory:
             recorder = RawFrameRecorder(directory, fps=15.0)
             service = StreamService(processor, max_frame_bytes=1024 * 1024, recorder=recorder)
-            for frame in (first, second, second, third, third):
+            for frame in (first, second, second, third, fourth, fourth):
                 ok, encoded = cv2.imencode(".jpg", frame)
                 self.assertTrue(ok)
                 service.ingest(bytes(encoded))
@@ -367,10 +368,33 @@ class StreamServerTests(unittest.TestCase):
                 counts.append(len(frames))
                 values.append([float(frame.mean()) for frame in frames])
 
-            self.assertEqual(counts, [2, 1])
+            self.assertEqual(counts, [2, 2])
             self.assertLess(abs(values[0][0] - 40), 5)
             self.assertLess(abs(values[0][1] - 120), 5)
             self.assertLess(abs(values[1][0] - 200), 5)
+            self.assertLess(abs(values[1][1] - 230), 5)
+
+    def test_raw_recorder_ignores_paused_frames_at_startup(self) -> None:
+        processor = LiveStreamProcessor(
+            EnhancementStages(),
+            EnhancementParameters(),
+            noise_sigma=10,
+            crop_sample_frames=3,
+            jpeg_quality=92,
+            auto_crop_enabled=False,
+        )
+        paused = np.full((48, 64, 3), 40, dtype=np.uint8)
+        first_live = np.full((48, 64, 3), 120, dtype=np.uint8)
+        with TemporaryDirectory() as directory:
+            recorder = RawFrameRecorder(directory, fps=15.0)
+            service = StreamService(processor, max_frame_bytes=1024 * 1024, recorder=recorder)
+            for frame in (paused, paused, first_live, first_live):
+                ok, encoded = cv2.imencode(".jpg", frame)
+                self.assertTrue(ok)
+                service.ingest(bytes(encoded))
+            service.close()
+
+            self.assertEqual(recorder.completed_paths, [])
 
     def test_http_ingest_and_mjpeg_egress(self) -> None:
         processor = LiveStreamProcessor(

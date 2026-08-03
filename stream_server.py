@@ -263,22 +263,75 @@ class RawFrameRecorder:
         self.directory = Path(directory)
         self.fps = fps
         self._last_frame: np.ndarray | None = None
+        self._candidate_frame: np.ndarray | None = None
+        self._initial_frame_pending = True
         self._writer: cv2.VideoWriter | None = None
         self._recording_path: Path | None = None
         self.completed_paths: list[Path] = []
 
     def record(self, frame: np.ndarray) -> None:
-        if self._last_frame is not None and np.array_equal(frame, self._last_frame):
-            self.close_recording()
+        if self._last_frame is None:
+            self._last_frame = frame.copy()
             return
-        if self._writer is None:
-            self._open_recording(frame)
-        elif frame.shape[:2] != self._last_frame.shape[:2]:
-            self.close_recording()
-            self._open_recording(frame)
+
+        if self._writer is not None:
+            if np.array_equal(frame, self._last_frame):
+                self.close_recording()
+                return
+            if frame.shape[:2] != self._last_frame.shape[:2]:
+                self.close_recording()
+                self._candidate_frame = frame.copy()
+                self._last_frame = self._candidate_frame
+                return
+            self._writer.write(frame)
+            self._last_frame = frame.copy()
+            return
+
+        if self._initial_frame_pending:
+            self._initial_frame_pending = False
+            if np.array_equal(frame, self._last_frame):
+                return
+            if frame.shape[:2] == self._last_frame.shape[:2]:
+                self._open_recording(self._last_frame)
+                assert self._writer is not None
+                self._writer.write(self._last_frame)
+                self._writer.write(frame)
+                self._last_frame = frame.copy()
+                return
+            self._candidate_frame = frame.copy()
+            self._last_frame = self._candidate_frame
+            return
+
+        if self._candidate_frame is None:
+            if np.array_equal(frame, self._last_frame):
+                return
+            self._candidate_frame = frame.copy()
+            self._last_frame = self._candidate_frame
+            return
+
+        if np.array_equal(frame, self._candidate_frame):
+            self._candidate_frame = None
+            return
+        if frame.shape[:2] != self._candidate_frame.shape[:2]:
+            self._candidate_frame = frame.copy()
+            self._last_frame = self._candidate_frame
+            return
+        self._open_recording(self._candidate_frame)
         assert self._writer is not None
+        self._writer.write(self._candidate_frame)
         self._writer.write(frame)
+        self._candidate_frame = None
         self._last_frame = frame.copy()
+
+    def close_recording(self) -> None:
+        if self._writer is None:
+            return
+        self._writer.release()
+        self._writer = None
+        assert self._recording_path is not None
+        self.completed_paths.append(self._recording_path)
+        LOGGER.info("Saved raw fluoroscopy recording %s", self._recording_path)
+        self._recording_path = None
 
     def _open_recording(self, frame: np.ndarray) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -297,16 +350,6 @@ class RawFrameRecorder:
             self._writer = None
             raise RuntimeError(f"Could not open recording file: {self._recording_path}")
         LOGGER.info("Started raw fluoroscopy recording %s", self._recording_path)
-
-    def close_recording(self) -> None:
-        if self._writer is None:
-            return
-        self._writer.release()
-        self._writer = None
-        assert self._recording_path is not None
-        self.completed_paths.append(self._recording_path)
-        LOGGER.info("Saved raw fluoroscopy recording %s", self._recording_path)
-        self._recording_path = None
 
 
 class StreamService:
