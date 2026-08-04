@@ -37,6 +37,31 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_reordered_roi_analysis_drawer_reflows_when_toggled(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window.resize(500, 500)
+        window.show()
+        app.processEvents()
+
+        gain_drawer = window._add_pipeline_stage("gain_stabilization")
+        analysis_drawer = window._add_pipeline_stage("roi_residence_analysis", after=gain_drawer)
+        window._reorder_pipeline_stage_by_key("roi_residence_analysis", "gain_stabilization")
+        app.processEvents()
+        collapsed_height = analysis_drawer.height()
+
+        analysis_drawer.expand_button.setChecked(True)
+        app.processEvents()
+        expanded_height = analysis_drawer.height()
+
+        analysis_drawer.expand_button.setChecked(False)
+        app.processEvents()
+
+        self.assertEqual(window.live_pipeline_stage_drawers[1], analysis_drawer)
+        self.assertGreater(expanded_height, collapsed_height)
+        self.assertEqual(analysis_drawer.height(), collapsed_height)
+
     def test_comparison_sync_control_is_only_visible_in_comparison_mode(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = ContrastWindow()

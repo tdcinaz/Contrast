@@ -3103,6 +3103,16 @@ class StageDrawer(QFrame):
     def _set_expanded(self, expanded: bool) -> None:
         self.expand_button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
         self.content.setVisible(expanded)
+        if self.layout() is not None:
+            self.layout().invalidate()
+        self.updateGeometry()
+        parent = self.parentWidget()
+        while parent is not None:
+            if parent.layout() is not None:
+                parent.layout().invalidate()
+                parent.layout().activate()
+            parent.updateGeometry()
+            parent = parent.parentWidget()
 
     def set_stage_index(self, stage_index: int) -> None:
         self.stage_label.setText(self.stage_title)
