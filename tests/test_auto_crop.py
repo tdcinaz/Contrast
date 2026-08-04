@@ -43,6 +43,20 @@ class AutoCropTests(unittest.TestCase):
         self.assertEqual(crop.width() % 32, 0)
         self.assertEqual(crop.getRect(), (120, 40, 160, 160))
 
+    def test_detects_dark_standby_field_with_bright_label(self) -> None:
+        frames: list[np.ndarray] = []
+        for level in (42, 45, 48, 51, 54, 57):
+            frame = np.full((240, 400), level, dtype=np.uint8)
+            cv2.circle(frame, (200, 120), 110, 0, thickness=-1)
+            cv2.putText(frame, "Please Initiate SCAN", (112, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.55, 170, 2)
+            frames.append(frame)
+
+        crop = _detect_aligned_field_crop(frames)
+
+        self.assertIsNotNone(crop)
+        assert crop is not None
+        self.assertEqual(crop.getRect(), (120, 40, 160, 160))
+
     def test_rejects_rectangular_content_as_fluoroscope_field(self) -> None:
         frames = [np.pad(np.full((200, 240), 160, dtype=np.uint8), ((0, 0), (80, 80))) for _ in range(6)]
 

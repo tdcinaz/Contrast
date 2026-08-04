@@ -23,6 +23,7 @@ from contrast_pipeline import (
 )
 from main import (
     FrameDenoiser,
+    _adjust_auto_crop_square,
     _detect_aligned_field_crop,
     _detect_pillarbox_crop,
     crop_frame,
@@ -158,6 +159,7 @@ class LiveStreamProcessor:
         jpeg_quality: int,
         auto_crop_enabled: bool,
         denoiser: FrameDenoiser | None = None,
+        auto_crop_size_offset: int = 0,
     ) -> None:
         self.stages = stages
         self.parameters = parameters
@@ -166,8 +168,10 @@ class LiveStreamProcessor:
         self.jpeg_quality = jpeg_quality
         self.auto_crop_enabled = auto_crop_enabled
         self.denoiser = denoiser
+        self.auto_crop_size_offset = auto_crop_size_offset
         self.pipeline = FramePipelineExecutor()
         self._crop_samples: list[np.ndarray] = []
+        self._auto_crop_rect = None
         self._crop_rect = None
         self._shape: tuple[int, int] | None = None
         self._lock = Lock()
@@ -190,6 +194,7 @@ class LiveStreamProcessor:
         noise_sigma: int,
         auto_crop_enabled: bool,
         denoiser: FrameDenoiser | None,
+        auto_crop_size_offset: int,
     ) -> None:
         """Apply updated desktop controls before processing the next frame."""
         with self._lock:
@@ -199,9 +204,19 @@ class LiveStreamProcessor:
             self.noise_sigma = noise_sigma
             self.auto_crop_enabled = auto_crop_enabled
             self.denoiser = denoiser
+            self.auto_crop_size_offset = auto_crop_size_offset
             if reset_crop:
                 self._crop_samples.clear()
+                self._auto_crop_rect = None
                 self._crop_rect = None
+            elif self._auto_crop_rect is not None and self._shape is not None:
+                width, height = self._shape
+                self._crop_rect = _adjust_auto_crop_square(
+                    self._auto_crop_rect,
+                    width,
+                    height,
+                    self.auto_crop_size_offset,
+                )
         LOGGER.info(
             "Updated live stream pipeline: auto_crop=%s enabled_stages=%s denoiser=%s",
             auto_crop_enabled,
@@ -222,14 +237,21 @@ class LiveStreamProcessor:
                 LOGGER.info("Input dimensions changed from %s to %sx%s; resetting crop state", self._shape, width, height)
                 self._shape = (width, height)
                 self._crop_samples.clear()
+                self._auto_crop_rect = None
                 self._crop_rect = None
             if self._crop_rect is None and self.auto_crop_enabled:
                 self._crop_samples.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
                 if len(self._crop_samples) < self.crop_sample_frames:
                     LOGGER.debug("Collecting crop sample %s/%s", len(self._crop_samples), self.crop_sample_frames)
                     return None
-                self._crop_rect = _detect_aligned_field_crop(self._crop_samples) or _detect_pillarbox_crop(
+                self._auto_crop_rect = _detect_aligned_field_crop(self._crop_samples) or _detect_pillarbox_crop(
                     self._crop_samples, width, height
+                )
+                self._crop_rect = _adjust_auto_crop_square(
+                    self._auto_crop_rect,
+                    width,
+                    height,
+                    self.auto_crop_size_offset,
                 )
                 self._crop_samples.clear()
                 LOGGER.info("Auto-crop selected rectangle %s", self._crop_rect)

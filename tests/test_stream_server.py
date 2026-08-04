@@ -361,6 +361,39 @@ class StreamServerTests(unittest.TestCase):
         self.assertIsNotNone(enhanced)
         self.assertTrue(processor.crop_ready)
 
+    def test_processor_reapplies_live_crop_size_offset(self) -> None:
+        processor = LiveStreamProcessor(
+            EnhancementStages(),
+            EnhancementParameters(),
+            noise_sigma=10,
+            crop_sample_frames=3,
+            jpeg_quality=92,
+            auto_crop_enabled=True,
+        )
+        frame = np.zeros((240, 400, 3), dtype=np.uint8)
+        cv2.circle(frame, (200, 120), 110, (160, 160, 160), thickness=-1)
+
+        for _ in range(2):
+            self.assertIsNone(processor.process_frame(frame))
+        base_output = processor.process_frame(frame)
+        self.assertIsNotNone(base_output)
+        processor.configure(
+            EnhancementStages(),
+            EnhancementParameters(),
+            noise_sigma=10,
+            auto_crop_enabled=True,
+            denoiser=None,
+            auto_crop_size_offset=32,
+        )
+        adjusted_output = processor.process_frame(frame)
+
+        assert base_output is not None
+        assert adjusted_output is not None
+        base_frame = cv2.imdecode(np.frombuffer(base_output, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        adjusted_frame = cv2.imdecode(np.frombuffer(adjusted_output, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        self.assertEqual(base_frame.shape, (160, 160))
+        self.assertEqual(adjusted_frame.shape, (192, 192))
+
     def test_raw_recorder_waits_for_three_identical_frames_before_cutting(self) -> None:
         processor = LiveStreamProcessor(
             EnhancementStages(),

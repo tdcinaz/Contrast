@@ -392,11 +392,14 @@ def _detect_aligned_field_crop(gray_frames: list[np.ndarray]) -> QRect | None:
     )
     edge_level = float(np.median(edges))
     center_level = float(np.median(center))
-    if center_level - edge_level < 12.0:
+    contrast = center_level - edge_level
+    if abs(contrast) < 12.0:
         return None
 
-    threshold = edge_level + (center_level - edge_level) * 0.45
-    field_mask = (temporal_level > threshold).astype(np.uint8)
+    threshold = edge_level + contrast * 0.45
+    field_mask = (
+        temporal_level > threshold if contrast > 0 else temporal_level < threshold
+    ).astype(np.uint8)
     kernel_size = max(5, round(min(height, width) * 0.03) | 1)
     field_mask = cv2.morphologyEx(
         field_mask,
@@ -3342,6 +3345,7 @@ class ContrastWindow(QMainWindow):
             settings.crop_sample_frames,
             settings.jpeg_quality,
             self._has_enabled_stage("auto_crop"),
+            auto_crop_size_offset=self.auto_crop_size_offset_spin.value(),
         )
         service = StreamService(
             processor,
@@ -3389,6 +3393,7 @@ class ContrastWindow(QMainWindow):
             self.denoise_strength_spin.value(),
             self._has_enabled_stage("auto_crop"),
             self._live_denoiser_for(live_stages),
+            self.auto_crop_size_offset_spin.value(),
         )
 
     def _set_video_controls_enabled(self, enabled: bool) -> None:
