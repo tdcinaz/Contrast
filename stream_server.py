@@ -259,10 +259,13 @@ class LiveStreamProcessor:
 class RawFrameRecorder:
     """Writes each contiguous sequence of distinct raw source frames to its own video."""
 
+    IDENTICAL_FRAME_CUTOFF = 3
+
     def __init__(self, directory: str | Path, fps: float) -> None:
         self.directory = Path(directory)
         self.fps = fps
         self._last_frame: np.ndarray | None = None
+        self._identical_frame_count = 0
         self._candidate_frame: np.ndarray | None = None
         self._initial_frame_pending = True
         self._writer: cv2.VideoWriter | None = None
@@ -287,7 +290,11 @@ class RawFrameRecorder:
 
         if self._writer is not None:
             if np.array_equal(frame, self._last_frame):
-                self.close_recording()
+                self._identical_frame_count += 1
+                if self._identical_frame_count >= self.IDENTICAL_FRAME_CUTOFF:
+                    self.close_recording()
+                    return
+                self._writer.write(frame)
                 return
             if frame.shape[:2] != self._last_frame.shape[:2]:
                 self.close_recording()
@@ -296,6 +303,7 @@ class RawFrameRecorder:
                 return
             self._writer.write(frame)
             self._last_frame = frame.copy()
+            self._identical_frame_count = 1
             return
 
         if self._initial_frame_pending:
@@ -347,12 +355,14 @@ class RawFrameRecorder:
     def reset(self) -> None:
         self.close_recording()
         self._last_frame = None
+        self._identical_frame_count = 0
         self._candidate_frame = None
         self._initial_frame_pending = True
 
     def _open_recording(self, frame: np.ndarray) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         self._recording_path = self._next_recording_path()
+        self._identical_frame_count = 1
         height, width = frame.shape[:2]
         self._writer = cv2.VideoWriter(
             str(self._recording_path),

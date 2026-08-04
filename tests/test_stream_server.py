@@ -361,7 +361,7 @@ class StreamServerTests(unittest.TestCase):
         self.assertIsNotNone(enhanced)
         self.assertTrue(processor.crop_ready)
 
-    def test_raw_recorder_saves_distinct_frame_sequences_separately(self) -> None:
+    def test_raw_recorder_waits_for_three_identical_frames_before_cutting(self) -> None:
         processor = LiveStreamProcessor(
             EnhancementStages(),
             EnhancementParameters(),
@@ -377,13 +377,13 @@ class StreamServerTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             recorder = RawFrameRecorder(directory, fps=15.0)
             service = StreamService(processor, max_frame_bytes=1024 * 1024, recorder=recorder)
-            for frame in (first, second, second, third, fourth, fourth):
+            for frame in (first, second, second, third, fourth, fourth, fourth):
                 ok, encoded = cv2.imencode(".jpg", frame)
                 self.assertTrue(ok)
                 service.ingest(bytes(encoded))
             service.close()
 
-            self.assertEqual(len(recorder.completed_paths), 2)
+            self.assertEqual(len(recorder.completed_paths), 1)
             counts: list[int] = []
             values: list[list[float]] = []
             for path in recorder.completed_paths:
@@ -398,11 +398,13 @@ class StreamServerTests(unittest.TestCase):
                 counts.append(len(frames))
                 values.append([float(frame.mean()) for frame in frames])
 
-            self.assertEqual(counts, [2, 2])
+            self.assertEqual(counts, [6])
             self.assertLess(abs(values[0][0] - 40), 5)
             self.assertLess(abs(values[0][1] - 120), 5)
-            self.assertLess(abs(values[1][0] - 200), 5)
-            self.assertLess(abs(values[1][1] - 230), 5)
+            self.assertLess(abs(values[0][2] - 120), 5)
+            self.assertLess(abs(values[0][3] - 200), 5)
+            self.assertLess(abs(values[0][4] - 230), 5)
+            self.assertLess(abs(values[0][5] - 230), 5)
 
     def test_raw_recorder_ignores_paused_frames_at_startup(self) -> None:
         processor = LiveStreamProcessor(
@@ -435,17 +437,20 @@ class StreamServerTests(unittest.TestCase):
             jpeg_quality=92,
             auto_crop_enabled=False,
         )
-        frames = [np.full((48, 64, 3), value, dtype=np.uint8) for value in (20, 40, 40, 60, 80, 80, 100, 120, 120)]
+        frames = [
+            np.full((48, 64, 3), value, dtype=np.uint8)
+            for value in (20, 40, 40, 40, 60, 80, 80, 80, 100, 120, 120, 120)
+        ]
         with TemporaryDirectory() as directory:
             recorder = RawFrameRecorder(directory, fps=15.0)
             service = StreamService(processor, max_frame_bytes=1024 * 1024, recorder=recorder)
             service.configure_recording("C-arm 1", "Case 7", "pre")
-            for frame in frames[:6]:
+            for frame in frames[:8]:
                 ok, encoded = cv2.imencode(".jpg", frame)
                 self.assertTrue(ok)
                 service.ingest(bytes(encoded))
             service.configure_recording("C-arm 1", "Case 7", "post")
-            for frame in frames[6:]:
+            for frame in frames[8:]:
                 ok, encoded = cv2.imencode(".jpg", frame)
                 self.assertTrue(ok)
                 service.ingest(bytes(encoded))
