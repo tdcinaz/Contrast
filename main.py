@@ -3391,6 +3391,7 @@ class ContrastWindow(QMainWindow):
         self.live_device_name_edit.setEnabled(enabled and live_input)
         self.live_test_identifier_edit.setEnabled(enabled and live_input)
         self.live_phase_toggle.setEnabled(enabled and live_input)
+        self.live_export_toggle.setEnabled(enabled and live_input)
         self.compare_view_check.setEnabled(enabled)
         self.overlay_mask_check.setEnabled(enabled and self._has_enabled_stage("segmentation"))
         self.open_pre_action.setEnabled(enabled and bool(self.pre_panel))
@@ -3411,6 +3412,12 @@ class ContrastWindow(QMainWindow):
         device = device_name.strip() or "device"
         test = test_identifier.strip() or "test"
         self.live_recording_name_label.setText(f"{device}_{test}_{phase}_0.avi")
+
+    def _set_live_recording_enabled(self, enabled: bool) -> None:
+        service = self._stream_service
+        set_recording_enabled = getattr(service, "set_recording_enabled", None)
+        if set_recording_enabled is not None:
+            set_recording_enabled(enabled)
 
     def _set_live_incompatible_stages_enabled(self, enabled: bool) -> None:
         for stage_key in (
@@ -3972,9 +3979,14 @@ class ContrastWindow(QMainWindow):
         self.live_recording_name_label = QLabel()
         self.live_recording_name_label.setObjectName("timeLabel")
         self.live_recording_name_label.setToolTip("Name of the next live recording")
+        self.live_export_toggle = QCheckBox("Export")
+        self.live_export_toggle.setObjectName("liveRecordingPhaseToggle")
+        self.live_export_toggle.setChecked(True)
+        self.live_export_toggle.setToolTip("Save newly received live video clips")
         self.live_device_name_edit.textChanged.connect(self._update_live_recording_name)
         self.live_test_identifier_edit.textChanged.connect(self._update_live_recording_name)
         self.live_phase_toggle.toggled.connect(self._update_live_recording_name)
+        self.live_export_toggle.toggled.connect(self._set_live_recording_enabled)
         self.live_recording_controls = QWidget()
         self.live_recording_controls.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         live_recording_layout = QHBoxLayout(self.live_recording_controls)
@@ -3998,6 +4010,7 @@ class ContrastWindow(QMainWindow):
         live_recording_layout.addWidget(test_field)
         live_recording_layout.addWidget(self.live_phase_toggle)
         live_recording_layout.addWidget(self.live_recording_name_label)
+        live_recording_layout.addWidget(self.live_export_toggle)
 
         self.compare_view_check = QCheckBox("Show source")
         self.compare_view_check.setChecked(False)

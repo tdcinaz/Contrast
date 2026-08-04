@@ -189,6 +189,8 @@ class StreamServerTests(unittest.TestCase):
         self.assertFalse(window.frame_label.isVisible())
         self.assertFalse(window.speed_control_label.isVisible())
         self.assertTrue(window.live_recording_controls.isVisible())
+        self.assertTrue(window.live_export_toggle.isVisible())
+        self.assertTrue(window.live_export_toggle.isChecked())
         self.assertTrue(window.compare_view_check.isVisible())
         self.assertEqual(service.configure_recording.call_args.args, ("C-arm 1", "Case 7", "post"))
         self.assertEqual(window.live_recording_name_label.text(), "device_test_pre_0.avi")
@@ -453,6 +455,33 @@ class StreamServerTests(unittest.TestCase):
                 [path.name for path in recorder.completed_paths],
                 ["C-arm_1_Case_7_pre_0.avi", "C-arm_1_Case_7_pre_1.avi", "C-arm_1_Case_7_post_0.avi"],
             )
+
+    def test_recording_can_be_disabled_and_reenabled(self) -> None:
+        processor = LiveStreamProcessor(
+            EnhancementStages(),
+            EnhancementParameters(),
+            noise_sigma=10,
+            crop_sample_frames=3,
+            jpeg_quality=92,
+            auto_crop_enabled=False,
+        )
+        frames = [np.full((48, 64, 3), value, dtype=np.uint8) for value in (20, 40, 40, 60, 80, 80)]
+        with TemporaryDirectory() as directory:
+            recorder = RawFrameRecorder(directory, fps=15.0)
+            service = StreamService(processor, max_frame_bytes=1024 * 1024, recorder=recorder)
+            service.set_recording_enabled(False)
+            for frame in frames[:3]:
+                ok, encoded = cv2.imencode(".jpg", frame)
+                self.assertTrue(ok)
+                service.ingest(bytes(encoded))
+            service.set_recording_enabled(True)
+            for frame in frames[3:]:
+                ok, encoded = cv2.imencode(".jpg", frame)
+                self.assertTrue(ok)
+                service.ingest(bytes(encoded))
+            service.close()
+
+            self.assertEqual(len(recorder.completed_paths), 1)
 
     def test_http_ingest_and_mjpeg_egress(self) -> None:
         processor = LiveStreamProcessor(

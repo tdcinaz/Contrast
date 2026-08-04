@@ -344,6 +344,12 @@ class RawFrameRecorder:
         LOGGER.info("Saved raw fluoroscopy recording %s", self._recording_path)
         self._recording_path = None
 
+    def reset(self) -> None:
+        self.close_recording()
+        self._last_frame = None
+        self._candidate_frame = None
+        self._initial_frame_pending = True
+
     def _open_recording(self, frame: np.ndarray) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         self._recording_path = self._next_recording_path()
@@ -384,6 +390,7 @@ class StreamService:
         self.processor = processor
         self.max_frame_bytes = max_frame_bytes
         self.recorder = recorder
+        self.recording_enabled = True
         self._condition = Condition()
         self._ingest_lock = Lock()
         self._latest_source: bytes | None = None
@@ -398,7 +405,7 @@ class StreamService:
         if frame is None:
             raise ValueError("Ingest body is not a valid JPEG frame.")
         with self._ingest_lock:
-            if self.recorder is not None:
+            if self.recorder is not None and self.recording_enabled:
                 self.recorder.record(frame)
             enhanced = self.processor.process_frame(frame)
             with self._condition:
@@ -420,6 +427,12 @@ class StreamService:
             return None
         with self._ingest_lock:
             return self.recorder.configure_naming(device_name, test_identifier, phase)
+
+    def set_recording_enabled(self, enabled: bool) -> None:
+        with self._ingest_lock:
+            self.recording_enabled = enabled
+            if not enabled and self.recorder is not None:
+                self.recorder.reset()
 
     def next_frame(self, last_frame_id: int, timeout: float = 15.0) -> tuple[int, bytes | None]:
         with self._condition:
