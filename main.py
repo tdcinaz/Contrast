@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QMouseEvent, QPainter, QPdfWriter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -81,6 +81,167 @@ MODE_LIVE = "live"
 MODE_RECENT = "recent"
 MODE_SELECT = "select"
 LOGGER = logging.getLogger("contrast.main")
+
+
+def _report_frame(panel: VideoPanel, frame_index: int) -> np.ndarray | None:
+    if panel.enhanced_frames is not None and 0 <= frame_index < len(panel.enhanced_frames):
+        enhanced = cv2.imdecode(panel.enhanced_frames[frame_index], cv2.IMREAD_GRAYSCALE)
+        if enhanced is not None:
+            return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    return None if panel.current_frame is None else panel.current_frame.copy()
+
+
+def _draw_report_image(
+    painter: QPainter,
+    frame: np.ndarray,
+    roi: QRect | None,
+    roi_mask: np.ndarray | None,
+    color: QColor,
+    target: QRect,
+) -> None:
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.shape[1] * 3, QImage.Format.Format_RGB888).copy()
+    scaled = image.scaled(target.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    image_rect = QRect(
+        target.x() + (target.width() - scaled.width()) // 2,
+        target.y() + (target.height() - scaled.height()) // 2,
+        scaled.width(),
+        scaled.height(),
+    )
+    painter.drawImage(image_rect, scaled)
+    if roi is None or not roi.isValid():
+        return
+    x_scale = image_rect.width() / max(1, frame.shape[1])
+    y_scale = image_rect.height() / max(1, frame.shape[0])
+    painter.setPen(QPen(color, 3, Qt.PenStyle.DotLine))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    if roi_mask is None:
+        painter.drawRect(QRect(round(image_rect.x() + roi.x() * x_scale), round(image_rect.y() + roi.y() * y_scale), round(roi.width() * x_scale), round(roi.height() * y_scale)))
+        return
+    contours, _ = cv2.findContours(roi_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        if len(contour) >= 3:
+            painter.drawPolygon(QPolygon([QPoint(round(image_rect.x() + (roi.x() + int(point[0][0])) * x_scale), round(image_rect.y() + (roi.y() + int(point[0][1])) * y_scale)) for point in contour]))
+
+
+def render_comparison_report(path: Path, panels: list[VideoPanel], results: dict[str, AnalysisResult], frame_index: int) -> bool:
+    if len(panels) != 2 or not results:
+        return False
+    frames = [_report_frame(panel, frame_index) for panel in panels]
+    if any(frame is None for frame in frames):
+        return False
+    writer = QPdfWriter(str(path))
+    writer.setResolution(144)
+    writer.setTitle("Contrast ROI Residence Comparison")
+    painter = QPainter(writer)
+    page = writer.pageLayout().paintRectPixels(writer.resolution())
+    margin = 72
+    content_width = page.width() - margin * 2
+    painter.fillRect(page, QColor("#ffffff"))
+    title_font = QFont()
+    title_font.setPointSize(14)
+    title_font.setBold(True)
+    painter.setPen(QColor("#172033"))
+    painter.setFont(title_font)
+    painter.drawText(margin, margin, "Contrast ROI Residence Comparison")
+    body_font = QFont()
+    body_font.setPointSize(9)
+    painter.setFont(body_font)
+    painter.setPen(QColor("#526070"))
+    painter.drawText(margin, margin + 28, f"Frame {frame_index + 1}")
+    image_top = margin + 54
+    image_height = int(content_width * 0.50)
+    image_gap = 24
+    image_width = (content_width - image_gap) // 2
+    for index, (panel, frame) in enumerate(zip(panels, frames, strict=True)):
+        x = margin + index * (image_width + image_gap)
+        painter.setPen(panel.color)
+        painter.drawText(x, image_top - 8, f"{panel.label}: {panel.path.name}")
+        _draw_report_image(painter, cast(np.ndarray, frame), panel.roi(), panel.roi_mask(), panel.color, QRect(x, image_top, image_width, image_height))
+    chart_top = image_top + image_height + 76
+    chart_title_gap = 30
+    tick_label_height = painter.fontMetrics().height() + 4
+    axis_label_gap = 38
+    chart_gap = 104
+    chart_footer_padding = 64
+    chart_height = (page.bottom() - chart_top - margin - chart_footer_padding - chart_gap) // 2
+    chart = QRect(margin + 56, chart_top, content_width - 72, chart_height)
+    painter.setPen(QColor("#172033"))
+    painter.setFont(title_font)
+    painter.drawText(margin, chart.y() - chart_title_gap, "ROI Residence (Normalized Signal)")
+    painter.setFont(body_font)
+    painter.setPen(QPen(QColor("#9aa7b5"), 1))
+    painter.drawLine(chart.left(), chart.bottom(), chart.right(), chart.bottom())
+    painter.drawLine(chart.left(), chart.top(), chart.left(), chart.bottom())
+    max_time = max((float(result.time[-1]) for result in results.values() if len(result.time)), default=1.0)
+    max_time = max(max_time, 1.0)
+    for tick_index in range(9):
+        fraction = tick_index / 8
+        y = round(chart.bottom() - chart.height() * fraction)
+        painter.setPen(QPen(QColor("#d7dde5"), 1, Qt.PenStyle.DotLine))
+        painter.drawLine(chart.left(), y, chart.right(), y)
+        painter.setPen(QColor("#526070"))
+        painter.drawText(chart.left() - 42, y + 4, f"{fraction:.2f}")
+    for tick_index in range(7):
+        fraction = tick_index / 6
+        x = round(chart.left() + chart.width() * fraction)
+        painter.setPen(QPen(QColor("#d7dde5"), 1, Qt.PenStyle.DotLine))
+        painter.drawLine(x, chart.top(), x, chart.bottom())
+        painter.setPen(QColor("#526070"))
+        painter.drawText(QRect(x - 28, chart.bottom() + 4, 56, tick_label_height), Qt.AlignmentFlag.AlignHCenter, f"{max_time * fraction:.1f}")
+    for panel in panels:
+        result = results.get(panel.label)
+        if result is None or not len(result.time):
+            continue
+        points = QPolygon([QPoint(round(chart.left() + chart.width() * float(time) / max_time), round(chart.bottom() - chart.height() * float(signal))) for time, signal in zip(result.time, result.normalized_signal, strict=True)])
+        painter.setPen(QPen(panel.color, 2))
+        painter.drawPolyline(points)
+        painter.setFont(body_font)
+        painter.drawText(chart.right() - 180, chart.top() + 16 + panels.index(panel) * 16, panel.label)
+    painter.setPen(QColor("#526070"))
+    painter.drawText(chart.center().x() - 22, chart.bottom() + axis_label_gap, "Time (s)")
+    brightness_chart = QRect(chart.left(), chart.bottom() + chart_gap, chart.width(), chart_height)
+    painter.setPen(QColor("#172033"))
+    painter.setFont(title_font)
+    painter.drawText(margin, brightness_chart.y() - chart_title_gap, "ROI Brightness (Mean Pixel Value)")
+    painter.setFont(body_font)
+    painter.setPen(QPen(QColor("#9aa7b5"), 1))
+    painter.drawLine(brightness_chart.left(), brightness_chart.bottom(), brightness_chart.right(), brightness_chart.bottom())
+    painter.drawLine(brightness_chart.left(), brightness_chart.top(), brightness_chart.left(), brightness_chart.bottom())
+    intensity_values = [float(value) for result in results.values() for value in result.mean_intensity]
+    intensity_min = min(intensity_values, default=0.0)
+    intensity_max = max(intensity_values, default=1.0)
+    intensity_span = max(intensity_max - intensity_min, 1.0)
+    intensity_min -= intensity_span * 0.20
+    intensity_max += intensity_span * 0.20
+    for tick_index in range(9):
+        fraction = tick_index / 8
+        y = round(brightness_chart.bottom() - brightness_chart.height() * fraction)
+        value = intensity_min + (intensity_max - intensity_min) * fraction
+        painter.setPen(QPen(QColor("#d7dde5"), 1, Qt.PenStyle.DotLine))
+        painter.drawLine(brightness_chart.left(), y, brightness_chart.right(), y)
+        painter.setPen(QColor("#526070"))
+        painter.drawText(brightness_chart.left() - 42, y + 4, f"{value:.0f}")
+    for tick_index in range(7):
+        fraction = tick_index / 6
+        x = round(brightness_chart.left() + brightness_chart.width() * fraction)
+        painter.setPen(QPen(QColor("#d7dde5"), 1, Qt.PenStyle.DotLine))
+        painter.drawLine(x, brightness_chart.top(), x, brightness_chart.bottom())
+        painter.setPen(QColor("#526070"))
+        painter.drawText(QRect(x - 28, brightness_chart.bottom() + 4, 56, tick_label_height), Qt.AlignmentFlag.AlignHCenter, f"{max_time * fraction:.1f}")
+    for panel in panels:
+        result = results.get(panel.label)
+        if result is None or not len(result.time):
+            continue
+        points = QPolygon([QPoint(round(brightness_chart.left() + brightness_chart.width() * float(time) / max_time), round(brightness_chart.bottom() - brightness_chart.height() * (float(value) - intensity_min) / (intensity_max - intensity_min))) for time, value in zip(result.time, result.mean_intensity, strict=True)])
+        painter.setPen(QPen(panel.color, 2))
+        painter.drawPolyline(points)
+        painter.setFont(body_font)
+        painter.drawText(brightness_chart.right() - 180, brightness_chart.top() + 16 + panels.index(panel) * 16, panel.label)
+    painter.setPen(QColor("#526070"))
+    painter.drawText(brightness_chart.center().x() - 22, brightness_chart.bottom() + axis_label_gap, "Time (s)")
+    painter.end()
+    return True
 
 
 class ModeSelectionButton(QPushButton):
@@ -3856,6 +4017,9 @@ class ContrastWindow(QMainWindow):
         self.export_action = QAction("Export analysis CSV...", self)
         self.export_action.triggered.connect(self.export_csv)
         self.export_action.setEnabled(False)
+        self.export_pdf_action = QAction("Export comparison report PDF...", self)
+        self.export_pdf_action.triggered.connect(self.export_pdf_report)
+        self.export_pdf_action.setEnabled(False)
 
         file_menu = self.menuBar().addMenu("File")
         file_menu.addAction(self.open_pre_action)
@@ -3870,6 +4034,7 @@ class ContrastWindow(QMainWindow):
         file_menu.addAction(self.save_default_pipeline_settings_action)
         file_menu.addSeparator()
         file_menu.addAction(self.export_action)
+        file_menu.addAction(self.export_pdf_action)
 
     def _sync_trimmed_video_window(self) -> None:
         if not self.panels:
@@ -4414,6 +4579,10 @@ class ContrastWindow(QMainWindow):
         self.export_button.clicked.connect(self.export_csv)
         self.export_button.setEnabled(False)
         self.analysis_stage_drawer.content_layout.addWidget(self.export_button)
+        self.export_pdf_button = QPushButton("Export comparison PDF")
+        self.export_pdf_button.clicked.connect(self.export_pdf_report)
+        self.export_pdf_button.setEnabled(False)
+        self.analysis_stage_drawer.content_layout.addWidget(self.export_pdf_button)
 
         self.pre_card = MetricCard("Pre residence")
         self.post_card = MetricCard("Post residence")
@@ -6450,6 +6619,9 @@ class ContrastWindow(QMainWindow):
         self.refresh_plots_and_metrics()
         self.export_action.setEnabled(True)
         self.export_button.setEnabled(True)
+        comparison_ready = self.active_mode == MODE_COMPARISON and len(self.panels) == 2
+        self.export_pdf_action.setEnabled(comparison_ready)
+        self.export_pdf_button.setEnabled(comparison_ready)
         self._update_stage_statuses()
         self.statusBar().showMessage("ROI residence analysis updated from the current enhanced pipeline output.")
         return True
@@ -6505,6 +6677,8 @@ class ContrastWindow(QMainWindow):
         self.delta_card.set_metric("--")
         self.export_action.setEnabled(False)
         self.export_button.setEnabled(False)
+        self.export_pdf_action.setEnabled(False)
+        self.export_pdf_button.setEnabled(False)
 
     def refresh_plots_and_metrics(self) -> None:
         self.normalized_plot.clear()
@@ -6633,6 +6807,20 @@ class ContrastWindow(QMainWindow):
                         row.extend(["", "", "", "", ""])
                 writer.writerow(row)
         self.statusBar().showMessage(f"Exported analysis to {path}")
+
+    def export_pdf_report(self) -> None:
+        if self.active_mode != MODE_COMPARISON or len(self.panels) != 2 or not self.results:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export comparison report PDF", str(ROOT / "contrast_comparison_report.pdf"), "PDF files (*.pdf)")
+        if not path:
+            return
+        report_path = Path(path)
+        if report_path.suffix.lower() != ".pdf":
+            report_path = report_path.with_suffix(".pdf")
+        if render_comparison_report(report_path, self.panels, self.results, self.current_frame_index):
+            self.statusBar().showMessage(f"Exported comparison report to {report_path}")
+        else:
+            self.statusBar().showMessage("Comparison report export needs enhanced frames and ROI residence results.")
 
     def _drawer_control_values(self, drawer: StageDrawer) -> dict[str, bool | int | float | str]:
         values: dict[str, bool | int | float | str] = {}

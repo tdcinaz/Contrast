@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
+from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QFrame, QSpinBox
 
@@ -37,6 +38,47 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_comparison_pdf_report_writes_enhanced_images_and_residence_curves(self) -> None:
+        QApplication.instance() or QApplication([])
+        frame = np.full((40, 60), 120, dtype=np.uint8)
+        encoded = cv2.imencode(".png", frame)[1]
+        mask_image = np.zeros((12, 16), dtype=np.uint8)
+        cv2.circle(mask_image, (8, 6), 5, 1, thickness=-1)
+        mask = mask_image.astype(bool)
+        panels = [
+            SimpleNamespace(
+                label="Pre-deployment",
+                color=QColor("#38bdf8"),
+                path=Path("pre.mp4"),
+                enhanced_frames=[encoded],
+                current_frame=None,
+                roi=lambda: QRect(10, 8, 16, 12),
+                roi_mask=lambda: mask,
+            ),
+            SimpleNamespace(
+                label="Post-deployment",
+                color=QColor("#f97316"),
+                path=Path("post.mp4"),
+                enhanced_frames=[encoded],
+                current_frame=None,
+                roi=lambda: QRect(10, 8, 16, 12),
+                roi_mask=lambda: mask,
+            ),
+        ]
+        results = {
+            panel.label: SimpleNamespace(
+                time=np.asarray([0.0, 0.5, 1.0]),
+                normalized_signal=np.asarray([0.0, 1.0, 0.2]),
+                mean_intensity=np.asarray([120.0, 92.0, 115.0]),
+            )
+            for panel in panels
+        }
+        with TemporaryDirectory() as directory:
+            report_path = Path(directory) / "comparison.pdf"
+            self.assertTrue(main.render_comparison_report(report_path, panels, results, 0))
+            self.assertTrue(report_path.read_bytes().startswith(b"%PDF"))
+            self.assertGreater(report_path.stat().st_size, 1_000)
+
     def test_reordered_roi_analysis_drawer_reflows_when_toggled(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = ContrastWindow()

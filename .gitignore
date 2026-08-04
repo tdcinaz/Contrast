@@ -32,3 +32,6 @@ configs/*.json
 *.mpeg
 *.mpg
 *.m4v
+
+# Reports
+*.pdf
