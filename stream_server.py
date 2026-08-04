@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import re
 from threading import Condition, Lock
 from typing import Any
 
@@ -268,6 +268,17 @@ class RawFrameRecorder:
         self._writer: cv2.VideoWriter | None = None
         self._recording_path: Path | None = None
         self.completed_paths: list[Path] = []
+        self._device_name = "device"
+        self._test_identifier = "test"
+        self._phase = "pre"
+
+    def configure_naming(self, device_name: str, test_identifier: str, phase: str) -> Path:
+        if phase not in {"pre", "post"}:
+            raise ValueError("Recording phase must be 'pre' or 'post'.")
+        self._device_name = self._filename_component(device_name, "device")
+        self._test_identifier = self._filename_component(test_identifier, "test")
+        self._phase = phase
+        return self._next_recording_path()
 
     def record(self, frame: np.ndarray) -> None:
         if self._last_frame is None:
@@ -335,8 +346,7 @@ class RawFrameRecorder:
 
     def _open_recording(self, frame: np.ndarray) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-        self._recording_path = self.directory / f"fluoroscopy_{timestamp}.avi"
+        self._recording_path = self._next_recording_path()
         height, width = frame.shape[:2]
         self._writer = cv2.VideoWriter(
             str(self._recording_path),
@@ -350,6 +360,18 @@ class RawFrameRecorder:
             self._writer = None
             raise RuntimeError(f"Could not open recording file: {self._recording_path}")
         LOGGER.info("Started raw fluoroscopy recording %s", self._recording_path)
+
+    def _next_recording_path(self) -> Path:
+        stem = f"{self._device_name}_{self._test_identifier}_{self._phase}"
+        clip_number = 0
+        while (path := self.directory / f"{stem}_{clip_number}.avi").exists():
+            clip_number += 1
+        return path
+
+    @staticmethod
+    def _filename_component(value: str, fallback: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9-]+", "_", value.strip()).strip("_")
+        return sanitized or fallback
 
 
 class StreamService:
@@ -392,6 +414,12 @@ class StreamService:
     def close(self) -> None:
         if self.recorder is not None:
             self.recorder.close_recording()
+
+    def configure_recording(self, device_name: str, test_identifier: str, phase: str) -> Path | None:
+        if self.recorder is None:
+            return None
+        with self._ingest_lock:
+            return self.recorder.configure_naming(device_name, test_identifier, phase)
 
     def next_frame(self, last_frame_id: int, timeout: float = 15.0) -> tuple[int, bytes | None]:
         with self._condition:

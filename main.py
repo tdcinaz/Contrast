@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -3382,14 +3383,34 @@ class ContrastWindow(QMainWindow):
 
     def _set_video_controls_enabled(self, enabled: bool) -> None:
         live_input = self.active_mode == MODE_LIVE
-        self.play_button.setEnabled(enabled)
-        self.frame_slider.setEnabled(enabled and not live_input)
-        self.frame_spin.setEnabled(enabled and not live_input)
-        self.speed_slider.setEnabled(enabled)
+        for widget in self.playback_controls:
+            widget.setVisible(not live_input)
+            widget.setEnabled(enabled and not live_input)
+        self.live_recording_controls.setVisible(live_input)
+        self.live_recording_spacer.setVisible(live_input)
+        self.live_device_name_edit.setEnabled(enabled and live_input)
+        self.live_test_identifier_edit.setEnabled(enabled and live_input)
+        self.live_phase_toggle.setEnabled(enabled and live_input)
         self.compare_view_check.setEnabled(enabled)
         self.overlay_mask_check.setEnabled(enabled and self._has_enabled_stage("segmentation"))
         self.open_pre_action.setEnabled(enabled and bool(self.pre_panel))
         self.open_post_action.setEnabled(enabled and bool(self.post_panel))
+        if live_input:
+            self._update_live_recording_name()
+
+    def _update_live_recording_name(self) -> None:
+        device_name = self.live_device_name_edit.text()
+        test_identifier = self.live_test_identifier_edit.text()
+        phase = "post" if self.live_phase_toggle.isChecked() else "pre"
+        service = self._stream_service
+        configure_recording = getattr(service, "configure_recording", None)
+        path = configure_recording(device_name, test_identifier, phase) if configure_recording is not None else None
+        if path is not None:
+            self.live_recording_name_label.setText(path.name)
+            return
+        device = device_name.strip() or "device"
+        test = test_identifier.strip() or "test"
+        self.live_recording_name_label.setText(f"{device}_{test}_{phase}_0.avi")
 
     def _set_live_incompatible_stages_enabled(self, enabled: bool) -> None:
         for stage_key in (
@@ -3540,7 +3561,7 @@ class ContrastWindow(QMainWindow):
         self.video_layout.setStretch(0, 1)
         self._update_temporal_alignment_controls()
         self._set_live_incompatible_stages_enabled(False)
-        self._set_video_controls_enabled(False)
+        self._set_video_controls_enabled(True)
         self.compare_view_check.setEnabled(True)
         self.video_stack.setCurrentWidget(self.video_row)
         self._update_video_stack_geometry()
@@ -3935,6 +3956,49 @@ class ContrastWindow(QMainWindow):
         self.time_label = QLabel()
         self.time_label.setObjectName("timeLabel")
 
+        self.live_device_name_edit = QLineEdit("device")
+        self.live_device_name_edit.setObjectName("liveRecordingField")
+        self.live_device_name_edit.setPlaceholderText("Device")
+        self.live_device_name_edit.setMaximumWidth(120)
+        self.live_device_name_edit.setToolTip("Device name for exported live recordings")
+        self.live_test_identifier_edit = QLineEdit("test")
+        self.live_test_identifier_edit.setObjectName("liveRecordingField")
+        self.live_test_identifier_edit.setPlaceholderText("Test")
+        self.live_test_identifier_edit.setMaximumWidth(120)
+        self.live_test_identifier_edit.setToolTip("Test identifier for exported live recordings")
+        self.live_phase_toggle = QCheckBox("Post")
+        self.live_phase_toggle.setObjectName("liveRecordingPhaseToggle")
+        self.live_phase_toggle.setToolTip("Unchecked: pre; checked: post")
+        self.live_recording_name_label = QLabel()
+        self.live_recording_name_label.setObjectName("timeLabel")
+        self.live_recording_name_label.setToolTip("Name of the next live recording")
+        self.live_device_name_edit.textChanged.connect(self._update_live_recording_name)
+        self.live_test_identifier_edit.textChanged.connect(self._update_live_recording_name)
+        self.live_phase_toggle.toggled.connect(self._update_live_recording_name)
+        self.live_recording_controls = QWidget()
+        self.live_recording_controls.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        live_recording_layout = QHBoxLayout(self.live_recording_controls)
+        live_recording_layout.setContentsMargins(0, 0, 0, 0)
+        live_recording_layout.setSpacing(12)
+        device_field = QWidget()
+        device_field.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        device_field_layout = QHBoxLayout(device_field)
+        device_field_layout.setContentsMargins(0, 0, 0, 0)
+        device_field_layout.setSpacing(4)
+        device_field_layout.addWidget(QLabel("Device"))
+        device_field_layout.addWidget(self.live_device_name_edit)
+        test_field = QWidget()
+        test_field.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        test_field_layout = QHBoxLayout(test_field)
+        test_field_layout.setContentsMargins(0, 0, 0, 0)
+        test_field_layout.setSpacing(4)
+        test_field_layout.addWidget(QLabel("Test"))
+        test_field_layout.addWidget(self.live_test_identifier_edit)
+        live_recording_layout.addWidget(device_field)
+        live_recording_layout.addWidget(test_field)
+        live_recording_layout.addWidget(self.live_phase_toggle)
+        live_recording_layout.addWidget(self.live_recording_name_label)
+
         self.compare_view_check = QCheckBox("Show source")
         self.compare_view_check.setChecked(False)
         self.compare_view_check.setToolTip("Show source beside enhanced output")
@@ -4048,14 +4112,30 @@ class ContrastWindow(QMainWindow):
         playback_layout.setSpacing(8)
         playback_layout.addWidget(self.play_button)
         playback_layout.addWidget(self.frame_slider, 1)
-        playback_layout.addWidget(QLabel("Frame"))
+        self.frame_label = QLabel("Frame")
+        playback_layout.addWidget(self.frame_label)
         playback_layout.addWidget(self.frame_spin)
-        playback_layout.addWidget(QLabel("Speed"))
+        self.speed_control_label = QLabel("Speed")
+        playback_layout.addWidget(self.speed_control_label)
         playback_layout.addWidget(self.speed_slider)
         playback_layout.addWidget(self.speed_label)
         playback_layout.addWidget(self.time_label)
+        playback_layout.addWidget(self.live_recording_controls)
+        self.live_recording_spacer = QWidget()
+        self.live_recording_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        playback_layout.addWidget(self.live_recording_spacer, 1)
         playback_layout.addWidget(self.compare_view_check)
         playback_layout.addWidget(self.overlay_mask_check)
+        self.playback_controls = (
+            self.play_button,
+            self.frame_slider,
+            self.frame_label,
+            self.frame_spin,
+            self.speed_control_label,
+            self.speed_slider,
+            self.speed_label,
+            self.time_label,
+        )
 
         controls_panel = self._build_controls_panel()
         self.enhancement_progress = EnhancementProgressPanel()
@@ -5221,6 +5301,11 @@ class ContrastWindow(QMainWindow):
             QSplitter::handle:vertical { background: #1c2637; border-top: 1px solid #334155; border-bottom: 1px solid #253044; margin: 2px 0; }
             QSplitter::handle:horizontal { background: #1c2637; border-left: 1px solid #334155; border-right: 1px solid #253044; margin: 0; }
             QSpinBox, QDoubleSpinBox, QComboBox { background: #111827; border: 1px solid #334155; border-radius: 6px; padding: 5px; color: #e5edf6; }
+            QLineEdit#liveRecordingField { background: #111827; border: 1px solid #5b718c; border-radius: 5px; padding: 5px 7px; color: #f8fafc; }
+            QLineEdit#liveRecordingField:focus { border-color: #5eead4; }
+            QCheckBox#liveRecordingPhaseToggle { background: #111827; border: 1px solid #5b718c; border-radius: 5px; padding: 5px 8px; color: #e5edf6; }
+            QCheckBox#liveRecordingPhaseToggle:hover { border-color: #7dd3fc; }
+            QCheckBox#liveRecordingPhaseToggle:checked { background: #134e4a; border-color: #2dd4bf; }
             QGroupBox { background: #111827; border: 1px solid #253044; border-radius: 8px; margin-top: 12px; padding: 12px; font-weight: 700; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #f8fafc; }
             QFrame#videoPanel, QFrame#plotPanel { background: #111827; border: 1px solid #253044; border-radius: 8px; }
