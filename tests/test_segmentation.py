@@ -174,13 +174,14 @@ class SegmentationTests(unittest.TestCase):
             "Contrast ROI Residence Comparison",
         )
 
-    def test_comparison_pdf_report_writes_enhanced_images_and_residence_curves(self) -> None:
+    def test_comparison_pdf_report_writes_matched_heatmaps_before_residence_curve(self) -> None:
         QApplication.instance() or QApplication([])
         frame = np.full((40, 60), 120, dtype=np.uint8)
         encoded = cv2.imencode(".png", frame)[1]
         mask_image = np.zeros((12, 16), dtype=np.uint8)
         cv2.circle(mask_image, (8, 6), 5, 1, thickness=-1)
         mask = mask_image.astype(bool)
+        heatmap = np.full((40, 60, 3), (10, 80, 180), dtype=np.uint8)
         panels = [
             SimpleNamespace(
                 label="Pre-deployment",
@@ -190,6 +191,7 @@ class SegmentationTests(unittest.TestCase):
                 current_frame=None,
                 roi=lambda: QRect(10, 8, 16, 12),
                 roi_mask=lambda: mask,
+                temporal_change_heatmap=heatmap,
             ),
             SimpleNamespace(
                 label="Post-deployment",
@@ -199,21 +201,51 @@ class SegmentationTests(unittest.TestCase):
                 current_frame=None,
                 roi=lambda: QRect(10, 8, 16, 12),
                 roi_mask=lambda: mask,
+                temporal_change_heatmap=heatmap,
             ),
         ]
         results = {
             panel.label: SimpleNamespace(
                 time=np.asarray([0.0, 0.5, 1.0]),
                 normalized_signal=np.asarray([0.0, 1.0, 0.2]),
-                mean_intensity=np.asarray([120.0, 92.0, 115.0]),
             )
             for panel in panels
         }
         with TemporaryDirectory() as directory:
             report_path = Path(directory) / "comparison.pdf"
-            self.assertTrue(main.render_comparison_report(report_path, panels, results, 0))
+            with patch.object(main, "_draw_report_image", wraps=main._draw_report_image) as draw_image:
+                self.assertTrue(main.render_comparison_report(report_path, panels, results, 0))
             self.assertTrue(report_path.read_bytes().startswith(b"%PDF"))
             self.assertGreater(report_path.stat().st_size, 1_000)
+        self.assertEqual(draw_image.call_count, 4)
+        frame_targets = [call.args[-1] for call in draw_image.call_args_list[:2]]
+        heatmap_targets = [call.args[-1] for call in draw_image.call_args_list[2:]]
+        self.assertEqual([target.size() for target in heatmap_targets], [target.size() for target in frame_targets])
+        self.assertGreater(heatmap_targets[0].y(), frame_targets[0].y())
+
+    def test_pdf_export_generates_missing_heatmaps_before_rendering(self) -> None:
+        panels = [
+            SimpleNamespace(temporal_change_heatmap=None),
+            SimpleNamespace(temporal_change_heatmap=None),
+        ]
+        status_bar = Mock()
+        window = SimpleNamespace(
+            active_mode=MODE_COMPARISON,
+            panels=panels,
+            results={"Pre-deployment": SimpleNamespace()},
+            current_frame_index=3,
+            run_temporal_change_heatmap=Mock(return_value=True),
+            statusBar=Mock(return_value=status_bar),
+        )
+
+        with (
+            patch.object(main.QFileDialog, "getSaveFileName", return_value=("comparison.pdf", "PDF files (*.pdf)")),
+            patch.object(main, "render_comparison_report", return_value=True) as render_report,
+        ):
+            ContrastWindow.export_pdf_report(window)
+
+        window.run_temporal_change_heatmap.assert_called_once_with()
+        render_report.assert_called_once_with(Path("comparison.pdf"), panels, window.results, 3)
 
     def test_reordered_roi_analysis_drawer_reflows_when_toggled(self) -> None:
         app = QApplication.instance() or QApplication([])

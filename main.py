@@ -142,7 +142,8 @@ def render_comparison_report(path: Path, panels: list[VideoPanel], results: dict
     if len(panels) != 2 or not results:
         return False
     frames = [_report_frame(panel, frame_index) for panel in panels]
-    if any(frame is None for frame in frames):
+    heatmaps = [panel.temporal_change_heatmap for panel in panels]
+    if any(frame is None for frame in frames) or any(heatmap is None for heatmap in heatmaps):
         return False
     report_title = comparison_report_title([panel.path for panel in panels])
     writer = QPdfWriter(str(path))
@@ -173,13 +174,26 @@ def render_comparison_report(path: Path, panels: list[VideoPanel], results: dict
         painter.setPen(panel.color)
         painter.drawText(x, image_top - 8, f"{panel.label}: {panel.path.name}")
         _draw_report_image(painter, cast(np.ndarray, frame), panel.roi(), panel.roi_mask(), panel.color, QRect(x, image_top, image_width, image_height))
-    chart_top = image_top + image_height + 76
+    heatmap_top = image_top + image_height + 76
+    painter.setPen(QColor("#172033"))
+    painter.setFont(title_font)
+    painter.drawText(margin, heatmap_top - 30, "Temporal Pixel Change")
+    for index, (panel, heatmap) in enumerate(zip(panels, heatmaps, strict=True)):
+        x = margin + index * (image_width + image_gap)
+        _draw_report_image(
+            painter,
+            cast(np.ndarray, heatmap),
+            None,
+            None,
+            panel.color,
+            QRect(x, heatmap_top, image_width, image_height),
+        )
+    chart_top = heatmap_top + image_height + 76
     chart_title_gap = 30
     tick_label_height = painter.fontMetrics().height() + 4
     axis_label_gap = 38
-    chart_gap = 104
     chart_footer_padding = 64
-    chart_height = (page.bottom() - chart_top - margin - chart_footer_padding - chart_gap) // 2
+    chart_height = page.bottom() - chart_top - margin - chart_footer_padding
     chart = QRect(margin + 56, chart_top, content_width - 72, chart_height)
     painter.setPen(QColor("#172033"))
     painter.setFont(title_font)
@@ -215,46 +229,6 @@ def render_comparison_report(path: Path, panels: list[VideoPanel], results: dict
         painter.drawText(chart.right() - 180, chart.top() + 16 + panels.index(panel) * 16, panel.label)
     painter.setPen(QColor("#526070"))
     painter.drawText(chart.center().x() - 22, chart.bottom() + axis_label_gap, "Time (s)")
-    brightness_chart = QRect(chart.left(), chart.bottom() + chart_gap, chart.width(), chart_height)
-    painter.setPen(QColor("#172033"))
-    painter.setFont(title_font)
-    painter.drawText(margin, brightness_chart.y() - chart_title_gap, "ROI Brightness (Mean Pixel Value)")
-    painter.setFont(body_font)
-    painter.setPen(QPen(QColor("#9aa7b5"), 1))
-    painter.drawLine(brightness_chart.left(), brightness_chart.bottom(), brightness_chart.right(), brightness_chart.bottom())
-    painter.drawLine(brightness_chart.left(), brightness_chart.top(), brightness_chart.left(), brightness_chart.bottom())
-    intensity_values = [float(value) for result in results.values() for value in result.mean_intensity]
-    intensity_min = min(intensity_values, default=0.0)
-    intensity_max = max(intensity_values, default=1.0)
-    intensity_span = max(intensity_max - intensity_min, 1.0)
-    intensity_min -= intensity_span * 0.20
-    intensity_max += intensity_span * 0.20
-    for tick_index in range(9):
-        fraction = tick_index / 8
-        y = round(brightness_chart.bottom() - brightness_chart.height() * fraction)
-        value = intensity_min + (intensity_max - intensity_min) * fraction
-        painter.setPen(QPen(QColor("#d7dde5"), 1, Qt.PenStyle.DotLine))
-        painter.drawLine(brightness_chart.left(), y, brightness_chart.right(), y)
-        painter.setPen(QColor("#526070"))
-        painter.drawText(brightness_chart.left() - 42, y + 4, f"{value:.0f}")
-    for tick_index in range(7):
-        fraction = tick_index / 6
-        x = round(brightness_chart.left() + brightness_chart.width() * fraction)
-        painter.setPen(QPen(QColor("#d7dde5"), 1, Qt.PenStyle.DotLine))
-        painter.drawLine(x, brightness_chart.top(), x, brightness_chart.bottom())
-        painter.setPen(QColor("#526070"))
-        painter.drawText(QRect(x - 28, brightness_chart.bottom() + 4, 56, tick_label_height), Qt.AlignmentFlag.AlignHCenter, f"{max_time * fraction:.1f}")
-    for panel in panels:
-        result = results.get(panel.label)
-        if result is None or not len(result.time):
-            continue
-        points = QPolygon([QPoint(round(brightness_chart.left() + brightness_chart.width() * float(time) / max_time), round(brightness_chart.bottom() - brightness_chart.height() * (float(value) - intensity_min) / (intensity_max - intensity_min))) for time, value in zip(result.time, result.mean_intensity, strict=True)])
-        painter.setPen(QPen(panel.color, 2))
-        painter.drawPolyline(points)
-        painter.setFont(body_font)
-        painter.drawText(brightness_chart.right() - 180, brightness_chart.top() + 16 + panels.index(panel) * 16, panel.label)
-    painter.setPen(QColor("#526070"))
-    painter.drawText(brightness_chart.center().x() - 22, brightness_chart.bottom() + axis_label_gap, "Time (s)")
     painter.end()
     return True
 
@@ -7480,6 +7454,9 @@ class ContrastWindow(QMainWindow):
     def export_pdf_report(self) -> None:
         if self.active_mode != MODE_COMPARISON or len(self.panels) != 2 or not self.results:
             return
+        if any(panel.temporal_change_heatmap is None for panel in self.panels) and not self.run_temporal_change_heatmap():
+            self.statusBar().showMessage("Comparison report export needs enhanced frames, heatmaps, and ROI residence results.")
+            return
         path, _ = QFileDialog.getSaveFileName(self, "Export comparison report PDF", str(ROOT / "contrast_comparison_report.pdf"), "PDF files (*.pdf)")
         if not path:
             return
@@ -7489,7 +7466,7 @@ class ContrastWindow(QMainWindow):
         if render_comparison_report(report_path, self.panels, self.results, self.current_frame_index):
             self.statusBar().showMessage(f"Exported comparison report to {report_path}")
         else:
-            self.statusBar().showMessage("Comparison report export needs enhanced frames and ROI residence results.")
+            self.statusBar().showMessage("Comparison report export needs enhanced frames, heatmaps, and ROI residence results.")
 
     def _drawer_control_values(self, drawer: StageDrawer) -> dict[str, bool | int | float | str]:
         values: dict[str, bool | int | float | str] = {}
