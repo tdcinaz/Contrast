@@ -167,6 +167,8 @@ def _roi_token(parameters: EnhancementParameters, _backend_id: str, _noise_sigma
         bool(parameters.roi_softening_enabled),
         round(float(parameters.roi_softening_radius_ratio), 4),
         round(float(parameters.roi_softening_threshold), 4),
+        bool(parameters.roi_convex_hull_enabled),
+        bool(parameters.roi_circle_fit_enabled),
     )
 
 
@@ -203,17 +205,6 @@ def _smoothing_token(parameters: EnhancementParameters, _backend_id: str, _noise
     return (round(float(parameters.smoothing_sigma_x), 4),)
 
 
-def _segmentation_token(parameters: EnhancementParameters, _backend_id: str, _noise_sigma: int) -> tuple[object, ...]:
-    return (
-        str(parameters.segmentation_mode),
-        int(parameters.segmentation_block_size),
-        round(float(parameters.segmentation_sensitivity), 4),
-        round(float(parameters.segmentation_change_threshold), 4),
-        int(parameters.segmentation_level_tolerance),
-        int(parameters.segmentation_min_area),
-    )
-
-
 BUILTIN_STAGES = StageRegistry(
     (
         StageDefinition("auto_crop", "Auto-crop fluoroscope field", ExecutionShape.SOURCE, 0.0, 0.0, live_supported=True),
@@ -238,16 +229,6 @@ BUILTIN_STAGES = StageRegistry(
         StageDefinition("local_contrast", "Local contrast (CLAHE)", ExecutionShape.FRAME, 0.0028, 0.0038, processor=_local_contrast, token_builder=_contrast_token),
         StageDefinition("image_adjustments", "Image adjustments", ExecutionShape.FRAME, 0.0016, 0.0026, processor=_image_adjustments, token_builder=_adjustments_token),
         StageDefinition("final_smoothing", "Final Gaussian smoothing", ExecutionShape.FRAME, 0.0010, 0.0015, processor=_smooth, token_builder=_smoothing_token),
-        StageDefinition(
-            "segmentation",
-            "Brightness-coded contrast segmentation",
-            ExecutionShape.OBSERVER,
-            0.0035,
-            0.0050,
-            modifies_frame_data=False,
-            token_builder=_segmentation_token,
-            live_supported=lambda parameters: parameters.segmentation_mode == "dark_contrast",
-        ),
         StageDefinition(
             "roi_residence_analysis",
             "ROI residence analysis",

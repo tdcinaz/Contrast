@@ -39,6 +39,21 @@ class PipelineRuntimeTests(unittest.TestCase):
     def test_roi_extraction_does_not_modify_frame_data(self) -> None:
         self.assertFalse(BUILTIN_STAGES.require("roi_extraction").modifies_frame_data)
         self.assertTrue(BUILTIN_STAGES.require("local_contrast").modifies_frame_data)
+        with self.assertRaisesRegex(ValueError, "Unknown pipeline stage"):
+            BUILTIN_STAGES.require("segmentation")
+
+        with_hull = EnhancementParameters(roi_convex_hull_enabled=True)
+        without_hull = EnhancementParameters(roi_convex_hull_enabled=False)
+        self.assertNotEqual(
+            BUILTIN_STAGES.require("roi_extraction").cache_token(with_hull),
+            BUILTIN_STAGES.require("roi_extraction").cache_token(without_hull),
+        )
+        with_circle = EnhancementParameters(roi_circle_fit_enabled=True)
+        without_circle = EnhancementParameters(roi_circle_fit_enabled=False)
+        self.assertNotEqual(
+            BUILTIN_STAGES.require("roi_extraction").cache_token(with_circle),
+            BUILTIN_STAGES.require("roi_extraction").cache_token(without_circle),
+        )
 
     def test_temporal_change_heatmap_is_a_file_only_analysis_stage(self) -> None:
         definition = BUILTIN_STAGES.require("temporal_change_heatmap")

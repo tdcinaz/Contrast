@@ -45,14 +45,14 @@ class QuantumMottleFilterTests(unittest.TestCase):
         panel.source_gray_frames = [np.full((8, 8), level, dtype=np.uint8) for level in (10, 20, 30, 40, 50)]
         panel.stage_frame_cache = {}
         panel.encoded_frame_cache = {}
-        panel.segmentation_mask_cache = {}
+        panel.roi_region_mask_cache = {}
         panel.roi_selection_cache = {}
         panel.temporal_change_map_cache = {}
         panel.active_sequence_key = None
         panel.inactive_sequence_key = None
         panel.stage_duration_per_frame = {}
         panel.enhanced_frames = None
-        panel.segmentation_masks = None
+        panel.roi_region_masks = None
         panel.stage_roi_selection = None
         panel.display = SimpleNamespace(set_roi=lambda *_args: None)
         parameters = EnhancementParameters(mottle_similarity_sigma=0.1, mottle_window_radius=2)

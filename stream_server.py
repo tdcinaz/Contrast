@@ -74,11 +74,6 @@ def _parameters(controls: dict[str, object]) -> EnhancementParameters:
         adjustments_sharpen_amount=float(_control_value(controls, "adjustmentsSharpen", 0.0)),
         adjustments_gamma=float(_control_value(controls, "adjustmentsGamma", 1.0)),
         smoothing_sigma_x=float(_control_value(controls, "smoothingSigma", 0.55)),
-        segmentation_mode=str(_control_value(controls, "segmentationMode", "dark_contrast")),
-        segmentation_block_size=int(_control_value(controls, "segmentationBlockSize", 51)),
-        segmentation_sensitivity=float(_control_value(controls, "segmentationSensitivity", 7.0)),
-        segmentation_level_tolerance=int(_control_value(controls, "segmentationTolerance", 12)),
-        segmentation_min_area=int(_control_value(controls, "segmentationMinimumArea", 80)),
     )
 
 

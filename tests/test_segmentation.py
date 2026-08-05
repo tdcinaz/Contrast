@@ -31,8 +31,9 @@ from main import (
     detect_aneurysm_roi,
     build_analysis_result,
     normalize_analysis_results,
-    overlay_segmentation_mask,
-    segment_dark_contrast,
+    overlay_roi_regions,
+    fit_circle_to_convex_hull,
+    roi_selection_from_mask,
     segment_temporal_change_map,
     segment_temporal_change_contrast,
     temporal_change_heatmap_peaks,
@@ -648,56 +649,22 @@ class SegmentationTests(unittest.TestCase):
             "ROI residence analysis failed: ROI extraction did not produce masks for Pre-deployment.",
         )
 
-    def test_preserves_component_brightness_and_removes_small_components(self) -> None:
-        frame = np.full((160, 160), 180, dtype=np.uint8)
-        cv2.circle(frame, (55, 80), 18, 45, thickness=-1)
-        cv2.circle(frame, (105, 80), 18, 95, thickness=-1)
-        cv2.circle(frame, (20, 20), 2, 60, thickness=-1)
-
-        mask = segment_dark_contrast(
-            frame,
-            block_size=51,
-            sensitivity=7.0,
-            level_tolerance=0,
-            minimum_area=80,
-        )
-
-        self.assertEqual(mask[80, 55], 45)
-        self.assertEqual(mask[80, 105], 95)
-        self.assertEqual(mask[20, 20], 0)
-        self.assertEqual(mask.dtype, np.uint8)
-
-    def test_groups_component_levels_within_brightness_tolerance(self) -> None:
-        frame = np.full((180, 220), 180, dtype=np.uint8)
-        cv2.circle(frame, (35, 90), 15, 45, thickness=-1)
-        cv2.circle(frame, (85, 90), 15, 52, thickness=-1)
-        cv2.circle(frame, (135, 90), 15, 59, thickness=-1)
-        cv2.circle(frame, (185, 90), 15, 95, thickness=-1)
-
-        component_map = segment_dark_contrast(
-            frame,
-            block_size=41,
-            sensitivity=7.0,
-            level_tolerance=10,
-            minimum_area=80,
-        )
-
-        self.assertEqual(component_map[90, 35], component_map[90, 85])
-        self.assertNotEqual(component_map[90, 85], component_map[90, 135])
-        self.assertNotEqual(component_map[90, 135], component_map[90, 185])
-
     def test_overlay_changes_only_masked_pixels_without_mutating_input(self) -> None:
         frame = np.full((4, 4, 3), 100, dtype=np.uint8)
         original = frame.copy()
         mask = np.zeros((4, 4), dtype=np.uint8)
-        mask[1, 1] = 45
-        mask[2, 2] = 95
+        mask[1, 1] = main.ROI_VESSEL_LABEL
+        mask[2, 2] = main.ROI_ANEURYSM_LABEL
 
-        overlaid = overlay_segmentation_mask(frame, mask, opacity=0.5)
+        overlaid = overlay_roi_regions(frame, mask, opacity=0.5)
 
         np.testing.assert_array_equal(frame, original)
         np.testing.assert_array_equal(overlaid[0, 0], original[0, 0])
         self.assertFalse(np.array_equal(overlaid[1, 1], overlaid[2, 2]))
+
+        colored = overlay_roi_regions(frame, mask, aneurysm_color=(0, 128, 255), opacity=1.0)
+        np.testing.assert_array_equal(colored[1, 1], np.array([0, 0, 255], dtype=np.uint8))
+        np.testing.assert_array_equal(colored[2, 2], np.array([0, 128, 255], dtype=np.uint8))
 
     def test_temporal_change_segmentation_keeps_only_regions_with_large_full_video_change(self) -> None:
         frames: list[np.ndarray] = []
@@ -718,6 +685,72 @@ class SegmentationTests(unittest.TestCase):
         self.assertGreater(change_map[60, 48], 0)
         self.assertEqual(change_map[60, 112], 0)
         self.assertEqual(change_map.dtype, np.uint8)
+
+    def test_temporal_change_segmentation_labels_aneurysm_and_vessels_separately(self) -> None:
+        change = np.zeros((160, 200), dtype=np.float32)
+        cv2.rectangle(change, (20, 75), (150, 85), 30, thickness=-1)
+        cv2.circle(change, (155, 80), 24, 30, thickness=-1)
+        aneurysm = np.zeros(change.shape, dtype=bool)
+        cv2.circle(aneurysm, (155, 80), 20, 1, thickness=-1)
+
+        mask = segment_temporal_change_map(
+            change,
+            change_threshold=12.0,
+            level_tolerance=12,
+            minimum_area=80,
+            smoothing_window=11,
+            aneurysm_mask=aneurysm,
+        )
+
+        self.assertEqual(mask[80, 50], main.ROI_VESSEL_LABEL)
+        self.assertEqual(mask[80, 155], main.ROI_ANEURYSM_LABEL)
+        self.assertEqual(mask[20, 20], 0)
+        overlay = overlay_roi_regions(np.full((160, 200, 3), 100, dtype=np.uint8), mask)
+        self.assertFalse(np.array_equal(overlay[80, 50], overlay[80, 155]))
+
+    def test_temporal_change_segmentation_fills_the_aneurysm_convex_hull(self) -> None:
+        change = np.zeros((120, 160), dtype=np.float32)
+        cv2.rectangle(change, (20, 45), (140, 75), 30, thickness=-1)
+        aneurysm = np.zeros(change.shape, dtype=bool)
+        aneurysm[50:71, 100:106] = True
+        aneurysm[65:71, 100:131] = True
+
+        mask = segment_temporal_change_map(
+            change,
+            change_threshold=12.0,
+            level_tolerance=12,
+            minimum_area=80,
+            smoothing_window=11,
+            aneurysm_mask=aneurysm,
+        )
+
+        self.assertEqual(mask[60, 110], main.ROI_ANEURYSM_LABEL)
+        self.assertEqual(mask[60, 40], main.ROI_VESSEL_LABEL)
+
+    def test_roi_selection_uses_the_final_aneurysm_region_perimeter(self) -> None:
+        region = np.zeros((120, 160), dtype=bool)
+        region[50:71, 100:106] = True
+        region[65:71, 100:131] = True
+        points = np.column_stack(np.nonzero(region)[::-1]).astype(np.int32)
+        cv2.fillConvexPoly(region, cv2.convexHull(points), 1)
+
+        selection = roi_selection_from_mask(region)
+
+        self.assertIsNotNone(selection)
+        assert selection is not None
+        self.assertEqual(selection.rect.getRect(), (100, 50, 31, 21))
+        self.assertTrue(selection.mask[10, 10])
+        self.assertFalse(selection.mask[0, 30])
+
+    def test_circle_fit_refines_the_aneurysm_convex_hull(self) -> None:
+        region = np.zeros((120, 160), dtype=bool)
+        cv2.circle(region, (90, 60), 20, 1, thickness=-1)
+        cv2.rectangle(region, (105, 55), (125, 65), 1, thickness=-1)
+
+        circle = fit_circle_to_convex_hull(region)
+
+        self.assertTrue(circle[60, 90])
+        self.assertFalse(circle[60, 125])
 
     def test_temporal_change_map_cache_reuses_raw_measurement(self) -> None:
         panel = VideoPanel.__new__(VideoPanel)
@@ -784,7 +817,7 @@ class SegmentationTests(unittest.TestCase):
             (gain, contrast_b): [],
             (gain, smoothing): [],
         }
-        panel.segmentation_mask_cache = {}
+        panel.roi_region_mask_cache = {}
         panel.roi_selection_cache = {(gain, roi): None}
         panel.temporal_change_map_cache = {}
         panel.active_sequence_key = first
@@ -815,14 +848,14 @@ class SegmentationTests(unittest.TestCase):
         panel.source_gray_frames = [np.full((16, 16), level, dtype=np.uint8) for level in (80, 90, 100)]
         panel.stage_frame_cache = {}
         panel.encoded_frame_cache = {}
-        panel.segmentation_mask_cache = {}
+        panel.roi_region_mask_cache = {}
         panel.roi_selection_cache = {}
         panel.temporal_change_map_cache = {}
         panel.active_sequence_key = None
         panel.inactive_sequence_key = None
         panel.stage_duration_per_frame = {}
         panel.enhanced_frames = None
-        panel.segmentation_masks = None
+        panel.roi_region_masks = None
         panel.stage_roi_selection = None
         panel.display = SimpleNamespace(set_roi=lambda *_args: None)
 
@@ -878,7 +911,7 @@ class SegmentationTests(unittest.TestCase):
         seeks: list[int] = []
         panel = SimpleNamespace(
             enhanced_frames=[np.array([4, 5, 6], dtype=np.uint8)],
-            segmentation_masks=[],
+            roi_region_masks=[],
             seek=seeks.append,
         )
         mask_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
@@ -886,7 +919,7 @@ class SegmentationTests(unittest.TestCase):
         pending_future: Future[bool] = Future()
         playback_limits: list[int] = []
         window = SimpleNamespace(
-            _segmentation_mask_events=mask_events,
+            _roi_region_mask_events=mask_events,
             _enhancement_frame_events=SimpleQueue(),
             _source_pipeline_events=SimpleQueue(),
             _enhancement_generation=7,
@@ -900,7 +933,7 @@ class SegmentationTests(unittest.TestCase):
         ContrastWindow._poll_enhancement(window)
 
         self.assertFalse(pending_future.done())
-        self.assertIs(panel.segmentation_masks[0], encoded_mask)
+        self.assertIs(panel.roi_region_masks[0], encoded_mask)
         self.assertEqual(seeks, [0])
         self.assertEqual(playback_limits, [0])
 

@@ -26,12 +26,8 @@ class EnhancementParameters:
     roi_softening_enabled: bool = False
     roi_softening_radius_ratio: float = 0.12
     roi_softening_threshold: float = 0.10
-    segmentation_mode: str = "dark_contrast"
-    segmentation_block_size: int = 51
-    segmentation_sensitivity: float = 7.0
-    segmentation_change_threshold: float = 12.0
-    segmentation_level_tolerance: int = 12
-    segmentation_min_area: int = 80
+    roi_convex_hull_enabled: bool = True
+    roi_circle_fit_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +50,6 @@ class EnhancementStages:
     local_contrast: bool = False
     image_adjustments: bool = False
     final_smoothing: bool = False
-    segmentation: bool = False
     stage_order: tuple[str, ...] = (
         "brightness_stabilization",
         "roi_extraction",
@@ -66,7 +61,6 @@ class EnhancementStages:
         "local_contrast",
         "image_adjustments",
         "final_smoothing",
-        "segmentation",
     )
     instances: tuple[PipelineStage, ...] = ()
 

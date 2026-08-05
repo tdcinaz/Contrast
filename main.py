@@ -885,52 +885,8 @@ def apply_image_adjustments(
     return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
-def segment_dark_contrast(
-    gray: np.ndarray,
-    block_size: int,
-    sensitivity: float,
-    level_tolerance: int,
-    minimum_area: int,
-) -> np.ndarray:
-    source = np.clip(gray, 0, 255).astype(np.uint8)
-    block_size = max(3, int(block_size) | 1)
-    mask = cv2.adaptiveThreshold(
-        source,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        block_size,
-        sensitivity,
-    )
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    brightness_map = np.zeros_like(mask)
-    components: list[tuple[int, int, int]] = []
-    for component in range(1, component_count):
-        area = int(stats[component, cv2.CC_STAT_AREA])
-        if area >= minimum_area:
-            component_pixels = labels == component
-            component_brightness = int(np.median(source[component_pixels]))
-            components.append((component_brightness, component, area))
-
-    components.sort()
-    tolerance = max(0, int(level_tolerance))
-    level_groups: list[list[tuple[int, int, int]]] = []
-    for component_info in components:
-        if not level_groups or component_info[0] - level_groups[-1][0][0] > tolerance:
-            level_groups.append([component_info])
-        else:
-            level_groups[-1].append(component_info)
-
-    for group in level_groups:
-        brightness_total = sum(brightness * area for brightness, _, area in group)
-        area_total = sum(area for _, _, area in group)
-        representative_brightness = max(1, round(brightness_total / area_total))
-        for _, component, _ in group:
-            brightness_map[labels == component] = representative_brightness
-    return brightness_map
+ROI_VESSEL_LABEL = 96
+ROI_ANEURYSM_LABEL = 224
 
 
 def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
@@ -942,7 +898,10 @@ def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
         return np.zeros_like(source_frames[0], dtype=np.float32)
 
     stack = np.stack(source_frames, axis=0).astype(np.float32)
-    return np.percentile(stack, 90.0, axis=0) - np.percentile(stack, 10.0, axis=0)
+    baseline_count = min(len(source_frames) - 1, max(3, min(24, len(source_frames) // 8)))
+    baseline = np.percentile(stack[:baseline_count], 75.0, axis=0)
+    darkest = np.percentile(stack, 10.0, axis=0)
+    return np.clip(baseline - darkest, 0.0, None)
 
 
 def compute_temporal_change_summary(
@@ -1131,12 +1090,71 @@ def extract_aneurysm_roi(gray_frames: list[np.ndarray], fps: float, parameters: 
     )
 
 
+def roi_selection_from_mask(mask: np.ndarray) -> ROISelection | None:
+    points = cv2.findNonZero(mask.astype(np.uint8))
+    if points is None:
+        return None
+    x, y, width, height = cv2.boundingRect(points)
+    return ROISelection(
+        QRect(x, y, width, height),
+        mask[y : y + height, x : x + width].astype(bool, copy=True),
+    )
+
+
+def fit_circle_to_convex_hull(mask: np.ndarray) -> np.ndarray:
+    points = cv2.findNonZero(mask.astype(np.uint8))
+    if points is None or len(points) < 3:
+        return mask.astype(bool, copy=True)
+    hull = cv2.convexHull(points).reshape(-1, 2).astype(np.float64)
+    coefficients = np.column_stack((2.0 * hull[:, 0], 2.0 * hull[:, 1], np.ones(len(hull))))
+    solution, *_ = np.linalg.lstsq(coefficients, np.sum(hull * hull, axis=1), rcond=None)
+    center_x, center_y, offset = solution
+    radius_squared = offset + center_x * center_x + center_y * center_y
+    if radius_squared <= 0.0:
+        return mask.astype(bool, copy=True)
+    circle = np.zeros(mask.shape, dtype=np.uint8)
+    cv2.circle(circle, (round(center_x), round(center_y)), max(1, round(math.sqrt(radius_squared))), 1, thickness=-1)
+    return circle.astype(bool)
+
+
+def extract_aneurysm_regions(
+    gray_frames: list[np.ndarray],
+    fps: float,
+    parameters: EnhancementParameters,
+) -> tuple[ROISelection | None, np.ndarray]:
+    roi = extract_aneurysm_roi(gray_frames, fps, parameters)
+    if roi is None or parameters.roi_mode == "manual":
+        shape = gray_frames[0].shape if gray_frames else (1, 1)
+        return roi, np.zeros(shape, dtype=np.uint8)
+
+    temporal_change = compute_temporal_change_map(gray_frames)
+    aneurysm_mask = np.zeros(temporal_change.shape, dtype=bool)
+    x, y, width, height = roi.rect.getRect()
+    aneurysm_mask[y : y + height, x : x + width] = roi.mask
+    regions = segment_temporal_change_map(
+        temporal_change,
+        change_threshold=12.0,
+        level_tolerance=0,
+        minimum_area=80,
+        smoothing_window=51,
+        aneurysm_mask=aneurysm_mask,
+        fill_aneurysm_hull=parameters.roi_convex_hull_enabled,
+    )
+    if parameters.roi_circle_fit_enabled:
+        aneurysm_region = fit_circle_to_convex_hull(regions == ROI_ANEURYSM_LABEL)
+        regions[regions == ROI_ANEURYSM_LABEL] = ROI_VESSEL_LABEL
+        regions[aneurysm_region] = ROI_ANEURYSM_LABEL
+    return roi_selection_from_mask(regions == ROI_ANEURYSM_LABEL) or roi, regions
+
+
 def segment_temporal_change_map(
     temporal_change: np.ndarray,
     change_threshold: float,
     level_tolerance: int,
     minimum_area: int,
     smoothing_window: int,
+    aneurysm_mask: np.ndarray | None = None,
+    fill_aneurysm_hull: bool = True,
 ) -> np.ndarray:
     smoothed_change = temporal_change.astype(np.float32, copy=True)
     kernel_size = max(3, int(smoothing_window) | 1)
@@ -1150,29 +1168,23 @@ def segment_temporal_change_map(
 
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     change_map = np.zeros_like(mask, dtype=np.uint8)
-    components: list[tuple[int, int, int]] = []
+    selected_components: list[int] = []
     for component in range(1, component_count):
         area = int(stats[component, cv2.CC_STAT_AREA])
         if area >= minimum_area:
-            component_pixels = labels == component
-            component_change = int(np.median(smoothed_change[component_pixels]))
-            components.append((component_change, component, area))
+            selected_components.append(component)
 
-    components.sort()
-    tolerance = max(0, int(level_tolerance))
-    level_groups: list[list[tuple[int, int, int]]] = []
-    for component_info in components:
-        if not level_groups or component_info[0] - level_groups[-1][0][0] > tolerance:
-            level_groups.append([component_info])
-        else:
-            level_groups[-1].append(component_info)
+    for component in selected_components:
+        change_map[labels == component] = ROI_VESSEL_LABEL
 
-    for group in level_groups:
-        change_total = sum(change * area for change, _, area in group)
-        area_total = sum(area for _, _, area in group)
-        representative_change = max(1, min(255, round(change_total / area_total)))
-        for _, component, _ in group:
-            change_map[labels == component] = representative_change
+    if aneurysm_mask is not None and aneurysm_mask.shape == mask.shape:
+        aneurysm_pixels = (change_map > 0) & aneurysm_mask.astype(bool)
+        change_map[aneurysm_pixels] = ROI_ANEURYSM_LABEL
+        rows, columns = np.nonzero(aneurysm_pixels)
+        points = np.column_stack((columns, rows)).astype(np.int32)
+        if fill_aneurysm_hull and len(points) >= 3:
+            hull = cv2.convexHull(points)
+            cv2.fillConvexPoly(change_map, hull, ROI_ANEURYSM_LABEL)
 
     return change_map
 
@@ -1185,25 +1197,37 @@ def segment_temporal_change_contrast(
     smoothing_window: int,
 ) -> np.ndarray:
     temporal_change = compute_temporal_change_map(gray_frames)
+    roi = detect_aneurysm_roi(gray_frames, fps=15.0)
+    aneurysm_mask = None
+    if roi is not None:
+        aneurysm_mask = np.zeros(temporal_change.shape, dtype=bool)
+        x, y, width, height = roi.rect.getRect()
+        aneurysm_mask[y : y + height, x : x + width] = roi.mask
     return segment_temporal_change_map(
         temporal_change,
         change_threshold,
         level_tolerance,
         minimum_area,
         smoothing_window,
+        aneurysm_mask,
     )
 
 
-def overlay_segmentation_mask(
+def overlay_roi_regions(
     frame: np.ndarray,
     mask: np.ndarray,
+    aneurysm_color: tuple[int, int, int] = (255, 0, 0),
     opacity: float = 0.42,
 ) -> np.ndarray:
     result = frame.copy()
     selected = mask > 0
     if not np.any(selected):
         return result
-    overlay_colors = cv2.applyColorMap(mask, cv2.COLORMAP_TURBO)
+    overlay_colors = np.zeros_like(result)
+    overlay_colors[mask == ROI_VESSEL_LABEL] = (0, 0, 255)
+    overlay_colors[mask == ROI_ANEURYSM_LABEL] = aneurysm_color
+    unknown = selected & (mask != ROI_VESSEL_LABEL) & (mask != ROI_ANEURYSM_LABEL)
+    overlay_colors[unknown] = cv2.applyColorMap(mask, cv2.COLORMAP_TURBO)[unknown]
     result[selected] = np.clip(
         result[selected].astype(np.float32) * (1.0 - opacity)
         + overlay_colors[selected].astype(np.float32) * opacity,
@@ -1842,15 +1866,15 @@ class VideoPanel(QFrame):
         self.enhance_display = False
         self.comparison_display = True
         self.temporal_change_display = False
-        self.segmentation_overlay_display = True
+        self.roi_region_overlay_display = True
         self.target_median = 128.0
         self.enhanced_frames: list[np.ndarray] | None = None
         self.temporal_change_heatmap: np.ndarray | None = None
-        self.segmentation_masks: list[np.ndarray] | None = None
+        self.roi_region_masks: list[np.ndarray] | None = None
         self.source_gray_frames: list[np.ndarray] | None = None
         self.stage_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.encoded_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
-        self.segmentation_mask_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
+        self.roi_region_mask_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         self.roi_selection_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], ROISelection | None] = {}
         self.temporal_change_map_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], np.ndarray] = {}
         self.active_sequence_key: tuple[tuple[str, tuple[object, ...]], ...] | None = None
@@ -2204,9 +2228,9 @@ class VideoPanel(QFrame):
             if not BUILTIN_STAGES.require(token[0]).modifies_frame_data
         }
 
-        self.segmentation_mask_cache = {
+        self.roi_region_mask_cache = {
             key: masks
-            for key, masks in self.segmentation_mask_cache.items()
+            for key, masks in self.roi_region_mask_cache.items()
             if key in retained_artifact_keys
         }
         self.roi_selection_cache = {
@@ -2252,13 +2276,13 @@ class VideoPanel(QFrame):
     def _encode_stage_token(self) -> tuple[str, tuple[object, ...]]:
         return ("encode_enhanced", tuple())
 
-    def _segmentation_masks_for_sequence(
+    def _roi_region_masks_for_sequence(
         self,
         sequence_key: tuple[tuple[str, tuple[object, ...]], ...],
     ) -> list[np.ndarray] | None:
         for index, token in enumerate(sequence_key):
-            if token[0] == "segmentation":
-                return self.segmentation_mask_cache.get(self._artifact_cache_key(sequence_key[: index + 1]))
+            if token[0] == "roi_extraction":
+                return self.roi_region_mask_cache.get(self._artifact_cache_key(sequence_key[: index + 1]))
         return None
 
     def _roi_selection_for_sequence(
@@ -2297,39 +2321,12 @@ class VideoPanel(QFrame):
                 return False
             parameters = stage.parameters or default_parameters
             if stage.key == "roi_extraction" and artifact_key not in self.roi_selection_cache:
-                self.roi_selection_cache[artifact_key] = extract_aneurysm_roi(frames, self.info.fps, parameters)
-            elif stage.key == "segmentation" and artifact_key not in self.segmentation_mask_cache:
-                if parameters.segmentation_mode == "temporal_change":
-                    temporal_change = self.temporal_change_map_cache.get(frame_prefix)
-                    if temporal_change is None:
-                        temporal_change = compute_temporal_change_map(frames)
-                        self.temporal_change_map_cache[frame_prefix] = temporal_change
-                    mask = segment_temporal_change_map(
-                        temporal_change,
-                        parameters.segmentation_change_threshold,
-                        parameters.segmentation_level_tolerance,
-                        parameters.segmentation_min_area,
-                        parameters.segmentation_block_size,
-                    )
-                    encoded_ok, encoded_mask = cv2.imencode(".png", mask)
-                    if not encoded_ok:
-                        raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
-                    self.segmentation_mask_cache[artifact_key] = [encoded_mask] * len(frames)
-                else:
-                    encoded_masks: list[np.ndarray] = []
-                    for frame in frames:
-                        mask = segment_dark_contrast(
-                            frame,
-                            parameters.segmentation_block_size,
-                            parameters.segmentation_sensitivity,
-                            parameters.segmentation_level_tolerance,
-                            parameters.segmentation_min_area,
-                        )
-                        encoded_ok, encoded_mask = cv2.imencode(".png", mask)
-                        if not encoded_ok:
-                            raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
-                        encoded_masks.append(encoded_mask)
-                    self.segmentation_mask_cache[artifact_key] = encoded_masks
+                roi, regions = extract_aneurysm_regions(frames, self.info.fps, parameters)
+                self.roi_selection_cache[artifact_key] = roi
+                encoded_ok, encoded_regions = cv2.imencode(".png", regions)
+                if not encoded_ok:
+                    raise RuntimeError(f"Could not cache ROI regions: {self.path}")
+                self.roi_region_mask_cache[artifact_key] = [encoded_regions] * len(frames)
         return True
 
     def _sequence_has_roi_extraction(
@@ -2433,7 +2430,7 @@ class VideoPanel(QFrame):
         progress_callback: Callable[[float, float], bool] | None = None,
         stage_progress_callback: Callable[[str, int, int], bool] | None = None,
         encoded_frame_callback: Callable[[int, np.ndarray], None] | None = None,
-        segmentation_mask_callback: Callable[[int, np.ndarray], None] | None = None,
+        roi_region_mask_callback: Callable[[int, np.ndarray], None] | None = None,
         activate_result: bool = True,
         cancel_callback: Callable[[], bool] | None = None,
         frame_executor: AdaptiveFrameExecutor | None = None,
@@ -2460,19 +2457,19 @@ class VideoPanel(QFrame):
         )
         if frame_sequence_key in self.encoded_frame_cache and artifacts_ready:
             encoded_frames = self.encoded_frame_cache[frame_sequence_key]
-            segmentation_masks = self._segmentation_masks_for_sequence(sequence_key)
+            roi_region_masks = self._roi_region_masks_for_sequence(sequence_key)
             roi_selection = self._roi_selection_for_sequence(sequence_key)
-            if encoded_frame_callback is not None or segmentation_mask_callback is not None:
+            if encoded_frame_callback is not None or roi_region_mask_callback is not None:
                 for index, encoded in enumerate(encoded_frames):
                     if cancel_callback is not None and cancel_callback():
                         return False
-                    if segmentation_mask_callback is not None and segmentation_masks is not None:
-                        segmentation_mask_callback(index, segmentation_masks[index])
+                    if roi_region_mask_callback is not None and roi_region_masks is not None:
+                        roi_region_mask_callback(index, roi_region_masks[index])
                     if encoded_frame_callback is not None:
                         encoded_frame_callback(index, encoded)
             if activate_result:
                 self.enhanced_frames = encoded_frames
-            self.segmentation_masks = segmentation_masks
+            self.roi_region_masks = roi_region_masks
             self._activate_cache_branch(sequence_key)
             if self._sequence_has_roi_extraction(sequence_key):
                 self._activate_stage_roi_selection(roi_selection)
@@ -2491,7 +2488,7 @@ class VideoPanel(QFrame):
                     progress_callback,
                     stage_progress_callback,
                     encoded_frame_callback,
-                    segmentation_mask_callback,
+                    roi_region_mask_callback,
                     activate_result,
                     cancel_callback,
                     owned_executor,
@@ -2520,9 +2517,10 @@ class VideoPanel(QFrame):
                 reusable_frames = cached_frames
             else:
                 artifact_key = self._artifact_cache_key(stage_prefix)
-                if token[0] == "roi_extraction" and artifact_key not in self.roi_selection_cache:
-                    break
-                if token[0] == "segmentation" and artifact_key not in self.segmentation_mask_cache:
+                if (
+                    token[0] == "roi_extraction"
+                    and (artifact_key not in self.roi_selection_cache or artifact_key not in self.roi_region_mask_cache)
+                ):
                     break
             start_index = index + 1
 
@@ -2566,7 +2564,7 @@ class VideoPanel(QFrame):
         queues = [Queue[object](maxsize=frame_executor.max_pending) for _ in range(len(missing_stages) + 1)]
         source_output: list[np.ndarray] = []
         stage_outputs: list[list[np.ndarray]] = [[] for _ in missing_stages]
-        segmentation_outputs: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
+        roi_region_outputs: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
         roi_outputs: dict[tuple[tuple[str, tuple[object, ...]], ...], ROISelection | None] = {}
         encoded_frames: list[np.ndarray] = []
 
@@ -2849,83 +2847,6 @@ class VideoPanel(QFrame):
                             active_seconds += duration
                             if not emit(frame_number, transformed):
                                 break
-                elif stage_key == "segmentation":
-                    artifact_key = self._artifact_cache_key(stage_prefix)
-                    encoded_masks = segmentation_outputs.setdefault(artifact_key, [])
-                    segmentation_mode = str(stage_parameters.segmentation_mode)
-                    if segmentation_mode == "temporal_change":
-                        stage_frames: list[tuple[int, np.ndarray]] = []
-                        while True:
-                            item = input_queue.get()
-                            if item is STREAM_END:
-                                break
-                            if cancelled.is_set():
-                                continue
-                            frame_index, frame = cast(tuple[int, np.ndarray], item)
-                            stage_frames.append((frame_index, frame))
-                        if stage_frames and not cancelled.is_set():
-                            input_prefix = stage_frame_prefix
-                            started_at = perf_counter()
-                            temporal_change = self.temporal_change_map_cache.get(input_prefix)
-                            if temporal_change is None:
-                                temporal_change = compute_temporal_change_map([frame for _, frame in stage_frames])
-                                self.temporal_change_map_cache[input_prefix] = temporal_change
-                            temporal_mask = segment_temporal_change_map(
-                                temporal_change,
-                                stage_parameters.segmentation_change_threshold,
-                                stage_parameters.segmentation_level_tolerance,
-                                stage_parameters.segmentation_min_area,
-                                stage_parameters.segmentation_block_size,
-                            )
-                            encoded_ok, encoded_mask = cv2.imencode(".png", temporal_mask)
-                            duration = perf_counter() - started_at
-                            if not encoded_ok:
-                                raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
-                            active_seconds += duration
-                            for frame_index, frame in stage_frames:
-                                encoded_masks.append(encoded_mask)
-                                if segmentation_mask_callback is not None:
-                                    segmentation_mask_callback(frame_index, encoded_mask)
-                                emit(frame_index, frame)
-                    else:
-                        pending_masks: deque[tuple[int, np.ndarray, Future[tuple[np.ndarray, float]]]] = deque()
-
-                        def segment_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
-                            started_at = perf_counter()
-                            mask = segment_dark_contrast(
-                                frame,
-                                stage_parameters.segmentation_block_size,
-                                stage_parameters.segmentation_sensitivity,
-                                stage_parameters.segmentation_level_tolerance,
-                                stage_parameters.segmentation_min_area,
-                            )
-                            encoded_ok, encoded_mask = cv2.imencode(".png", mask)
-                            if not encoded_ok:
-                                raise RuntimeError(f"Could not cache segmentation mask: {self.path}")
-                            return encoded_mask, perf_counter() - started_at
-
-                        def drain_mask() -> None:
-                            nonlocal active_seconds
-                            frame_index, frame, future = pending_masks.popleft()
-                            encoded_mask, duration = future.result()
-                            active_seconds += duration
-                            encoded_masks.append(encoded_mask)
-                            if segmentation_mask_callback is not None:
-                                segmentation_mask_callback(frame_index, encoded_mask)
-                            emit(frame_index, frame)
-
-                        while True:
-                            item = input_queue.get()
-                            if item is STREAM_END:
-                                break
-                            if cancelled.is_set():
-                                continue
-                            frame_index, frame = cast(tuple[int, np.ndarray], item)
-                            pending_masks.append((frame_index, frame, frame_executor.submit(segment_frame, frame)))
-                            if len(pending_masks) >= frame_executor.max_workers:
-                                drain_mask()
-                        while pending_masks:
-                            drain_mask()
                 elif stage_key == "roi_extraction":
                     stage_frames: list[tuple[int, np.ndarray]] = []
                     while True:
@@ -2939,11 +2860,19 @@ class VideoPanel(QFrame):
 
                     if stage_frames and not cancelled.is_set():
                         started_at = perf_counter()
-                        roi_outputs[self._artifact_cache_key(stage_prefix)] = extract_aneurysm_roi(
+                        artifact_key = self._artifact_cache_key(stage_prefix)
+                        roi, regions = extract_aneurysm_regions(
                             [frame for _, frame in stage_frames], self.info.fps, stage_parameters
                         )
+                        encoded_ok, encoded_regions = cv2.imencode(".png", regions)
+                        if not encoded_ok:
+                            raise RuntimeError(f"Could not cache ROI regions: {self.path}")
+                        roi_outputs[artifact_key] = roi
+                        roi_region_outputs[artifact_key] = [encoded_regions] * len(stage_frames)
                         active_seconds += perf_counter() - started_at
                         for frame_index, frame in stage_frames:
+                            if roi_region_mask_callback is not None:
+                                roi_region_mask_callback(frame_index, encoded_regions)
                             if not emit(frame_index, frame):
                                 break
                 else:
@@ -3029,13 +2958,13 @@ class VideoPanel(QFrame):
         for (token, _, stage_frame_prefix), output in zip(missing_stages, stage_outputs):
             if BUILTIN_STAGES.require(token[0]).modifies_frame_data:
                 self.stage_frame_cache[stage_frame_prefix] = output
-        self.segmentation_mask_cache.update(segmentation_outputs)
+        self.roi_region_mask_cache.update(roi_region_outputs)
         self.roi_selection_cache.update(roi_outputs)
         self.encoded_frame_cache[frame_sequence_key] = encoded_frames
 
         if activate_result:
             self.enhanced_frames = self.encoded_frame_cache[frame_sequence_key]
-        self.segmentation_masks = self._segmentation_masks_for_sequence(sequence_key)
+        self.roi_region_masks = self._roi_region_masks_for_sequence(sequence_key)
         self._activate_cache_branch(sequence_key)
         if self._sequence_has_roi_extraction(sequence_key):
             self._activate_stage_roi_selection(self._roi_selection_for_sequence(sequence_key))
@@ -3067,14 +2996,18 @@ class VideoPanel(QFrame):
             if enhanced is not None:
                 enhanced_frame = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
                 can_overlay = (
-                    self.segmentation_overlay_display
-                    and self.segmentation_masks is not None
-                    and self.current_frame_index < len(self.segmentation_masks)
+                    self.roi_region_overlay_display
+                    and self.roi_region_masks is not None
+                    and self.current_frame_index < len(self.roi_region_masks)
                 )
                 if can_overlay:
-                    mask = cv2.imdecode(self.segmentation_masks[self.current_frame_index], cv2.IMREAD_GRAYSCALE)
+                    mask = cv2.imdecode(self.roi_region_masks[self.current_frame_index], cv2.IMREAD_GRAYSCALE)
                     if mask is not None:
-                        enhanced_frame = overlay_segmentation_mask(enhanced_frame, mask)
+                        enhanced_frame = overlay_roi_regions(
+                            enhanced_frame,
+                            mask,
+                            (self.color.blue(), self.color.green(), self.color.red()),
+                        )
         left_frame = self.temporal_change_heatmap if self.temporal_change_display and self.temporal_change_heatmap is not None else source_frame
         left_label = "Pixel change" if self.temporal_change_display and self.temporal_change_heatmap is not None else "Source"
         self.display.set_frames(left_frame, enhanced_frame, left_label)
@@ -3102,7 +3035,6 @@ class VideoPanel(QFrame):
             return
         source = self.current_frame
         enhanced: np.ndarray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
-        segmentation_mask: np.ndarray | None = None
         for stage in stages.enabled_stage_instances(default_parameters):
             parameters = stage.parameters or default_parameters
             if stage.key in {
@@ -3112,16 +3044,6 @@ class VideoPanel(QFrame):
                 "roi_extraction",
             }:
                 continue
-            if stage.key == "segmentation":
-                if parameters.segmentation_mode == "dark_contrast":
-                    segmentation_mask = segment_dark_contrast(
-                        np.clip(enhanced, 0, 255).astype(np.uint8),
-                        parameters.segmentation_block_size,
-                        parameters.segmentation_sensitivity,
-                        parameters.segmentation_level_tolerance,
-                        parameters.segmentation_min_area,
-                    )
-                continue
             if stage.key == "denoise" and denoiser is not None:
                 result = denoiser.denoise_batch([np.clip(enhanced, 0, 255).astype(np.uint8)], stage.noise_sigma or noise_sigma)
                 if result:
@@ -3130,8 +3052,6 @@ class VideoPanel(QFrame):
             enhanced = self._apply_frame_stage(stage.key, enhanced, parameters)
 
         output = cv2.cvtColor(np.clip(enhanced, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-        if segmentation_mask is not None and self.segmentation_overlay_display:
-            output = overlay_segmentation_mask(output, segmentation_mask)
         self.display.set_frames(source, output)
 
     def seek(self, frame_index: int) -> bool:
@@ -3211,20 +3131,20 @@ class VideoPanel(QFrame):
         self.display.set_comparison_enabled(self.comparison_display)
         self.seek(frame_index)
 
-    def set_segmentation_overlay(self, enabled: bool, frame_index: int) -> None:
-        self.segmentation_overlay_display = enabled
+    def set_roi_region_overlay(self, enabled: bool, frame_index: int) -> None:
+        self.roi_region_overlay_display = enabled
         self.seek(frame_index)
 
     def clear_enhancement_cache(self) -> None:
         self.enhanced_frames = None
         self.temporal_change_heatmap = None
         self.temporal_change_display = False
-        self.segmentation_masks = None
+        self.roi_region_masks = None
         self.source_gray_frames = None
         self.stage_roi_selection = None
         self.stage_frame_cache.clear()
         self.encoded_frame_cache.clear()
-        self.segmentation_mask_cache.clear()
+        self.roi_region_mask_cache.clear()
         self.roi_selection_cache.clear()
         self.temporal_change_map_cache.clear()
         self.active_sequence_key = None
@@ -3718,7 +3638,7 @@ class ContrastWindow(QMainWindow):
         self._enhancement_pending_request: EnhancementRequest | None = None
         self._enhancement_generation = 0
         self._enhancement_frame_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
-        self._segmentation_mask_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
+        self._roi_region_mask_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
         self._source_pipeline_events: SimpleQueue[tuple[int, list[SourcePipelineState], Event]] = SimpleQueue()
         self._enhancement_progress_lock = Lock()
         self._enhancement_progress_values = [0.0, 0.0]
@@ -3839,7 +3759,7 @@ class ContrastWindow(QMainWindow):
         self.live_phase_toggle.setEnabled(enabled and live_input)
         self.live_export_toggle.setEnabled(enabled and live_input)
         self.compare_view_check.setEnabled(enabled)
-        self.overlay_mask_check.setEnabled(enabled and self._has_enabled_stage("segmentation"))
+        self.overlay_mask_check.setEnabled(enabled and self._has_enabled_stage("roi_extraction"))
         self.open_pre_action.setEnabled(enabled and bool(self.pre_panel))
         self.open_post_action.setEnabled(enabled and bool(self.post_panel))
         if live_input:
@@ -4500,8 +4420,8 @@ class ContrastWindow(QMainWindow):
         self.overlay_mask_check = QCheckBox("ROI")
         self.overlay_mask_check.setChecked(True)
         self.overlay_mask_check.setEnabled(False)
-        self.overlay_mask_check.setToolTip("Show segmentation masks over enhanced video")
-        self.overlay_mask_check.toggled.connect(self.on_segmentation_overlay_toggled)
+        self.overlay_mask_check.setToolTip("Show automatic aneurysm and vessel regions over enhanced video")
+        self.overlay_mask_check.toggled.connect(self.on_roi_region_overlay_toggled)
 
         self.video_row = QWidget()
         self.video_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
@@ -4754,11 +4674,6 @@ class ContrastWindow(QMainWindow):
         self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 10)
         self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 11)
         self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 12)
-        self.segmentation_stage_drawer = StageDrawer(
-            "segmentation",
-            "Brightness-coded contrast segmentation",
-            13,
-        )
         self.analysis_stage_drawer = StageDrawer(
             "roi_residence_analysis",
             "ROI residence analysis",
@@ -4787,7 +4702,6 @@ class ContrastWindow(QMainWindow):
         self.contrast_stage_check = self.contrast_stage_drawer.enable_button
         self.adjustments_stage_check = self.adjustments_stage_drawer.enable_button
         self.smoothing_stage_check = self.smoothing_stage_drawer.enable_button
-        self.segmentation_stage_check = self.segmentation_stage_drawer.enable_button
         self.analysis_stage_check = self.analysis_stage_drawer.enable_button
         self.frame_brightness_analysis_stage_check = self.frame_brightness_analysis_stage_drawer.enable_button
         self.temporal_change_heatmap_stage_check = self.temporal_change_heatmap_stage_drawer.enable_button
@@ -4807,7 +4721,6 @@ class ContrastWindow(QMainWindow):
             self.contrast_stage_check,
             self.adjustments_stage_check,
             self.smoothing_stage_check,
-            self.segmentation_stage_check,
         ]
         self.pipeline_stage_checks = [
             *self.source_pipeline_stage_checks,
@@ -4832,7 +4745,6 @@ class ContrastWindow(QMainWindow):
             self.contrast_stage_drawer,
             self.adjustments_stage_drawer,
             self.smoothing_stage_drawer,
-            self.segmentation_stage_drawer,
         ]
         self.live_pipeline_stage_drawers = [
             *self.frame_pipeline_stage_drawers,
@@ -4941,6 +4853,8 @@ class ContrastWindow(QMainWindow):
             "roi_soften_check": "roiSoftenEnabled",
             "roi_radius_spin": "roiSofteningRadius",
             "roi_threshold_spin": "roiSofteningThreshold",
+            "roi_convex_hull_check": "roiConvexHullEnabled",
+            "roi_circle_fit_check": "roiCircleFitEnabled",
             "scanline_clip_spin": "scanlineBiasClip",
             "scanline_sigma_spin": "scanlineSigmaY",
             "temporal_sigma_spin": "temporalMotionSigma",
@@ -4953,12 +4867,6 @@ class ContrastWindow(QMainWindow):
             "adjustments_sharpen_spin": "adjustmentsSharpen",
             "adjustments_gamma_spin": "adjustmentsGamma",
             "smoothing_sigma_spin": "smoothingSigma",
-            "segmentation_mode_combo": "segmentationMode",
-            "segmentation_block_spin": "segmentationBlockSize",
-            "segmentation_sensitivity_spin": "segmentationSensitivity",
-            "segmentation_change_threshold_spin": "segmentationChangeThreshold",
-            "segmentation_tolerance_spin": "segmentationTolerance",
-            "segmentation_area_spin": "segmentationMinimumArea",
         }
         for attribute, object_name in widget_names.items():
             getattr(self, attribute).setObjectName(object_name)
@@ -5161,6 +5069,8 @@ class ContrastWindow(QMainWindow):
             roi_softening_enabled=bool(value("roiSoftenEnabled", False)),
             roi_softening_radius_ratio=float(value("roiSofteningRadius", 0.12)),
             roi_softening_threshold=float(value("roiSofteningThreshold", 0.10)),
+            roi_convex_hull_enabled=bool(value("roiConvexHullEnabled", True)),
+            roi_circle_fit_enabled=bool(value("roiCircleFitEnabled", False)),
             scanline_bias_clip=float(value("scanlineBiasClip", 6.0)),
             scanline_sigma_y=float(value("scanlineSigmaY", 2.0)),
             temporal_motion_sigma=float(value("temporalMotionSigma", 12.0)),
@@ -5173,12 +5083,6 @@ class ContrastWindow(QMainWindow):
             adjustments_sharpen_amount=float(value("adjustmentsSharpen", 0.0)),
             adjustments_gamma=float(value("adjustmentsGamma", 1.0)),
             smoothing_sigma_x=float(value("smoothingSigma", 0.55)),
-            segmentation_mode=str(value("segmentationMode", "dark_contrast")),
-            segmentation_block_size=int(value("segmentationBlockSize", 51)),
-            segmentation_sensitivity=float(value("segmentationSensitivity", 7.0)),
-            segmentation_change_threshold=float(value("segmentationChangeThreshold", 12.0)),
-            segmentation_level_tolerance=int(value("segmentationTolerance", 12)),
-            segmentation_min_area=int(value("segmentationMinimumArea", 80)),
         )
 
     def _sync_active_denoise_controls(self) -> None:
@@ -5593,6 +5497,16 @@ class ContrastWindow(QMainWindow):
         roi_threshold_row.addWidget(self.roi_threshold_spin)
         self.roi_stage_drawer.content_layout.addLayout(roi_threshold_row)
 
+        self.roi_convex_hull_check = QCheckBox("Fill aneurysm convex hull")
+        self.roi_convex_hull_check.setChecked(True)
+        self.roi_convex_hull_check.setToolTip("Smooth the automatic aneurysm region boundary by filling its convex hull")
+        self.roi_stage_drawer.content_layout.addWidget(self.roi_convex_hull_check)
+
+        self.roi_circle_fit_check = QCheckBox("Fit circle to aneurysm hull")
+        self.roi_circle_fit_check.setChecked(False)
+        self.roi_circle_fit_check.setToolTip("Refine the automatic aneurysm region to a circle fitted to its convex hull")
+        self.roi_stage_drawer.content_layout.addWidget(self.roi_circle_fit_check)
+
         self.redetect_button = QPushButton("Refresh ROI extraction")
         self.redetect_button.clicked.connect(self.redetect_aneurysms)
         self.roi_stage_drawer.content_layout.addWidget(self.redetect_button)
@@ -5718,80 +5632,13 @@ class ContrastWindow(QMainWindow):
         smoothing_row.addWidget(self.smoothing_sigma_spin)
         self.smoothing_stage_drawer.content_layout.addLayout(smoothing_row)
 
-        segmentation_block_row = QHBoxLayout()
-        segmentation_block_row.addWidget(QLabel("Segmentation basis"))
-        self.segmentation_mode_combo = QComboBox()
-        self.segmentation_mode_combo.addItem("Dark contrast (per frame)", "dark_contrast")
-        self.segmentation_mode_combo.addItem("Temporal brightness change (full video)", "temporal_change")
-        self.segmentation_mode_combo.setToolTip(
-            "Temporal mode builds one mask from per-pixel brightness change over the full trimmed video"
-        )
-        segmentation_block_row.addWidget(self.segmentation_mode_combo)
-        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_block_row)
-
-        segmentation_block_row = QHBoxLayout()
-        segmentation_block_row.addWidget(QLabel("Adaptive neighborhood"))
-        self.segmentation_block_spin = QSpinBox()
-        self.segmentation_block_spin.setRange(3, 151)
-        self.segmentation_block_spin.setSingleStep(2)
-        self.segmentation_block_spin.setValue(51)
-        self.segmentation_block_spin.setToolTip(
-            "Local neighborhood for dark-contrast mode and temporal-map smoothing for temporal-change mode"
-        )
-        segmentation_block_row.addWidget(self.segmentation_block_spin)
-        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_block_row)
-
-        segmentation_sensitivity_row = QHBoxLayout()
-        segmentation_sensitivity_row.addWidget(QLabel("Sensitivity"))
-        self.segmentation_sensitivity_spin = QDoubleSpinBox()
-        self.segmentation_sensitivity_spin.setRange(0.0, 30.0)
-        self.segmentation_sensitivity_spin.setSingleStep(0.5)
-        self.segmentation_sensitivity_spin.setDecimals(1)
-        self.segmentation_sensitivity_spin.setValue(7.0)
-        segmentation_sensitivity_row.addWidget(self.segmentation_sensitivity_spin)
-        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_sensitivity_row)
-
-        segmentation_change_threshold_row = QHBoxLayout()
-        segmentation_change_threshold_row.addWidget(QLabel("Change threshold"))
-        self.segmentation_change_threshold_spin = QDoubleSpinBox()
-        self.segmentation_change_threshold_spin.setRange(0.0, 100.0)
-        self.segmentation_change_threshold_spin.setSingleStep(0.5)
-        self.segmentation_change_threshold_spin.setDecimals(1)
-        self.segmentation_change_threshold_spin.setValue(12.0)
-        self.segmentation_change_threshold_spin.setSuffix(" levels")
-        self.segmentation_change_threshold_spin.setToolTip(
-            "Minimum per-pixel full-video brightness change kept in temporal-change segmentation mode"
-        )
-        segmentation_change_threshold_row.addWidget(self.segmentation_change_threshold_spin)
-        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_change_threshold_row)
-
-        segmentation_tolerance_row = QHBoxLayout()
-        segmentation_tolerance_row.addWidget(QLabel("Brightness tolerance"))
-        self.segmentation_tolerance_spin = QSpinBox()
-        self.segmentation_tolerance_spin.setRange(0, 64)
-        self.segmentation_tolerance_spin.setValue(12)
-        self.segmentation_tolerance_spin.setSuffix(" levels")
-        self.segmentation_tolerance_spin.setToolTip(
-            "Maximum grayscale range grouped into one component level; 0 preserves exact levels"
-        )
-        segmentation_tolerance_row.addWidget(self.segmentation_tolerance_spin)
-        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_tolerance_row)
-
-        segmentation_area_row = QHBoxLayout()
-        segmentation_area_row.addWidget(QLabel("Minimum component area"))
-        self.segmentation_area_spin = QSpinBox()
-        self.segmentation_area_spin.setRange(1, 10000)
-        self.segmentation_area_spin.setValue(80)
-        self.segmentation_area_spin.setSuffix(" px")
-        segmentation_area_row.addWidget(self.segmentation_area_spin)
-        self.segmentation_stage_drawer.content_layout.addLayout(segmentation_area_row)
-
         for drawer in self.frame_pipeline_stage_drawers:
             self._add_sliders_to_parameter_layout(drawer.content_layout)
 
         self.gain_auto_target_check.toggled.connect(self._on_gain_auto_target_toggled)
         self.roi_soften_check.toggled.connect(self._on_roi_soften_toggled)
-        self.segmentation_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
+        self.roi_convex_hull_check.toggled.connect(self.on_enhancement_settings_changed)
+        self.roi_circle_fit_check.toggled.connect(self.on_enhancement_settings_changed)
         self.mottle_window_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         for spin in [
             self.auto_crop_size_offset_spin,
@@ -5813,11 +5660,6 @@ class ContrastWindow(QMainWindow):
             self.adjustments_sharpen_spin,
             self.adjustments_gamma_spin,
             self.smoothing_sigma_spin,
-            self.segmentation_block_spin,
-            self.segmentation_sensitivity_spin,
-            self.segmentation_change_threshold_spin,
-            self.segmentation_tolerance_spin,
-            self.segmentation_area_spin,
         ]:
             spin.valueChanged.connect(self.on_enhancement_settings_changed)
         self.background_video_one_check.toggled.connect(self._on_background_subtraction_video_toggled)
@@ -6347,13 +6189,13 @@ class ContrastWindow(QMainWindow):
             "Showing pixel change beside enhanced output." if enabled else "Showing enhanced output only."
         )
 
-    def on_segmentation_overlay_toggled(self, enabled: bool) -> None:
+    def on_roi_region_overlay_toggled(self, enabled: bool) -> None:
         if not self.panels:
             return
         for panel in self.panels:
-            panel.set_segmentation_overlay(enabled, self.current_frame_index)
+            panel.set_roi_region_overlay(enabled, self.current_frame_index)
         self.statusBar().showMessage(
-            "Segmentation mask overlay visible." if enabled else "Segmentation mask overlay hidden."
+            "ROI region overlay visible." if enabled else "ROI region overlay hidden."
         )
 
     def on_enhancement_settings_changed(self) -> None:
@@ -6362,7 +6204,7 @@ class ContrastWindow(QMainWindow):
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
         uses_accelerator = uses_ffdnet or (stages.denoise and active_mode == "tensor-nlm-ngc")
         uses_spatial_denoiser = stages.denoise
-        self.overlay_mask_check.setEnabled(bool(self.panels) and stages.segmentation)
+        self.overlay_mask_check.setEnabled(bool(self.panels) and stages.roi_extraction)
         self.denoise_strength_label.setEnabled(uses_spatial_denoiser)
         self.denoise_strength_spin.setEnabled(uses_spatial_denoiser)
         self.inference_batch_spin.setEnabled(uses_accelerator)
@@ -6406,7 +6248,6 @@ class ContrastWindow(QMainWindow):
             local_contrast=self._has_enabled_stage("local_contrast"),
             image_adjustments=self._has_enabled_stage("image_adjustments"),
             final_smoothing=self._has_enabled_stage("final_smoothing"),
-            segmentation=self._has_enabled_stage("segmentation"),
             stage_order=tuple(stage.key for stage in instances),
             instances=instances,
         )
@@ -6699,6 +6540,8 @@ class ContrastWindow(QMainWindow):
             roi_softening_enabled=self.roi_soften_check.isChecked(),
             roi_softening_radius_ratio=self.roi_radius_spin.value(),
             roi_softening_threshold=self.roi_threshold_spin.value(),
+            roi_convex_hull_enabled=self.roi_convex_hull_check.isChecked(),
+            roi_circle_fit_enabled=self.roi_circle_fit_check.isChecked(),
             scanline_bias_clip=self.scanline_clip_spin.value(),
             scanline_sigma_y=self.scanline_sigma_spin.value(),
             temporal_motion_sigma=self.temporal_sigma_spin.value(),
@@ -6711,12 +6554,6 @@ class ContrastWindow(QMainWindow):
             adjustments_sharpen_amount=self.adjustments_sharpen_spin.value(),
             adjustments_gamma=self.adjustments_gamma_spin.value(),
             smoothing_sigma_x=self.smoothing_sigma_spin.value(),
-            segmentation_mode=str(self.segmentation_mode_combo.currentData()),
-            segmentation_block_size=self.segmentation_block_spin.value(),
-            segmentation_sensitivity=self.segmentation_sensitivity_spin.value(),
-            segmentation_change_threshold=self.segmentation_change_threshold_spin.value(),
-            segmentation_level_tolerance=self.segmentation_tolerance_spin.value(),
-            segmentation_min_area=self.segmentation_area_spin.value(),
         )
 
     def on_pipeline_stages_changed(self) -> None:
@@ -6725,7 +6562,7 @@ class ContrastWindow(QMainWindow):
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
         uses_accelerator = uses_ffdnet or (stages.denoise and active_mode == "tensor-nlm-ngc")
         uses_spatial_denoiser = stages.denoise
-        self.overlay_mask_check.setEnabled(bool(self.panels) and stages.segmentation)
+        self.overlay_mask_check.setEnabled(bool(self.panels) and stages.roi_extraction)
         self.denoise_strength_label.setEnabled(uses_spatial_denoiser)
         self.denoise_strength_spin.setEnabled(uses_spatial_denoiser)
         self.inference_batch_spin.setEnabled(uses_accelerator)
@@ -6819,7 +6656,7 @@ class ContrastWindow(QMainWindow):
             self._enhancement_message = "Preparing enhanced videos..."
         for panel in self.panels:
             panel.enhanced_frames = []
-            panel.segmentation_masks = [] if request.stages.segmentation else None
+            panel.roi_region_masks = [] if request.stages.roi_extraction else None
             panel.enhance_display = True
         self._set_playback_limit(0)
         for panel in self.panels:
@@ -7002,8 +6839,8 @@ class ContrastWindow(QMainWindow):
             def encoded_frame_callback(frame_index: int, encoded: np.ndarray) -> None:
                 self._enhancement_frame_events.put((request.generation, panel_index, frame_index, encoded))
 
-            def segmentation_mask_callback(frame_index: int, encoded: np.ndarray) -> None:
-                self._segmentation_mask_events.put((request.generation, panel_index, frame_index, encoded))
+            def roi_region_mask_callback(frame_index: int, encoded: np.ndarray) -> None:
+                self._roi_region_mask_events.put((request.generation, panel_index, frame_index, encoded))
 
             prepared = panel.prepare_enhanced_frames(
                 panel_denoisers[panel_index],
@@ -7014,7 +6851,7 @@ class ContrastWindow(QMainWindow):
                 progress_callback,
                 stage_progress_callback,
                 encoded_frame_callback,
-                segmentation_mask_callback,
+                roi_region_mask_callback,
                 False,
                 cancel_event.is_set,
                 frame_executor,
@@ -7062,12 +6899,12 @@ class ContrastWindow(QMainWindow):
 
         while True:
             try:
-                generation, panel_index, frame_index, encoded = self._segmentation_mask_events.get_nowait()
+                generation, panel_index, frame_index, encoded = self._roi_region_mask_events.get_nowait()
             except Empty:
                 break
             if generation != self._enhancement_generation:
                 continue
-            masks = self.panels[panel_index].segmentation_masks
+            masks = self.panels[panel_index].roi_region_masks
             if masks is None:
                 continue
             if frame_index == len(masks):
