@@ -206,6 +206,28 @@ class AutoCropTests(unittest.TestCase):
         self.assertIsNotNone(panel.background_reference)
         panel.clear_enhancement_cache.assert_called_once()
 
+    def test_dsa_acquires_mask_before_injection_without_temporal_trimming(self) -> None:
+        class Source:
+            _full_frame_rect = VideoPanel._full_frame_rect
+            calculate_source_pipeline = VideoPanel.calculate_source_pipeline
+
+            def __init__(self) -> None:
+                self.info = SimpleNamespace(width=400, height=240, fps=10.0, frame_count=100)
+                self.live_input = False
+                self._auto_crop_rect_cache = None
+                self._trim_start_cache = {}
+                self._sample_cropped_gray_frames = Mock(return_value=[np.zeros((240, 400), dtype=np.uint8)] * 100)
+                self._acquire_dsa_mask = Mock(return_value=np.full((240, 400), 160, dtype=np.uint8))
+
+        source = Source()
+        with patch.object(main, "detect_pre_injection_trim_start", return_value=25):
+            state = source.calculate_source_pipeline(False, False, background_subtraction_enabled=True)
+
+        self.assertEqual(state.trim_start, 0)
+        source._acquire_dsa_mask.assert_called_once()
+        self.assertEqual(source._acquire_dsa_mask.call_args.args[1], 30)
+        self.assertIsNotNone(state.background_reference)
+
     def test_detects_trim_start_half_second_before_contrast_onset(self) -> None:
         frames: list[np.ndarray] = []
         for index in range(60):

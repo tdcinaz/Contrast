@@ -23,6 +23,7 @@ from main import (
     VideoDropPlaceholder,
     VideoPanel,
 )
+from contrast_pipeline import subtract_fluoroscopy_background
 from stream_server import RawFrameRecorder, LiveStreamProcessor, StreamService, StreamSettings, create_http_server, load_stream_configuration
 
 
@@ -394,6 +395,79 @@ class StreamServerTests(unittest.TestCase):
         self.assertEqual(base_frame.shape, (160, 160))
         self.assertEqual(adjusted_frame.shape, (192, 192))
 
+    def test_live_dsa_waits_one_second_before_acquiring_mask(self) -> None:
+        stages = EnhancementStages(instances=(PipelineStage("background_subtraction", True),))
+        processor = LiveStreamProcessor(
+            stages,
+            EnhancementParameters(),
+            noise_sigma=10,
+            crop_sample_frames=3,
+            jpeg_quality=100,
+            auto_crop_enabled=False,
+            dsa_mask_delay_frames=3,
+        )
+        processor.begin_recording()
+        baseline = np.full((48, 64, 3), 150, dtype=np.uint8)
+        contrast = np.full((48, 64, 3), 100, dtype=np.uint8)
+
+        for _ in range(2):
+            output = processor.process_frame(baseline)
+            decoded = cv2.imdecode(np.frombuffer(output, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            self.assertLess(abs(float(decoded.mean()) - 150), 3)
+
+        output = processor.process_frame(baseline)
+        decoded = cv2.imdecode(np.frombuffer(output, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        self.assertGreater(float(decoded.mean()), 250)
+
+        output = processor.process_frame(contrast)
+        decoded = cv2.imdecode(np.frombuffer(output, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        expected = subtract_fluoroscopy_background(
+            np.full((48, 64), 100, dtype=np.uint8),
+            np.full((48, 64), 150, dtype=np.uint8),
+            0,
+        )
+        self.assertLess(abs(float(decoded.mean()) - float(expected.mean())), 3)
+
+    def test_live_dsa_resets_for_each_detected_recording(self) -> None:
+        stages = EnhancementStages(instances=(PipelineStage("background_subtraction", True),))
+        processor = LiveStreamProcessor(
+            stages,
+            EnhancementParameters(),
+            noise_sigma=10,
+            crop_sample_frames=3,
+            jpeg_quality=100,
+            auto_crop_enabled=False,
+            dsa_mask_delay_frames=1,
+        )
+        with TemporaryDirectory() as directory:
+            service = StreamService(
+                processor,
+                max_frame_bytes=1024 * 1024,
+                recorder=RawFrameRecorder(directory, fps=15.0),
+            )
+
+            def ingest_level(level: int) -> np.ndarray:
+                frame = np.full((48, 64, 3), level, dtype=np.uint8)
+                ok, encoded = cv2.imencode(".jpg", frame)
+                self.assertTrue(ok)
+                service.ingest(bytes(encoded))
+                _frame_id, _source, enhanced = service.latest_frames()
+                assert enhanced is not None
+                return cv2.imdecode(np.frombuffer(enhanced, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+
+            ingest_level(40)
+            first_mask = ingest_level(150)
+            self.assertGreater(float(first_mask.mean()), 250)
+            ingest_level(150)
+            ingest_level(150)
+            ingest_level(150)
+
+            ingest_level(70)
+            second_mask = ingest_level(180)
+            self.assertGreater(float(second_mask.mean()), 250)
+            contrast = ingest_level(120)
+            self.assertLess(float(contrast.mean()), 200)
+
     def test_raw_recorder_waits_for_three_identical_frames_before_cutting(self) -> None:
         processor = LiveStreamProcessor(
             EnhancementStages(),
@@ -562,6 +636,20 @@ class StreamServerTests(unittest.TestCase):
             }))
             with self.assertRaisesRegex(ValueError, "temporal_filter"):
                 load_stream_configuration(str(config_path))
+
+    def test_accepts_dsa_mask_subtraction_in_headless_configuration(self) -> None:
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "stream.json"
+            config_path.write_text(json.dumps({
+                "stream": {},
+                "pipeline": [{"key": "background_subtraction", "enabled": True, "controls": {}}],
+            }))
+
+            _settings, stages, _parameters, _strength, _auto_crop, _denoiser = load_stream_configuration(
+                str(config_path)
+            )
+
+            self.assertIn("background_subtraction", stages.enabled_stage_order)
 
     def test_accepts_non_local_means_in_headless_configuration(self) -> None:
         with TemporaryDirectory() as directory:

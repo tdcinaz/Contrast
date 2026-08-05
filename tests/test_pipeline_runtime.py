@@ -62,13 +62,13 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertFalse(definition.modifies_frame_data)
         self.assertFalse(definition.supports_live(EnhancementParameters()))
 
-    def test_manual_background_subtraction_removes_static_dark_background(self) -> None:
+    def test_dsa_mask_subtraction_shows_dark_contrast_on_light_background(self) -> None:
         background = np.array([[40, 75, 100, 200]], dtype=np.uint8)
         frame = np.array([[40, 75, 70, 230]], dtype=np.uint8)
 
         result = subtract_fluoroscopy_background(frame, background, 10)
 
-        np.testing.assert_array_equal(result, np.array([[0, 0, 20, 0]], dtype=np.uint8))
+        np.testing.assert_array_equal(result, np.array([[255, 255, 235, 255]], dtype=np.uint8))
         self.assertEqual(BUILTIN_STAGES.require("background_subtraction").execution_shape, ExecutionShape.SOURCE)
 
     def test_frame_executor_preserves_stage_order_and_instance_settings(self) -> None:

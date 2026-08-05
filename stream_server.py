@@ -20,6 +20,7 @@ from contrast_pipeline import (
     FrameContext,
     FramePipelineExecutor,
     PipelineStage,
+    subtract_fluoroscopy_background,
 )
 from main import (
     FrameDenoiser,
@@ -155,6 +156,8 @@ class LiveStreamProcessor:
         auto_crop_enabled: bool,
         denoiser: FrameDenoiser | None = None,
         auto_crop_size_offset: int = 0,
+        dsa_mask_delay_frames: int = 15,
+        dsa_darkening_threshold: int = 0,
     ) -> None:
         self.stages = stages
         self.parameters = parameters
@@ -164,11 +167,15 @@ class LiveStreamProcessor:
         self.auto_crop_enabled = auto_crop_enabled
         self.denoiser = denoiser
         self.auto_crop_size_offset = auto_crop_size_offset
+        self.dsa_mask_delay_frames = max(1, dsa_mask_delay_frames)
+        self.dsa_darkening_threshold = max(0, dsa_darkening_threshold)
         self.pipeline = FramePipelineExecutor()
         self._crop_samples: list[np.ndarray] = []
         self._auto_crop_rect = None
         self._crop_rect = None
         self._shape: tuple[int, int] | None = None
+        self._dsa_mask: np.ndarray | None = None
+        self._dsa_recording_frame_count: int | None = None
         self._lock = Lock()
         LOGGER.info(
             "Initialized live stream processor: auto_crop=%s crop_samples=%s jpeg_quality=%s denoiser=%s",
@@ -190,6 +197,7 @@ class LiveStreamProcessor:
         auto_crop_enabled: bool,
         denoiser: FrameDenoiser | None,
         auto_crop_size_offset: int,
+        dsa_darkening_threshold: int = 0,
     ) -> None:
         """Apply updated desktop controls before processing the next frame."""
         with self._lock:
@@ -200,6 +208,7 @@ class LiveStreamProcessor:
             self.auto_crop_enabled = auto_crop_enabled
             self.denoiser = denoiser
             self.auto_crop_size_offset = auto_crop_size_offset
+            self.dsa_darkening_threshold = max(0, dsa_darkening_threshold)
             if reset_crop:
                 self._crop_samples.clear()
                 self._auto_crop_rect = None
@@ -219,6 +228,17 @@ class LiveStreamProcessor:
             getattr(denoiser, "backend_id", "none"),
         )
 
+    def begin_recording(self) -> None:
+        """Begin a new DSA acquisition window for a newly detected recording."""
+        with self._lock:
+            self._dsa_mask = None
+            self._dsa_recording_frame_count = 0
+
+    def reset_dsa_recording(self) -> None:
+        with self._lock:
+            self._dsa_mask = None
+            self._dsa_recording_frame_count = None
+
     def process_jpeg(self, encoded: bytes) -> bytes | None:
         frame = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
@@ -234,6 +254,7 @@ class LiveStreamProcessor:
                 self._crop_samples.clear()
                 self._auto_crop_rect = None
                 self._crop_rect = None
+                self._dsa_mask = None
             if self._crop_rect is None and self.auto_crop_enabled:
                 self._crop_samples.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
                 if len(self._crop_samples) < self.crop_sample_frames:
@@ -256,9 +277,17 @@ class LiveStreamProcessor:
                 self._crop_rect = QRect(0, 0, width, height)
                 LOGGER.info("Using full-frame rectangle %s", self._crop_rect)
             enhanced = cv2.cvtColor(crop_frame(frame, self._crop_rect), cv2.COLOR_BGR2GRAY)
+            dsa_enabled = "background_subtraction" in self.stages.enabled_stage_order
+            if dsa_enabled:
+                enhanced = self._apply_live_dsa(enhanced)
+            pipeline_stages = self.stages
+            if dsa_enabled:
+                pipeline_stages = EnhancementStages(
+                    instances=tuple(stage for stage in self.stages.instances if stage.key != "background_subtraction")
+                )
             enhanced = self.pipeline.process(
                 enhanced,
-                self.stages,
+                pipeline_stages,
                 self.parameters,
                 FrameContext(
                     target_median=128.0,
@@ -271,6 +300,17 @@ class LiveStreamProcessor:
                 raise RuntimeError("Could not encode enhanced frame.")
             LOGGER.debug("Enhanced frame %sx%s into %s JPEG bytes", width, height, len(output))
             return bytes(output)
+
+    def _apply_live_dsa(self, frame: np.ndarray) -> np.ndarray:
+        if self._dsa_recording_frame_count is None:
+            return frame
+        self._dsa_recording_frame_count += 1
+        if self._dsa_mask is None and self._dsa_recording_frame_count >= self.dsa_mask_delay_frames:
+            self._dsa_mask = frame.copy()
+            LOGGER.info("Acquired live DSA mask after %s recording frames", self._dsa_recording_frame_count)
+        if self._dsa_mask is None:
+            return frame
+        return subtract_fluoroscopy_background(frame, self._dsa_mask, self.dsa_darkening_threshold)
 
 
 class RawFrameRecorder:
@@ -300,64 +340,65 @@ class RawFrameRecorder:
         self._phase = phase
         return self._next_recording_path()
 
-    def record(self, frame: np.ndarray) -> None:
+    def record(self, frame: np.ndarray) -> bool:
         if self._last_frame is None:
             self._last_frame = frame.copy()
-            return
+            return False
 
         if self._writer is not None:
             if np.array_equal(frame, self._last_frame):
                 self._identical_frame_count += 1
                 if self._identical_frame_count >= self.IDENTICAL_FRAME_CUTOFF:
                     self.close_recording()
-                    return
+                    return False
                 self._writer.write(frame)
-                return
+                return False
             if frame.shape[:2] != self._last_frame.shape[:2]:
                 self.close_recording()
                 self._candidate_frame = frame.copy()
                 self._last_frame = self._candidate_frame
-                return
+                return False
             self._writer.write(frame)
             self._last_frame = frame.copy()
             self._identical_frame_count = 1
-            return
+            return False
 
         if self._initial_frame_pending:
             self._initial_frame_pending = False
             if np.array_equal(frame, self._last_frame):
-                return
+                return False
             if frame.shape[:2] == self._last_frame.shape[:2]:
                 self._open_recording(self._last_frame)
                 assert self._writer is not None
                 self._writer.write(self._last_frame)
                 self._writer.write(frame)
                 self._last_frame = frame.copy()
-                return
+                return True
             self._candidate_frame = frame.copy()
             self._last_frame = self._candidate_frame
-            return
+            return False
 
         if self._candidate_frame is None:
             if np.array_equal(frame, self._last_frame):
-                return
+                return False
             self._candidate_frame = frame.copy()
             self._last_frame = self._candidate_frame
-            return
+            return False
 
         if np.array_equal(frame, self._candidate_frame):
             self._candidate_frame = None
-            return
+            return False
         if frame.shape[:2] != self._candidate_frame.shape[:2]:
             self._candidate_frame = frame.copy()
             self._last_frame = self._candidate_frame
-            return
+            return False
         self._open_recording(self._candidate_frame)
         assert self._writer is not None
         self._writer.write(self._candidate_frame)
         self._writer.write(frame)
         self._candidate_frame = None
         self._last_frame = frame.copy()
+        return True
 
     def close_recording(self) -> None:
         if self._writer is None:
@@ -433,7 +474,8 @@ class StreamService:
             raise ValueError("Ingest body is not a valid JPEG frame.")
         with self._ingest_lock:
             if self.recorder is not None and self.recording_enabled:
-                self.recorder.record(frame)
+                if self.recorder.record(frame):
+                    self.processor.begin_recording()
             enhanced = self.processor.process_frame(frame)
             with self._condition:
                 self._ingested += 1
@@ -460,6 +502,7 @@ class StreamService:
             self.recording_enabled = enabled
             if not enabled and self.recorder is not None:
                 self.recorder.reset()
+                self.processor.reset_dsa_recording()
 
     def next_frame(self, last_frame_id: int, timeout: float = 15.0) -> tuple[int, bytes | None]:
         with self._condition:

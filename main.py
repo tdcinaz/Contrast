@@ -1991,6 +1991,7 @@ class VideoPanel(QFrame):
         background_level: int = 0,
     ) -> SourcePipelineState:
         temporal_alignment_enabled = temporal_alignment_enabled and not self.live_input
+        background_subtraction_enabled = background_subtraction_enabled and not self.live_input
         full_rect = self._full_frame_rect()
         next_crop_rect = full_rect
         source_stage_count = (
@@ -2060,12 +2061,20 @@ class VideoPanel(QFrame):
 
         background_reference = None
         if background_subtraction_enabled:
-            background_reference = self._sample_background_reference(
-                next_crop_rect,
-                next_trim_start,
-                lambda done, total: report("Sampling fluoroscopy background", done, total),
+            pre_injection_trim_start = detected_trim_start
+            if pre_injection_trim_start is None:
+                gray_frames = self._sample_cropped_gray_frames(next_crop_rect)
+                pre_injection_trim_start = detect_pre_injection_trim_start(gray_frames, self.info.fps)
+            mask_end_frame = min(
+                self.info.frame_count,
+                pre_injection_trim_start + round(self.info.fps * 0.5),
             )
-            report("Sampling fluoroscopy background", 1.0, 1.0)
+            background_reference = self._acquire_dsa_mask(
+                next_crop_rect,
+                mask_end_frame,
+                lambda done, total: report("Acquiring DSA mask", done, total),
+            )
+            report("Acquiring DSA mask", 1.0, 1.0)
             completed_stages += 1
 
         return SourcePipelineState(
@@ -2168,19 +2177,19 @@ class VideoPanel(QFrame):
             capture.release()
         return gray_frames
 
-    def _sample_background_reference(
+    def _acquire_dsa_mask(
         self,
         crop_rect: QRect,
-        trim_start: int,
+        mask_end_frame: int,
         progress_callback: Callable[[int, int], bool] | None = None,
     ) -> np.ndarray | None:
-        sample_count = min(
-            self.info.frame_count,
-            max(3, min(round(self.info.fps * 2), trim_start + 1)),
-        )
+        sample_count = min(max(3, round(self.info.fps)), max(0, mask_end_frame))
+        if sample_count < 3:
+            return None
         capture = cv2.VideoCapture(str(self.path))
         samples: list[np.ndarray] = []
         try:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, mask_end_frame - sample_count)
             for frame_index in range(sample_count):
                 ok, frame = capture.read()
                 if not ok:
@@ -2192,7 +2201,7 @@ class VideoPanel(QFrame):
             capture.release()
         if not samples:
             return None
-        return np.percentile(np.stack(samples, axis=0), 75.0, axis=0).astype(np.uint8)
+        return np.median(np.stack(samples, axis=0), axis=0).astype(np.uint8)
 
     def _subtract_background(self, gray: np.ndarray) -> np.ndarray:
         if not self.background_subtraction_enabled or self.background_reference is None:
@@ -3783,6 +3792,7 @@ class ContrastWindow(QMainWindow):
             settings.jpeg_quality,
             self._has_enabled_stage("auto_crop"),
             auto_crop_size_offset=self.auto_crop_size_offset_spin.value(),
+            dsa_mask_delay_frames=round(settings.recording_fps),
         )
         service = StreamService(
             processor,
@@ -3817,11 +3827,19 @@ class ContrastWindow(QMainWindow):
             return
         parameters = self.enhancement_parameters()
         configured_stages = self.enhancement_stages()
+        dsa_enabled = self.background_subtraction_stage_check.isChecked()
         live_stages = EnhancementStages(
             instances=tuple(
-                stage
-                for stage in configured_stages.instances
-                if not stage.enabled or BUILTIN_STAGES.require(stage.key).supports_live(stage.parameters or parameters)
+                (
+                    PipelineStage("background_subtraction", True, parameters)
+                    if dsa_enabled
+                    else ()
+                )
+                + tuple(
+                    stage
+                    for stage in configured_stages.instances
+                    if not stage.enabled or BUILTIN_STAGES.require(stage.key).supports_live(stage.parameters or parameters)
+                )
             )
         )
         processor.configure(
@@ -3831,6 +3849,7 @@ class ContrastWindow(QMainWindow):
             self._has_enabled_stage("auto_crop"),
             self._live_denoiser_for(live_stages),
             self.auto_crop_size_offset_spin.value(),
+            self.background_video_one_level_spin.value(),
         )
 
     def _set_video_controls_enabled(self, enabled: bool) -> None:
@@ -3874,7 +3893,6 @@ class ContrastWindow(QMainWindow):
     def _set_live_incompatible_stages_enabled(self, enabled: bool) -> None:
         for stage_key in (
             "temporal_alignment",
-            "background_subtraction",
             "brightness_stabilization",
             "roi_extraction",
             "temporal_filter",
@@ -4754,7 +4772,7 @@ class ContrastWindow(QMainWindow):
         )
         self.background_subtraction_stage_drawer = StageDrawer(
             "background_subtraction",
-            "Manual background subtraction",
+            "DSA mask subtraction",
             4,
         )
         self.brightness_stage_drawer = StageDrawer(
@@ -5505,7 +5523,7 @@ class ContrastWindow(QMainWindow):
         self.temporal_alignment_stage_drawer.content_layout.addWidget(self.comparison_sync_offset_row)
 
         background_hint = QLabel(
-            "Builds a pre-injection reference for each video and keeps only darkening caused by injected contrast."
+            "Acquires a median mask immediately before injection and subtracts subsequent frames from it."
         )
         background_hint.setObjectName("subtleLabel")
         background_hint.setWordWrap(True)
@@ -7915,6 +7933,7 @@ def run_headless(config_path: Path) -> None:
         settings.jpeg_quality,
         auto_crop_enabled,
         denoiser,
+        dsa_mask_delay_frames=round(settings.recording_fps),
     )
     service = StreamService(
         processor,
