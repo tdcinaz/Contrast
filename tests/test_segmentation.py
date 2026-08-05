@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
@@ -13,6 +14,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QFrame, QSpinBox
 
 import main
@@ -43,7 +45,7 @@ from main import (
 class SegmentationTests(unittest.TestCase):
     def test_manual_roi_selection_bypasses_auto_detection_and_has_a_distinct_cache_token(self) -> None:
         automatic = EnhancementParameters()
-        manual = EnhancementParameters(roi_mode="manual", roi_manual_rect=(12, 18, 24, 30))
+        manual = EnhancementParameters(roi_mode="manual", roi_manual_circle=(24, 30, 12))
 
         self.assertNotEqual(
             main.BUILTIN_STAGES.require("roi_extraction").cache_token(automatic),
@@ -54,15 +56,16 @@ class SegmentationTests(unittest.TestCase):
 
         self.assertIsNotNone(selection)
         assert selection is not None
-        self.assertEqual(selection.rect, QRect(12, 18, 24, 30))
-        self.assertTrue(np.all(selection.mask))
+        self.assertEqual(selection.rect, QRect(12, 18, 25, 25))
+        self.assertTrue(selection.mask[12, 12])
+        self.assertFalse(selection.mask[0, 0])
         detect.assert_not_called()
 
     def test_comparison_roi_modes_produce_independent_panel_parameters(self) -> None:
         QApplication.instance() or QApplication([])
         window = ContrastWindow()
         self.addCleanup(window.close)
-        window._manual_roi_rects = [QRect(4, 6, 20, 24), None]
+        window._manual_roi_circles = [(14, 18, 10), None]
         window.roi_mode_combos[0].setCurrentIndex(window.roi_mode_combos[0].findData("manual"))
         window.roi_mode_combos[1].setCurrentIndex(window.roi_mode_combos[1].findData("auto"))
 
@@ -70,9 +73,38 @@ class SegmentationTests(unittest.TestCase):
         post = window._roi_parameters_for_panel(1)
 
         self.assertEqual(pre.roi_mode, "manual")
-        self.assertEqual(pre.roi_manual_rect, (4, 6, 20, 24))
+        self.assertEqual(pre.roi_manual_circle, (14, 18, 10))
         self.assertEqual(post.roi_mode, "auto")
-        self.assertIsNone(post.roi_manual_rect)
+        self.assertIsNone(post.roi_manual_circle)
+
+    def test_manual_roi_drag_uses_press_position_as_circle_center(self) -> None:
+        QApplication.instance() or QApplication([])
+        display = main.VideoDisplay("Video", QColor("#ffffff"))
+        self.addCleanup(display.close)
+        display.set_comparison_enabled(False)
+        display.resize(200, 200)
+        display.set_frame(np.zeros((100, 100, 3), dtype=np.uint8))
+        display.show()
+        QApplication.processEvents()
+
+        circles: list[tuple[int, int, int]] = []
+        display.roiDrawn.connect(circles.append)
+        center = display._display_rect.center()
+        end = center + main.QPoint(30, 0)
+        expected_center = display._display_to_frame_point(center)
+        expected_end = display._display_to_frame_point(end)
+        expected_radius = round(math.hypot(expected_end.x() - expected_center.x(), expected_end.y() - expected_center.y()))
+
+        QTest.mousePress(display, main.Qt.MouseButton.LeftButton, pos=center)
+        QTest.mouseMove(display, end)
+        QTest.mouseRelease(display, main.Qt.MouseButton.LeftButton, pos=end)
+
+        self.assertEqual(circles, [(expected_center.x(), expected_center.y(), expected_radius)])
+        mask = display.roi_mask()
+        self.assertIsNotNone(mask)
+        assert mask is not None
+        self.assertTrue(mask[expected_radius, expected_radius])
+        self.assertFalse(mask[0, 0])
 
     def test_play_restarts_file_playback_at_the_final_frame(self) -> None:
         QApplication.instance() or QApplication([])

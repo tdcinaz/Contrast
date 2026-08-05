@@ -1121,13 +1121,16 @@ def detect_aneurysm_roi(
 
 def extract_aneurysm_roi(gray_frames: list[np.ndarray], fps: float, parameters: EnhancementParameters) -> ROISelection | None:
     if parameters.roi_mode == "manual":
-        rect_values = parameters.roi_manual_rect
-        if rect_values is None:
+        circle_values = parameters.roi_manual_circle
+        if circle_values is None:
             return None
-        rect = QRect(*rect_values).normalized()
-        if rect.width() < 4 or rect.height() < 4:
+        center_x, center_y, radius = circle_values
+        if radius < 2:
             return None
-        return ROISelection(rect, np.ones((rect.height(), rect.width()), dtype=bool))
+        rect = QRect(center_x - radius, center_y - radius, 2 * radius + 1, 2 * radius + 1)
+        mask = np.zeros((rect.height(), rect.width()), dtype=np.uint8)
+        cv2.circle(mask, (radius, radius), radius, 1, thickness=-1)
+        return ROISelection(rect, mask.astype(bool))
     return detect_aneurysm_roi(
         gray_frames,
         fps,
@@ -1326,7 +1329,7 @@ def roi_mean(gray: np.ndarray, roi: QRect, roi_mask: np.ndarray | None = None) -
 
 class VideoDisplay(QLabel):
     roiChanged = Signal(QRect)
-    roiDrawn = Signal(QRect)
+    roiDrawn = Signal(object)
 
     def __init__(self, title: str, color: QColor, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1502,7 +1505,7 @@ class VideoDisplay(QLabel):
         self._drag_origin = point
         self._roi_mask = None
         frame_point = self._display_to_frame_point(point)
-        self._roi = QRect(frame_point, frame_point)
+        self._roi = QRect(frame_point.x(), frame_point.y(), 1, 1)
         self.update()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: ANN001
@@ -1514,17 +1517,21 @@ class VideoDisplay(QLabel):
         point.setY(max(display_rect.top(), min(point.y(), display_rect.bottom())))
         start = self._display_to_frame_point(self._drag_origin)
         end = self._display_to_frame_point(point)
-        self._roi = QRect(start, end).normalized()
+        max_radius = min(start.x(), start.y(), self.frame_size[0] - 1 - start.x(), self.frame_size[1] - 1 - start.y())
+        radius = min(max_radius, round(math.hypot(end.x() - start.x(), end.y() - start.y())))
+        self._roi = QRect(start.x() - radius, start.y() - radius, 2 * radius + 1, 2 * radius + 1)
+        self._roi_mask = np.zeros((self._roi.height(), self._roi.width()), dtype=np.uint8)
+        cv2.circle(self._roi_mask, (radius, radius), radius, 1, thickness=-1)
+        self._roi_mask = self._roi_mask.astype(bool)
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
         if event.button() != Qt.MouseButton.LeftButton or self._drag_origin is None:
             return
         self._drag_origin = None
-        if self._roi and self._roi.width() >= 4 and self._roi.height() >= 4:
-            self._roi_mask = np.ones((self._roi.height(), self._roi.width()), dtype=bool)
+        if self._roi and self._roi.width() >= 5:
             self.roiChanged.emit(QRect(self._roi))
-            self.roiDrawn.emit(QRect(self._roi))
+            self.roiDrawn.emit((self._roi.center().x(), self._roi.center().y(), self._roi.width() // 2))
         else:
             self._roi = None
             self._roi_mask = None
@@ -1878,7 +1885,7 @@ class VideoDropPlaceholder(QFrame):
 
 class VideoPanel(QFrame):
     roiChanged = Signal()
-    roiDrawn = Signal(QRect)
+    roiDrawn = Signal(object)
     PANEL_MARGIN = 14
     PANEL_SPACING = 10
     TITLE_HEIGHT = 30
@@ -3744,7 +3751,7 @@ class ContrastWindow(QMainWindow):
         self._enhancement_stage_messages = ["Waiting", "Waiting"]
         self._enhancement_message = "Preparing enhanced videos..."
         self._loading_config = False
-        self._manual_roi_rects: list[QRect | None] = [None, None]
+        self._manual_roi_circles: list[tuple[int, int, int] | None] = [None, None]
         self.enhancement_poll_timer = QTimer(self)
         self.enhancement_poll_timer.setInterval(30)
         self.enhancement_poll_timer.timeout.connect(self._poll_enhancement)
@@ -3977,7 +3984,7 @@ class ContrastWindow(QMainWindow):
             self.panels.append(panel)
         self.pre_panel = self.panels[0] if self.panels else None
         self.post_panel = self.panels[1] if len(self.panels) > 1 else None
-        self._manual_roi_rects = [None] * len(self.panels)
+        self._manual_roi_circles = [None] * len(self.panels)
         self.active_mode = MODE_LIVE if live_input else (MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE)
         self._update_temporal_alignment_controls()
         self.open_pre_action.setText(f"Open {self.pre_panel.label.lower()} video..." if self.pre_panel else "Open video 1...")
@@ -5587,7 +5594,7 @@ class ContrastWindow(QMainWindow):
             mode_combo.addItem("Automatic", "auto")
             mode_combo.addItem("Manual", "manual")
             mode_combo.setObjectName(f"roiVideo{index + 1}Mode")
-            mode_combo.setToolTip("Draw on the enhanced video to switch this video to manual ROI selection")
+            mode_combo.setToolTip("Drag from the circle center on the enhanced video to set a manual ROI radius")
             mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
             mode_layout.addWidget(mode_label)
             mode_layout.addWidget(mode_combo)
@@ -6571,11 +6578,8 @@ class ContrastWindow(QMainWindow):
     def _roi_parameters_for_panel(self, panel_index: int) -> EnhancementParameters:
         parameters = self.enhancement_parameters()
         mode_combo = self.roi_mode_combos[min(panel_index, len(self.roi_mode_combos) - 1)]
-        manual_rect = self._manual_roi_rects[panel_index] if panel_index < len(self._manual_roi_rects) else None
-        rect_values = None if manual_rect is None else (
-            manual_rect.x(), manual_rect.y(), manual_rect.width(), manual_rect.height()
-        )
-        return replace(parameters, roi_mode=str(mode_combo.currentData()), roi_manual_rect=rect_values)
+        manual_circle = self._manual_roi_circles[panel_index] if panel_index < len(self._manual_roi_circles) else None
+        return replace(parameters, roi_mode=str(mode_combo.currentData()), roi_manual_circle=manual_circle)
 
     def _stages_for_roi_parameters(
         self,
@@ -6590,10 +6594,15 @@ class ContrastWindow(QMainWindow):
             ),
         )
 
-    def _on_manual_roi_drawn(self, panel_index: int, roi: QRect) -> None:
-        if panel_index >= len(self._manual_roi_rects):
+    def _on_manual_roi_drawn(self, panel_index: int, circle: object) -> None:
+        if (
+            panel_index >= len(self._manual_roi_circles)
+            or not isinstance(circle, tuple)
+            or len(circle) != 3
+            or not all(isinstance(value, int) and not isinstance(value, bool) for value in circle)
+        ):
             return
-        self._manual_roi_rects[panel_index] = QRect(roi)
+        self._manual_roi_circles[panel_index] = circle
         mode_combo = self.roi_mode_combos[min(panel_index, len(self.roi_mode_combos) - 1)]
         mode_combo.setCurrentIndex(mode_combo.findData("manual"))
         self.statusBar().showMessage(f"{self.panels[panel_index].label} ROI set to manual selection.")
@@ -6601,11 +6610,11 @@ class ContrastWindow(QMainWindow):
     def _roi_settings_data(self) -> list[dict[str, object]]:
         settings: list[dict[str, object]] = []
         for index, mode_combo in enumerate(self.roi_mode_combos):
-            rect = self._manual_roi_rects[index] if index < len(self._manual_roi_rects) else None
+            circle = self._manual_roi_circles[index] if index < len(self._manual_roi_circles) else None
             settings.append(
                 {
                     "mode": str(mode_combo.currentData()),
-                    "manual_rect": None if rect is None else [rect.x(), rect.y(), rect.width(), rect.height()],
+                    "manual_circle": None if circle is None else list(circle),
                 }
             )
         return settings
@@ -6624,6 +6633,15 @@ class ContrastWindow(QMainWindow):
                     combo.setCurrentIndex(combo.findData(mode))
                 finally:
                     combo.blockSignals(False)
+            circle_values = value.get("manual_circle")
+            if (
+                isinstance(circle_values, list)
+                and len(circle_values) == 3
+                and all(isinstance(item, int) and not isinstance(item, bool) for item in circle_values)
+            ):
+                center_x, center_y, radius = circle_values
+                self._manual_roi_circles[index] = (center_x, center_y, radius) if radius >= 2 else None
+                continue
             rect_values = value.get("manual_rect")
             if (
                 isinstance(rect_values, list)
@@ -6631,7 +6649,8 @@ class ContrastWindow(QMainWindow):
                 and all(isinstance(item, int) and not isinstance(item, bool) for item in rect_values)
             ):
                 rect = QRect(*rect_values).normalized()
-                self._manual_roi_rects[index] = rect if rect.width() >= 4 and rect.height() >= 4 else None
+                radius = min(rect.width(), rect.height()) // 2
+                self._manual_roi_circles[index] = (rect.center().x(), rect.center().y(), radius) if radius >= 2 else None
 
     def _on_background_subtraction_stage_toggled(self, enabled: bool) -> None:
         if getattr(self, "_syncing_background_subtraction", False):

@@ -22,7 +22,7 @@ class EnhancementParameters:
     adjustments_gamma: float = 1.0
     smoothing_sigma_x: float = 0.55
     roi_mode: str = "auto"
-    roi_manual_rect: tuple[int, int, int, int] | None = None
+    roi_manual_circle: tuple[int, int, int] | None = None
     roi_softening_enabled: bool = False
     roi_softening_radius_ratio: float = 0.12
     roi_softening_threshold: float = 0.10
