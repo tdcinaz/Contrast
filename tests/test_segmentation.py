@@ -7,7 +7,7 @@ from queue import SimpleQueue
 from threading import Event
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -72,6 +72,64 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(pre.roi_manual_rect, (4, 6, 20, 24))
         self.assertEqual(post.roi_mode, "auto")
         self.assertIsNone(post.roi_manual_rect)
+
+    def test_play_restarts_file_playback_at_the_final_frame(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        panel = SimpleNamespace(enhance_display=False, seek=Mock())
+        window.panels = [panel]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        window.max_frame = 3
+        window.current_frame_index = 3
+
+        window.play()
+
+        self.assertEqual(window.current_frame_index, 0)
+        panel.seek.assert_called_once_with(0)
+        self.assertTrue(window.is_playing)
+
+    def test_loop_rewinds_without_pausing_at_the_final_frame(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        panel = SimpleNamespace(enhance_display=False, seek=Mock())
+        window.panels = [panel]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        window.max_frame = 3
+        window.current_frame_index = 3
+        window.is_playing = True
+        window.loop_check.setChecked(True)
+
+        window.advance_frame()
+
+        self.assertEqual(window.current_frame_index, 0)
+        panel.seek.assert_called_once_with(0)
+        self.assertTrue(window.is_playing)
+
+    def test_non_looping_playback_pauses_at_the_final_frame(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window.panels = [SimpleNamespace(enhance_display=False, seek=Mock())]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        window.max_frame = 3
+        window.current_frame_index = 3
+        window.is_playing = True
+
+        window.advance_frame()
+
+        self.assertFalse(window.is_playing)
+
+    def test_config_serializes_loop_preference(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+
+        self.assertFalse(window._config_data()["view"]["loop"])
+        window.loop_check.setChecked(True)
+
+        self.assertTrue(window._config_data()["view"]["loop"])
 
     def test_comparison_report_title_uses_shared_device_and_test_identifier(self) -> None:
         self.assertEqual(

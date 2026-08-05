@@ -4431,6 +4431,9 @@ class ContrastWindow(QMainWindow):
         self.speed_label.setObjectName("timeLabel")
         self.update_speed_label()
 
+        self.loop_check = QCheckBox("Loop")
+        self.loop_check.setToolTip("Restart playback from the first frame when the video ends")
+
         self.time_label = QLabel()
         self.time_label.setObjectName("timeLabel")
 
@@ -4483,18 +4486,18 @@ class ContrastWindow(QMainWindow):
         live_recording_layout.addWidget(self.live_recording_name_label)
         live_recording_layout.addWidget(self.live_export_toggle)
 
-        self.compare_view_check = QCheckBox("Show source")
+        self.compare_view_check = QCheckBox("Source")
         self.compare_view_check.setChecked(False)
         self.compare_view_check.setToolTip("Show source beside enhanced output")
         self.compare_view_check.toggled.connect(self.on_compare_view_toggled)
 
-        self.temporal_change_view_check = QCheckBox("Show pixel change")
+        self.temporal_change_view_check = QCheckBox("Heatmap")
         self.temporal_change_view_check.setChecked(False)
         self.temporal_change_view_check.setEnabled(False)
         self.temporal_change_view_check.setToolTip("Show the temporal pixel-change heatmap beside enhanced output")
         self.temporal_change_view_check.toggled.connect(self.on_temporal_change_view_toggled)
 
-        self.overlay_mask_check = QCheckBox("Mask overlay")
+        self.overlay_mask_check = QCheckBox("ROI")
         self.overlay_mask_check.setChecked(True)
         self.overlay_mask_check.setEnabled(False)
         self.overlay_mask_check.setToolTip("Show segmentation masks over enhanced video")
@@ -4609,6 +4612,7 @@ class ContrastWindow(QMainWindow):
         playback_layout.addWidget(self.speed_control_label)
         playback_layout.addWidget(self.speed_slider)
         playback_layout.addWidget(self.speed_label)
+        playback_layout.addWidget(self.loop_check)
         playback_layout.addWidget(self.time_label)
         playback_layout.addWidget(self.live_recording_controls)
         self.live_recording_spacer = QWidget()
@@ -4625,6 +4629,7 @@ class ContrastWindow(QMainWindow):
             self.speed_control_label,
             self.speed_slider,
             self.speed_label,
+            self.loop_check,
             self.time_label,
         )
 
@@ -6000,6 +6005,8 @@ class ContrastWindow(QMainWindow):
             self.play()
 
     def play(self) -> None:
+        if self.active_mode != MODE_LIVE and self.panels and self.current_frame_index >= self.max_frame:
+            self.set_frame_index(0)
         self.is_playing = True
         self.play_button.setText("")
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
@@ -6037,6 +6044,9 @@ class ContrastWindow(QMainWindow):
         live_input = self.active_mode == MODE_LIVE
         if not live_input and self.current_frame_index >= self.max_frame:
             if self._enhancement_future is not None:
+                return
+            if self.loop_check.isChecked():
+                self.set_frame_index(0)
                 return
             self.pause()
             return
@@ -7519,6 +7529,7 @@ class ContrastWindow(QMainWindow):
                 "compare_enabled": self.compare_view_check.isChecked(),
                 "mask_overlay_enabled": self.overlay_mask_check.isChecked(),
                 "playback_speed": self.speed_slider.value(),
+                "loop": self.loop_check.isChecked(),
                 "frame_index": self.current_frame_index,
                 "roi_settings": self._roi_settings_data(),
             },
@@ -7751,6 +7762,7 @@ class ContrastWindow(QMainWindow):
                 playback_speed = view.get("playback_speed", 100)
                 if isinstance(playback_speed, int):
                     self.speed_slider.setValue(playback_speed)
+                self.loop_check.setChecked(bool(view.get("loop", False)))
             analysis = config.get("analysis", {})
             if isinstance(analysis, dict):
                 threshold = analysis.get("clearance_threshold")
