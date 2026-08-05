@@ -1017,6 +1017,9 @@ def detect_aneurysm_roi(
     if len(gray_frames) < 3:
         return None
 
+    detection_frame_count = max(3, round(max(1.0, fps) * 10.0))
+    gray_frames = gray_frames[:detection_frame_count]
+
     height, width = gray_frames[0].shape
     if height < 16 or width < 16 or any(frame.shape != (height, width) for frame in gray_frames):
         return None

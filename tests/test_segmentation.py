@@ -549,6 +549,23 @@ class SegmentationTests(unittest.TestCase):
         self.assertFalse(roi.contains(180, 88))
         self.assertLess(abs(roi.width() - roi.height()), 12)
 
+    def test_aneurysm_detection_ignores_late_video_distractors(self) -> None:
+        frames: list[np.ndarray] = []
+        for index in range(160):
+            frame = np.full((120, 160), 180, dtype=np.uint8)
+            if 6 <= index < 60:
+                cv2.circle(frame, (48, 60), 18, 60, thickness=-1)
+            if index >= 110:
+                cv2.circle(frame, (112, 60), 24, 20, thickness=-1)
+            frames.append(frame)
+
+        roi = detect_aneurysm_roi(frames, fps=10.0)
+
+        self.assertIsNotNone(roi)
+        assert roi is not None
+        self.assertTrue(roi.contains(48, 60))
+        self.assertFalse(roi.contains(112, 60))
+
     def test_analysis_uses_roi_mask_instead_of_full_bounding_box(self) -> None:
         detection_frames: list[np.ndarray] = []
         for index in range(8):
