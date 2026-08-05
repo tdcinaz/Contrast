@@ -138,7 +138,23 @@ def _draw_report_image(
             painter.drawPolygon(QPolygon([QPoint(round(image_rect.x() + (roi.x() + int(point[0][0])) * x_scale), round(image_rect.y() + (roi.y() + int(point[0][1])) * y_scale)) for point in contour]))
 
 
-def render_comparison_report(path: Path, panels: list[VideoPanel], results: dict[str, AnalysisResult], frame_index: int) -> bool:
+def _print_optimized_heatmap(heatmap: np.ndarray) -> np.ndarray:
+    grayscale = cv2.cvtColor(heatmap, cv2.COLOR_BGR2GRAY)
+    low, high = np.percentile(grayscale, (2.0, 98.0))
+    if high > low:
+        grayscale = np.clip((grayscale.astype(np.float32) - low) * (255.0 / (high - low)), 0, 255).astype(np.uint8)
+    grayscale = cv2.LUT(grayscale, np.asarray([round(255.0 * (value / 255.0) ** 0.75) for value in range(256)], dtype=np.uint8))
+    return cv2.cvtColor(grayscale, cv2.COLOR_GRAY2BGR)
+
+
+def render_comparison_report(
+    path: Path,
+    panels: list[VideoPanel],
+    results: dict[str, AnalysisResult],
+    frame_index: int,
+    *,
+    print_optimized: bool = True,
+) -> bool:
     if len(panels) != 2 or not results:
         return False
     frames = [_report_frame(panel, frame_index) for panel in panels]
@@ -182,7 +198,7 @@ def render_comparison_report(path: Path, panels: list[VideoPanel], results: dict
         x = margin + index * (image_width + image_gap)
         _draw_report_image(
             painter,
-            cast(np.ndarray, heatmap),
+            _print_optimized_heatmap(cast(np.ndarray, heatmap)) if print_optimized else cast(np.ndarray, heatmap),
             None,
             None,
             panel.color,
@@ -7463,8 +7479,24 @@ class ContrastWindow(QMainWindow):
         report_path = Path(path)
         if report_path.suffix.lower() != ".pdf":
             report_path = report_path.with_suffix(".pdf")
-        if render_comparison_report(report_path, self.panels, self.results, self.current_frame_index):
-            self.statusBar().showMessage(f"Exported comparison report to {report_path}")
+        screen_report_path = report_path.with_name(f"{report_path.stem}_screen.pdf")
+        print_report_path = report_path.with_name(f"{report_path.stem}_print.pdf")
+        screen_exported = render_comparison_report(
+            screen_report_path,
+            self.panels,
+            self.results,
+            self.current_frame_index,
+            print_optimized=False,
+        )
+        print_exported = render_comparison_report(
+            print_report_path,
+            self.panels,
+            self.results,
+            self.current_frame_index,
+            print_optimized=True,
+        )
+        if screen_exported and print_exported:
+            self.statusBar().showMessage(f"Exported screen and print comparison reports to {report_path.parent}")
         else:
             self.statusBar().showMessage("Comparison report export needs enhanced frames, heatmaps, and ROI residence results.")
 

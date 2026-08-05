@@ -223,6 +223,16 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual([target.size() for target in heatmap_targets], [target.size() for target in frame_targets])
         self.assertGreater(heatmap_targets[0].y(), frame_targets[0].y())
 
+    def test_report_heatmap_uses_print_friendly_grayscale_without_changing_gui_heatmap(self) -> None:
+        heatmap = np.asarray([[[20, 30, 240], [240, 220, 30]]], dtype=np.uint8)
+
+        optimized = main._print_optimized_heatmap(heatmap)
+
+        np.testing.assert_array_equal(heatmap, np.asarray([[[20, 30, 240], [240, 220, 30]]], dtype=np.uint8))
+        np.testing.assert_array_equal(optimized[..., 0], optimized[..., 1])
+        np.testing.assert_array_equal(optimized[..., 1], optimized[..., 2])
+        self.assertNotEqual(int(optimized[0, 0, 0]), int(optimized[0, 1, 0]))
+
     def test_pdf_export_generates_missing_heatmaps_before_rendering(self) -> None:
         panels = [
             SimpleNamespace(temporal_change_heatmap=None),
@@ -245,7 +255,11 @@ class SegmentationTests(unittest.TestCase):
             ContrastWindow.export_pdf_report(window)
 
         window.run_temporal_change_heatmap.assert_called_once_with()
-        render_report.assert_called_once_with(Path("comparison.pdf"), panels, window.results, 3)
+        self.assertEqual(render_report.call_count, 2)
+        self.assertEqual(render_report.call_args_list[0].args, (Path("comparison_screen.pdf"), panels, window.results, 3))
+        self.assertEqual(render_report.call_args_list[0].kwargs, {"print_optimized": False})
+        self.assertEqual(render_report.call_args_list[1].args, (Path("comparison_print.pdf"), panels, window.results, 3))
+        self.assertEqual(render_report.call_args_list[1].kwargs, {"print_optimized": True})
 
     def test_reordered_roi_analysis_drawer_reflows_when_toggled(self) -> None:
         app = QApplication.instance() or QApplication([])
