@@ -175,7 +175,9 @@ class LiveStreamProcessor:
         self._crop_rect = None
         self._shape: tuple[int, int] | None = None
         self._dsa_mask: np.ndarray | None = None
-        self._dsa_recording_frame_count: int | None = None
+        self._dsa_recording_frame_count: int | None = (
+            0 if "background_subtraction" in stages.enabled_stage_order else None
+        )
         self._lock = Lock()
         LOGGER.info(
             "Initialized live stream processor: auto_crop=%s crop_samples=%s jpeg_quality=%s denoiser=%s",
@@ -202,6 +204,8 @@ class LiveStreamProcessor:
         """Apply updated desktop controls before processing the next frame."""
         with self._lock:
             reset_crop = self.auto_crop_enabled != auto_crop_enabled
+            dsa_was_enabled = "background_subtraction" in self.stages.enabled_stage_order
+            dsa_enabled = "background_subtraction" in stages.enabled_stage_order
             self.stages = stages
             self.parameters = parameters
             self.noise_sigma = noise_sigma
@@ -221,6 +225,12 @@ class LiveStreamProcessor:
                     height,
                     self.auto_crop_size_offset,
                 )
+            if dsa_enabled and not dsa_was_enabled:
+                self._dsa_mask = None
+                self._dsa_recording_frame_count = 0
+            elif not dsa_enabled:
+                self._dsa_mask = None
+                self._dsa_recording_frame_count = None
         LOGGER.info(
             "Updated live stream pipeline: auto_crop=%s enabled_stages=%s denoiser=%s",
             auto_crop_enabled,
@@ -502,7 +512,6 @@ class StreamService:
             self.recording_enabled = enabled
             if not enabled and self.recorder is not None:
                 self.recorder.reset()
-                self.processor.reset_dsa_recording()
 
     def next_frame(self, last_frame_id: int, timeout: float = 15.0) -> tuple[int, bytes | None]:
         with self._condition:

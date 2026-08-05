@@ -3834,7 +3834,7 @@ class ContrastWindow(QMainWindow):
         live_stages = EnhancementStages(
             instances=tuple(
                 (
-                    PipelineStage("background_subtraction", True, parameters)
+                    (PipelineStage("background_subtraction", True, parameters),)
                     if dsa_enabled
                     else ()
                 )

@@ -169,6 +169,24 @@ class StreamServerTests(unittest.TestCase):
         self.assertIn("Network live stream active", window.statusBar().currentMessage())
         app.quit()
 
+    def test_live_pipeline_refresh_includes_enabled_dsa_stage(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        processor = MagicMock()
+        window.background_subtraction_stage_check.setChecked(True)
+        window._stream_processor = processor
+
+        window._refresh_desktop_stream_pipeline()
+
+        configured_stages = processor.configure.call_args.args[0]
+        self.assertEqual(configured_stages.instances[0].key, "background_subtraction")
+        self.assertTrue(configured_stages.instances[0].enabled)
+
+        window.close()
+        app.quit()
+
     def test_live_mode_shows_recording_name_controls(self) -> None:
         from PySide6.QtWidgets import QApplication
 
@@ -594,6 +612,40 @@ class StreamServerTests(unittest.TestCase):
             service.close()
 
             self.assertEqual(len(recorder.completed_paths), 1)
+
+    def test_live_dsa_acquires_mask_when_export_is_disabled(self) -> None:
+        stages = EnhancementStages(instances=(PipelineStage("background_subtraction", True),))
+        processor = LiveStreamProcessor(
+            stages,
+            EnhancementParameters(),
+            noise_sigma=10,
+            crop_sample_frames=3,
+            jpeg_quality=100,
+            auto_crop_enabled=False,
+            dsa_mask_delay_frames=2,
+        )
+        with TemporaryDirectory() as directory:
+            recorder = RawFrameRecorder(directory, fps=15.0)
+            service = StreamService(processor, max_frame_bytes=1024 * 1024, recorder=recorder)
+            service.set_recording_enabled(False)
+            baseline = np.full((48, 64, 3), 150, dtype=np.uint8)
+            contrast = np.full((48, 64, 3), 100, dtype=np.uint8)
+
+            for frame in (baseline, baseline, contrast):
+                ok, encoded = cv2.imencode(".jpg", frame)
+                self.assertTrue(ok)
+                service.ingest(bytes(encoded))
+
+            _frame_id, _source, enhanced = service.latest_frames()
+            assert enhanced is not None
+            decoded = cv2.imdecode(np.frombuffer(enhanced, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            expected = subtract_fluoroscopy_background(
+                np.full((48, 64), 100, dtype=np.uint8),
+                np.full((48, 64), 150, dtype=np.uint8),
+                0,
+            )
+            self.assertLess(abs(float(decoded.mean()) - float(expected.mean())), 3)
+            self.assertEqual(recorder.completed_paths, [])
 
     def test_http_ingest_and_mjpeg_egress(self) -> None:
         processor = LiveStreamProcessor(
