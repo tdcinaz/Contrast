@@ -27,6 +27,7 @@ from main import (
     analyze_gray_frames,
     average_frame_brightness,
     compute_temporal_change_map,
+    compute_temporal_change_summary,
     detect_aneurysm_roi,
     build_analysis_result,
     normalize_analysis_results,
@@ -164,6 +165,35 @@ class SegmentationTests(unittest.TestCase):
         ]
 
         np.testing.assert_array_equal(average_frame_brightness(frames), np.asarray([3.0, 13.0]))
+
+    def test_temporal_change_summary_accumulates_change_and_normalizes_rate(self) -> None:
+        frames = [
+            np.asarray([[0, 10], [20, 30]], dtype=np.uint8),
+            np.asarray([[4, 8], [20, 36]], dtype=np.uint8),
+            np.asarray([[10, 8], [15, 42]], dtype=np.uint8),
+        ]
+
+        total, rate = compute_temporal_change_summary(frames, fps=2.0)
+
+        np.testing.assert_array_equal(total, np.asarray([[10.0, 2.0], [5.0, 12.0]]))
+        np.testing.assert_array_equal(rate, np.asarray([[10.0, 2.0], [5.0, 12.0]]))
+
+    def test_temporal_change_view_is_mutually_exclusive_with_source_view(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window.temporal_change_results = {"video": (np.zeros((2, 2)), np.zeros((2, 2)))}
+        window.temporal_change_view_check.setEnabled(True)
+
+        window.temporal_change_view_check.setChecked(True)
+
+        self.assertTrue(window.temporal_change_view_check.isChecked())
+        self.assertFalse(window.compare_view_check.isChecked())
+
+        window.compare_view_check.setChecked(True)
+
+        self.assertTrue(window.compare_view_check.isChecked())
+        self.assertFalse(window.temporal_change_view_check.isChecked())
 
     def test_frame_brightness_analysis_uses_one_plot_per_comparison_video(self) -> None:
         app = QApplication.instance() or QApplication([])

@@ -264,5 +264,14 @@ BUILTIN_STAGES = StageRegistry(
             0.0,
             modifies_frame_data=False,
         ),
+        StageDefinition(
+            "temporal_change_heatmap",
+            "Temporal pixel-change heatmap",
+            ExecutionShape.ANALYSIS,
+            0.0,
+            0.0,
+            modifies_frame_data=False,
+            live_supported=False,
+        ),
     )
 )

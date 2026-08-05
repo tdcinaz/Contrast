@@ -945,6 +945,51 @@ def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
     return np.percentile(stack, 90.0, axis=0) - np.percentile(stack, 10.0, axis=0)
 
 
+def compute_temporal_change_summary(
+    gray_frames: list[np.ndarray],
+    fps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return cumulative absolute change and its mean per-second rate for every pixel."""
+    if not gray_frames:
+        empty = np.zeros((1, 1), dtype=np.float32)
+        return empty, empty
+
+    source_frames = [np.clip(frame, 0, 255).astype(np.float32) for frame in gray_frames]
+    shape = source_frames[0].shape
+    if any(frame.shape != shape for frame in source_frames):
+        raise ValueError("Temporal pixel-change analysis requires consistently sized frames.")
+    if len(source_frames) == 1:
+        empty = np.zeros(shape, dtype=np.float32)
+        return empty, empty
+
+    cumulative_change = np.zeros(shape, dtype=np.float32)
+    previous = source_frames[0]
+    for current in source_frames[1:]:
+        cumulative_change += np.abs(current - previous)
+        previous = current
+    elapsed_seconds = (len(source_frames) - 1) / max(float(fps), 1e-6)
+    return cumulative_change, cumulative_change / elapsed_seconds
+
+
+def render_temporal_change_heatmap(cumulative_change: np.ndarray, change_rate: np.ndarray) -> np.ndarray:
+    """Render total change as color and mean change rate as color brightness."""
+    total_peak = float(np.max(cumulative_change))
+    rate_peak = float(np.max(change_rate))
+    total_normalized = (
+        np.clip(cumulative_change * (255.0 / total_peak), 0, 255).astype(np.uint8)
+        if total_peak > 0
+        else np.zeros(cumulative_change.shape, dtype=np.uint8)
+    )
+    rate_normalized = (
+        np.clip(change_rate * (255.0 / rate_peak), 0, 255).astype(np.uint8)
+        if rate_peak > 0
+        else np.zeros(change_rate.shape, dtype=np.uint8)
+    )
+    heatmap = cv2.applyColorMap(total_normalized, cv2.COLORMAP_TURBO)
+    brightness = 0.25 + 0.75 * (rate_normalized.astype(np.float32) / 255.0)
+    return np.clip(heatmap.astype(np.float32) * brightness[..., np.newaxis], 0, 255).astype(np.uint8)
+
+
 def detect_aneurysm_roi(
     gray_frames: list[np.ndarray],
     fps: float,
@@ -1207,6 +1252,7 @@ class VideoDisplay(QLabel):
         self._left_pixmap = QPixmap()
         self._right_pixmap = QPixmap()
         self._comparison_enabled = True
+        self._left_label = "Source"
         self._roi: QRect | None = None
         self._roi_mask: np.ndarray | None = None
         self._drag_origin: QPoint | None = None
@@ -1237,9 +1283,15 @@ class VideoDisplay(QLabel):
         image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).copy()
         return QPixmap.fromImage(image)
 
-    def set_frames(self, original_frame: np.ndarray, enhanced_frame: np.ndarray | None = None) -> None:
+    def set_frames(
+        self,
+        original_frame: np.ndarray,
+        enhanced_frame: np.ndarray | None = None,
+        left_label: str = "Source",
+    ) -> None:
         self._left_pixmap = self._to_pixmap(original_frame)
         self.frame_size = (original_frame.shape[1], original_frame.shape[0])
+        self._left_label = left_label
         if enhanced_frame is None:
             self._right_pixmap = self._to_pixmap(original_frame)
         else:
@@ -1305,7 +1357,7 @@ class VideoDisplay(QLabel):
                 painter.drawPixmap(self._right_display_rect, right_scaled)
 
                 painter.setPen(QColor("#64748b"))
-                painter.drawText(left_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Source")
+                painter.drawText(left_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, self._left_label)
                 painter.drawText(right_slot.adjusted(8, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "Enhanced")
             else:
                 full_slot = QRect(0, 0, self.width(), self.height())
@@ -1776,9 +1828,11 @@ class VideoPanel(QFrame):
         self.current_frame_index = -1
         self.enhance_display = False
         self.comparison_display = True
+        self.temporal_change_display = False
         self.segmentation_overlay_display = True
         self.target_median = 128.0
         self.enhanced_frames: list[np.ndarray] | None = None
+        self.temporal_change_heatmap: np.ndarray | None = None
         self.segmentation_masks: list[np.ndarray] | None = None
         self.source_gray_frames: list[np.ndarray] | None = None
         self.stage_frame_cache: dict[tuple[tuple[str, tuple[object, ...]], ...], list[np.ndarray]] = {}
@@ -3008,7 +3062,9 @@ class VideoPanel(QFrame):
                     mask = cv2.imdecode(self.segmentation_masks[self.current_frame_index], cv2.IMREAD_GRAYSCALE)
                     if mask is not None:
                         enhanced_frame = overlay_segmentation_mask(enhanced_frame, mask)
-        self.display.set_frames(source_frame, enhanced_frame)
+        left_frame = self.temporal_change_heatmap if self.temporal_change_display and self.temporal_change_heatmap is not None else source_frame
+        left_label = "Pixel change" if self.temporal_change_display and self.temporal_change_heatmap is not None else "Source"
+        self.display.set_frames(left_frame, enhanced_frame, left_label)
 
     def read_next(self, playback: bool = False) -> bool:
         if not self.live_input and self.current_frame_index >= self.playback_frame_count - 1:
@@ -3129,7 +3185,17 @@ class VideoPanel(QFrame):
 
     def set_comparison(self, enabled: bool, frame_index: int) -> None:
         self.comparison_display = enabled
+        self.temporal_change_display = False
         self.display.set_comparison_enabled(enabled)
+        self.seek(frame_index)
+
+    def set_temporal_change_heatmap(self, heatmap: np.ndarray | None) -> None:
+        self.temporal_change_heatmap = None if heatmap is None else heatmap.copy()
+
+    def set_temporal_change_display(self, enabled: bool, frame_index: int) -> None:
+        self.temporal_change_display = enabled and self.temporal_change_heatmap is not None
+        self.comparison_display = self.temporal_change_display
+        self.display.set_comparison_enabled(self.comparison_display)
         self.seek(frame_index)
 
     def set_segmentation_overlay(self, enabled: bool, frame_index: int) -> None:
@@ -3138,6 +3204,8 @@ class VideoPanel(QFrame):
 
     def clear_enhancement_cache(self) -> None:
         self.enhanced_frames = None
+        self.temporal_change_heatmap = None
+        self.temporal_change_display = False
         self.segmentation_masks = None
         self.source_gray_frames = None
         self.stage_roi_selection = None
@@ -3628,6 +3696,7 @@ class ContrastWindow(QMainWindow):
         self.current_frame_index = 0
         self.results: dict[str, AnalysisResult] = {}
         self.frame_brightness_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self.temporal_change_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.deep_denoisers: dict[str, FrameDenoiser] = {}
         self._enhancement_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="enhancement-coordinator")
         self._enhancement_future: Future[bool] | None = None
@@ -3791,6 +3860,7 @@ class ContrastWindow(QMainWindow):
             "roi_extraction",
             "temporal_filter",
             "quantum_mottle_filter",
+            "temporal_change_heatmap",
         ):
             for drawer in self._stage_drawers(stage_key):
                 if not enabled:
@@ -4405,6 +4475,12 @@ class ContrastWindow(QMainWindow):
         self.compare_view_check.setToolTip("Show source beside enhanced output")
         self.compare_view_check.toggled.connect(self.on_compare_view_toggled)
 
+        self.temporal_change_view_check = QCheckBox("Show pixel change")
+        self.temporal_change_view_check.setChecked(False)
+        self.temporal_change_view_check.setEnabled(False)
+        self.temporal_change_view_check.setToolTip("Show the temporal pixel-change heatmap beside enhanced output")
+        self.temporal_change_view_check.toggled.connect(self.on_temporal_change_view_toggled)
+
         self.overlay_mask_check = QCheckBox("Mask overlay")
         self.overlay_mask_check.setChecked(True)
         self.overlay_mask_check.setEnabled(False)
@@ -4526,6 +4602,7 @@ class ContrastWindow(QMainWindow):
         self.live_recording_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         playback_layout.addWidget(self.live_recording_spacer, 1)
         playback_layout.addWidget(self.compare_view_check)
+        playback_layout.addWidget(self.temporal_change_view_check)
         playback_layout.addWidget(self.overlay_mask_check)
         self.playback_controls = (
             self.play_button,
@@ -4674,6 +4751,11 @@ class ContrastWindow(QMainWindow):
             "Frame brightness analysis",
             15,
         )
+        self.temporal_change_heatmap_stage_drawer = StageDrawer(
+            "temporal_change_heatmap",
+            "Temporal pixel-change heatmap",
+            16,
+        )
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
         self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
         self.background_subtraction_stage_check = self.background_subtraction_stage_drawer.enable_button
@@ -4690,6 +4772,7 @@ class ContrastWindow(QMainWindow):
         self.segmentation_stage_check = self.segmentation_stage_drawer.enable_button
         self.analysis_stage_check = self.analysis_stage_drawer.enable_button
         self.frame_brightness_analysis_stage_check = self.frame_brightness_analysis_stage_drawer.enable_button
+        self.temporal_change_heatmap_stage_check = self.temporal_change_heatmap_stage_drawer.enable_button
         self.source_pipeline_stage_checks = [
             self.auto_crop_stage_check,
             self.temporal_alignment_stage_check,
@@ -4713,6 +4796,7 @@ class ContrastWindow(QMainWindow):
             *self.frame_pipeline_stage_checks,
             self.analysis_stage_check,
             self.frame_brightness_analysis_stage_check,
+            self.temporal_change_heatmap_stage_check,
         ]
         self.source_pipeline_stage_drawers = [
             self.auto_crop_stage_drawer,
@@ -4736,6 +4820,7 @@ class ContrastWindow(QMainWindow):
             *self.frame_pipeline_stage_drawers,
             self.analysis_stage_drawer,
             self.frame_brightness_analysis_stage_drawer,
+            self.temporal_change_heatmap_stage_drawer,
         ]
         self.pipeline_stage_drawers = [
             *self.source_pipeline_stage_drawers,
@@ -6030,8 +6115,10 @@ class ContrastWindow(QMainWindow):
         roi_drawers = self._stage_drawers("roi_extraction")
         analysis_drawers = self._stage_drawers("roi_residence_analysis")
         frame_brightness_drawers = self._stage_drawers("frame_brightness_analysis")
+        temporal_change_drawers = self._stage_drawers("temporal_change_heatmap")
         analysis_enabled = self._has_enabled_stage("roi_residence_analysis")
         frame_brightness_enabled = self._has_enabled_stage("frame_brightness_analysis")
+        temporal_change_enabled = self._has_enabled_stage("temporal_change_heatmap")
         if self.active_mode == MODE_LIVE and self._network_stream_display is not None:
             for drawer in roi_drawers:
                 drawer.set_status("Unavailable for live input. Drag on the source image to select an ROI.", False)
@@ -6049,6 +6136,8 @@ class ContrastWindow(QMainWindow):
                     else None,
                     False,
                 )
+            for drawer in temporal_change_drawers:
+                drawer.set_status("Unavailable for live input.", temporal_change_enabled)
             return
         if not self.panels:
             for drawer in roi_drawers:
@@ -6057,6 +6146,8 @@ class ContrastWindow(QMainWindow):
                 drawer.set_status("Load video files to run ROI residence analysis.", analysis_enabled)
             for drawer in frame_brightness_drawers:
                 drawer.set_status("Load video files to run frame brightness analysis.", frame_brightness_enabled)
+            for drawer in temporal_change_drawers:
+                drawer.set_status("Load video files to build a temporal pixel-change heatmap.", temporal_change_enabled)
             return
         if not self._has_enabled_stage("roi_extraction"):
             extraction_message = "Disabled. Enable this stage to extract aneurysm ROI masks from the current enhanced video."
@@ -6099,6 +6190,16 @@ class ContrastWindow(QMainWindow):
         else:
             for drawer in frame_brightness_drawers:
                 drawer.set_status("Ready to compare original and enhanced frame brightness.", False)
+
+        if not temporal_change_enabled:
+            for drawer in temporal_change_drawers:
+                drawer.set_status(None)
+        elif self._enhancement_future is not None:
+            for drawer in temporal_change_drawers:
+                drawer.set_status("Waiting for enhanced video frames.", False)
+        else:
+            for drawer in temporal_change_drawers:
+                drawer.set_status("Ready to map total and per-second pixel change.", False)
 
     def on_roi_changed(self) -> None:
         if self.active_mode == MODE_LIVE and self._network_stream_display is not None:
@@ -6194,6 +6295,10 @@ class ContrastWindow(QMainWindow):
         return denoiser
 
     def on_compare_view_toggled(self, enabled: bool) -> None:
+        if enabled and self.temporal_change_view_check.isChecked():
+            self.temporal_change_view_check.blockSignals(True)
+            self.temporal_change_view_check.setChecked(False)
+            self.temporal_change_view_check.blockSignals(False)
         for panel in self.panels:
             panel.set_comparison(enabled, self.current_frame_index)
         if self._network_stream_display is not None:
@@ -6202,6 +6307,22 @@ class ContrastWindow(QMainWindow):
             self.statusBar().showMessage("Showing source beside enhanced output.")
         else:
             self.statusBar().showMessage("Showing enhanced output only.")
+
+    def on_temporal_change_view_toggled(self, enabled: bool) -> None:
+        if enabled and not self.temporal_change_results:
+            self.temporal_change_view_check.blockSignals(True)
+            self.temporal_change_view_check.setChecked(False)
+            self.temporal_change_view_check.blockSignals(False)
+            return
+        if enabled:
+            self.compare_view_check.blockSignals(True)
+            self.compare_view_check.setChecked(False)
+            self.compare_view_check.blockSignals(False)
+        for panel in self.panels:
+            panel.set_temporal_change_display(enabled, self.current_frame_index)
+        self.statusBar().showMessage(
+            "Showing pixel change beside enhanced output." if enabled else "Showing enhanced output only."
+        )
 
     def on_segmentation_overlay_toggled(self, enabled: bool) -> None:
         if not self.panels:
@@ -6272,6 +6393,7 @@ class ContrastWindow(QMainWindow):
             self.enhancement_stages().any_enabled
             or self._has_enabled_stage("roi_residence_analysis")
             or self._has_enabled_stage("frame_brightness_analysis")
+            or self._has_enabled_stage("temporal_change_heatmap")
             or self._has_enabled_stage("auto_crop")
             or self._has_enabled_stage("temporal_alignment")
             or any(enabled for enabled, _level in self._background_subtraction_settings())
@@ -6303,7 +6425,7 @@ class ContrastWindow(QMainWindow):
         self.frame_pipeline_stage_drawers = [
             drawer
             for drawer in self.live_pipeline_stage_drawers
-            if drawer.stage_key not in {"roi_residence_analysis", "frame_brightness_analysis"}
+            if drawer.stage_key not in {"roi_residence_analysis", "frame_brightness_analysis", "temporal_change_heatmap"}
         ]
         self.source_pipeline_stage_checks = [item.enable_button for item in self.source_pipeline_stage_drawers]
         self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
@@ -7002,8 +7124,11 @@ class ContrastWindow(QMainWindow):
                 panel.seek(self.current_frame_index)
             self._update_stage_statuses()
             roi_analysis_updated = self._has_enabled_stage("roi_residence_analysis") and self.run_analysis()
-            if self._has_enabled_stage("frame_brightness_analysis"):
-                self.run_frame_brightness_analysis()
+            frame_brightness_updated = self._has_enabled_stage("frame_brightness_analysis") and self.run_frame_brightness_analysis()
+            if self._has_enabled_stage("temporal_change_heatmap"):
+                self.run_temporal_change_heatmap()
+                return
+            if frame_brightness_updated:
                 return
             if roi_analysis_updated:
                 return
@@ -7129,6 +7254,31 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage("Frame brightness analysis updated from the current enhanced pipeline output.")
         return True
 
+    def run_temporal_change_heatmap(self) -> bool:
+        if not self.panels or self._enhancement_future is not None:
+            return False
+
+        stages = self.enhancement_stages()
+        parameters = self.enhancement_parameters()
+        backend_id = self._current_backend_id(stages)
+        results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for panel in self.panels:
+            enhanced_frames = panel.analysis_frames(
+                backend_id,
+                self.denoise_strength_spin.value(),
+                stages,
+                parameters,
+            )
+            if enhanced_frames is None:
+                return False
+            results[panel.label] = compute_temporal_change_summary(enhanced_frames, panel.info.fps)
+
+        self.temporal_change_results = results
+        self.refresh_temporal_change_views()
+        self._update_stage_statuses()
+        self.statusBar().showMessage("Temporal pixel-change heatmap updated from the current enhanced pipeline output.")
+        return True
+
     def refresh_analysis_from_existing(self) -> None:
         if not self.results:
             return
@@ -7141,6 +7291,8 @@ class ContrastWindow(QMainWindow):
         self.raw_plot.clear()
         self._clear_frame_brightness_plots()
         self.frame_brightness_results.clear()
+        self.temporal_change_results.clear()
+        self._clear_temporal_change_views()
         self.pre_card.set_metric("--")
         self.post_card.set_metric("--")
         self.delta_card.set_metric("--")
@@ -7229,6 +7381,30 @@ class ContrastWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
         self.frame_brightness_plots.clear()
+
+    def refresh_temporal_change_views(self) -> None:
+        for panel in self.panels:
+            result = self.temporal_change_results.get(panel.label)
+            if result is None:
+                panel.set_temporal_change_heatmap(None)
+                continue
+            cumulative_change, change_rate = result
+            panel.set_temporal_change_heatmap(render_temporal_change_heatmap(cumulative_change, change_rate))
+        self.temporal_change_view_check.setEnabled(bool(self.temporal_change_results) and self.active_mode != MODE_LIVE)
+        if self.temporal_change_view_check.isChecked():
+            for panel in self.panels:
+                panel.set_temporal_change_display(True, self.current_frame_index)
+
+    def _clear_temporal_change_views(self) -> None:
+        self.temporal_change_view_check.blockSignals(True)
+        self.temporal_change_view_check.setChecked(False)
+        self.temporal_change_view_check.setEnabled(False)
+        self.temporal_change_view_check.blockSignals(False)
+        for panel in self.panels:
+            set_heatmap = getattr(panel, "set_temporal_change_heatmap", None)
+            if set_heatmap is not None:
+                set_heatmap(None)
+            panel.set_comparison(self.compare_view_check.isChecked(), self.current_frame_index)
 
     def _metric_detail(self, result: AnalysisResult) -> str:
         return f"arrival {format_seconds(result.arrival_time)} | peak {format_seconds(result.peak_time)} | clear {format_seconds(result.clear_time)}"
