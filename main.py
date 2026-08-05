@@ -403,7 +403,8 @@ class SourcePipelineState:
     trim_cache_key: tuple[int, int, int, int] | None
     detected_trim_start: int | None
     background_reference: np.ndarray | None
-    configuration: tuple[bool, bool, bool, bool, int, int, float, float]
+    configuration: tuple[object, ...]
+    metal_needle_mask: np.ndarray | None = None
     gain_alignment_baseline: float = 0.0
     gain_alignment_span: float = 0.0
     gain_multiplier: float = 1.0
@@ -938,6 +939,31 @@ def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
     return np.clip(baseline - darkest, 0.0, None)
 
 
+def detect_stationary_metal_mask(gray_frames: list[np.ndarray]) -> np.ndarray | None:
+    """Find persistent dark metal objects while rejecting moving dark contrast."""
+    if len(gray_frames) < 3:
+        return None
+    shape = gray_frames[0].shape
+    if any(frame.shape != shape for frame in gray_frames):
+        raise ValueError("Metal needle detection requires consistently sized frames.")
+
+    stack = np.stack(gray_frames, axis=0).astype(np.float32)
+    median_intensity = np.median(stack, axis=0)
+    mean_frame_change = np.mean(np.abs(np.diff(stack, axis=0)), axis=0)
+    candidates = ((median_intensity <= 40.0) & (mean_frame_change <= 5.0)).astype(np.uint8)
+    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(candidates, connectivity=8)
+    mask = np.zeros(shape, dtype=np.uint8)
+    for label in range(1, component_count):
+        width = stats[label, cv2.CC_STAT_WIDTH]
+        height = stats[label, cv2.CC_STAT_HEIGHT]
+        aspect_ratio = max(width / max(1, height), height / max(1, width))
+        if stats[label, cv2.CC_STAT_AREA] >= 256 and aspect_ratio >= 2.0:
+            mask[labels == label] = 255
+    if not np.any(mask):
+        return None
+    return cv2.dilate(mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
+
+
 def compute_temporal_change_summary(
     gray_frames: list[np.ndarray],
     fps: float,
@@ -960,6 +986,13 @@ def compute_temporal_change_summary(
     for current in source_frames[1:]:
         cumulative_change += np.abs(current - previous)
         previous = current
+
+    # A fixed opaque instrument is dark but can retain low-level acquisition noise.
+    # Exclude that background signal so it cannot determine the heatmap scale.
+    median_intensity = np.median(np.stack(source_frames, axis=0), axis=0)
+    median_frame_change = cumulative_change / (len(source_frames) - 1)
+    stationary_dark = (median_intensity <= 32.0) & (median_frame_change <= 4.0)
+    cumulative_change[stationary_dark] = 0.0
     elapsed_seconds = (len(source_frames) - 1) / max(float(fps), 1e-6)
     return cumulative_change, cumulative_change / elapsed_seconds
 
@@ -1902,6 +1935,7 @@ class VideoPanel(QFrame):
         self.background_subtraction_enabled = False
         self.background_level = 0
         self.background_reference: np.ndarray | None = None
+        self.metal_needle_mask: np.ndarray | None = None
         self.source_gain_multiplier = 1.0
         self.source_gain_offset = 0.0
         self.capture = cv2.VideoCapture(str(path))
@@ -1989,6 +2023,7 @@ class VideoPanel(QFrame):
         contrast_gain_alignment_enabled: bool = False,
         background_subtraction_enabled: bool = False,
         background_level: int = 0,
+        metal_needle_removal_enabled: bool = False,
     ) -> SourcePipelineState:
         temporal_alignment_enabled = temporal_alignment_enabled and not self.live_input
         background_subtraction_enabled = background_subtraction_enabled and not self.live_input
@@ -1999,6 +2034,7 @@ class VideoPanel(QFrame):
             + int(temporal_alignment_enabled)
             + int(contrast_gain_alignment_enabled)
             + int(background_subtraction_enabled)
+            + int(metal_needle_removal_enabled)
         )
         completed_stages = 0
 
@@ -2077,6 +2113,15 @@ class VideoPanel(QFrame):
             report("Acquiring DSA mask", 1.0, 1.0)
             completed_stages += 1
 
+        metal_needle_mask = None
+        if metal_needle_removal_enabled:
+            metal_needle_mask = self._acquire_stationary_metal_mask(
+                next_crop_rect,
+                lambda done, total: report("Detecting stationary metal", done, total),
+            )
+            report("Detecting stationary metal", 1.0, 1.0)
+            completed_stages += 1
+
         return SourcePipelineState(
             crop_rect=next_crop_rect,
             trim_start=next_trim_start,
@@ -2084,6 +2129,7 @@ class VideoPanel(QFrame):
             trim_cache_key=trim_cache_key,
             detected_trim_start=detected_trim_start,
             background_reference=background_reference,
+            metal_needle_mask=metal_needle_mask,
             configuration=(
                 auto_crop_enabled,
                 temporal_alignment_enabled,
@@ -2093,6 +2139,7 @@ class VideoPanel(QFrame):
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds,
+                metal_needle_removal_enabled,
             ),
             gain_alignment_baseline=gain_alignment_baseline,
             gain_alignment_span=gain_alignment_span,
@@ -2110,6 +2157,7 @@ class VideoPanel(QFrame):
         self.background_subtraction_enabled = state.configuration[3]
         self.background_level = state.configuration[4]
         self.background_reference = state.background_reference
+        self.metal_needle_mask = state.metal_needle_mask
         if state.auto_crop_rect is not None:
             self._auto_crop_rect_cache = QRect(state.auto_crop_rect)
         if state.trim_cache_key is not None and state.detected_trim_start is not None:
@@ -2141,6 +2189,7 @@ class VideoPanel(QFrame):
         contrast_gain_alignment_enabled: bool = False,
         background_subtraction_enabled: bool = False,
         background_level: int = 0,
+        metal_needle_removal_enabled: bool = False,
     ) -> bool:
         return self.apply_source_pipeline_state(
             self.calculate_source_pipeline(
@@ -2152,6 +2201,7 @@ class VideoPanel(QFrame):
                 contrast_gain_alignment_enabled=contrast_gain_alignment_enabled,
                 background_subtraction_enabled=background_subtraction_enabled,
                 background_level=background_level,
+                metal_needle_removal_enabled=metal_needle_removal_enabled,
             )
         )
 
@@ -2203,10 +2253,43 @@ class VideoPanel(QFrame):
             return None
         return np.median(np.stack(samples, axis=0), axis=0).astype(np.uint8)
 
+    def _acquire_stationary_metal_mask(
+        self,
+        crop_rect: QRect,
+        progress_callback: Callable[[int, int], bool] | None = None,
+    ) -> np.ndarray | None:
+        sample_count = min(max(3, round(self.info.fps * 2.0)), self.info.frame_count)
+        capture = cv2.VideoCapture(str(self.path))
+        samples: list[np.ndarray] = []
+        try:
+            for frame_index in range(sample_count):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                samples.append(cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY))
+                if progress_callback is not None and not progress_callback(frame_index + 1, sample_count):
+                    break
+        finally:
+            capture.release()
+        return detect_stationary_metal_mask(samples)
+
     def _subtract_background(self, gray: np.ndarray) -> np.ndarray:
         if not self.background_subtraction_enabled or self.background_reference is None:
             return gray
         return subtract_fluoroscopy_background(gray, self.background_reference, self.background_level)
+
+    def _remove_stationary_metal(self, gray: np.ndarray) -> np.ndarray:
+        if self.metal_needle_mask is None:
+            return gray
+        output = gray.copy()
+        component_count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(self.metal_needle_mask, connectivity=8)
+        boundary_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (101, 101))
+        for label in range(1, component_count):
+            component = (labels == label).astype(np.uint8)
+            boundary = cv2.dilate(component, boundary_kernel) & (1 - component)
+            if np.any(boundary):
+                output[component.astype(bool)] = np.median(gray[boundary.astype(bool)])
+        return output
 
     def _align_source_gain(self, gray: np.ndarray) -> np.ndarray:
         if self.source_gain_multiplier == 1.0 and self.source_gain_offset == 0.0:
@@ -2702,6 +2785,7 @@ class VideoPanel(QFrame):
                     if not ok:
                         raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
                     gray = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
+                    gray = self._remove_stationary_metal(gray)
                     gray = self._align_source_gain(gray)
                     gray = self._subtract_background(gray)
                     active_seconds += perf_counter() - started_at
@@ -3076,8 +3160,14 @@ class VideoPanel(QFrame):
     def _display_frame(self, frame: np.ndarray, apply_enhancement: bool | None = None) -> None:
         self.current_frame = frame
         source_frame = frame
-        if self.source_gain_multiplier != 1.0 or self.source_gain_offset != 0.0 or self.background_subtraction_enabled:
+        if (
+            self.source_gain_multiplier != 1.0
+            or self.source_gain_offset != 0.0
+            or self.background_subtraction_enabled
+            or self.metal_needle_mask is not None
+        ):
             source_frame = self._align_source_gain(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            source_frame = self._remove_stationary_metal(source_frame)
             source_frame = self._subtract_background(source_frame)
             source_frame = cv2.cvtColor(source_frame, cv2.COLOR_GRAY2BGR)
         if apply_enhancement is None:
@@ -3197,6 +3287,7 @@ class VideoPanel(QFrame):
         self._trim_start_cache.clear()
         self.source_pipeline_configuration = None
         self.background_reference = None
+        self.metal_needle_mask = None
         self.source_gain_multiplier = 1.0
         self.source_gain_offset = 0.0
         self.capture = cv2.VideoCapture(str(path))
@@ -4359,6 +4450,7 @@ class ContrastWindow(QMainWindow):
         auto_crop_enabled = self._has_enabled_stage("auto_crop")
         temporal_alignment_enabled = self._has_enabled_stage("temporal_alignment")
         contrast_gain_alignment_enabled = self._has_enabled_stage("contrast_gain_alignment")
+        metal_needle_removal_enabled = self._has_enabled_stage("metal_needle_removal")
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         background_settings = self._background_subtraction_settings()
         states = [
@@ -4375,6 +4467,7 @@ class ContrastWindow(QMainWindow):
                 contrast_gain_alignment_enabled=contrast_gain_alignment_enabled,
                 background_subtraction_enabled=background_settings[panel_index][0],
                 background_level=background_settings[panel_index][1],
+                metal_needle_removal_enabled=metal_needle_removal_enabled,
             )
             for panel_index, panel in enumerate(self.panels)
         ]
@@ -4405,6 +4498,7 @@ class ContrastWindow(QMainWindow):
         temporal_trim_offset_seconds: float,
         comparison_sync_offset_seconds: float,
         background_settings: tuple[tuple[bool, int], ...],
+        metal_needle_removal: bool,
     ) -> bool:
         if not self.panels:
             return True
@@ -4419,6 +4513,7 @@ class ContrastWindow(QMainWindow):
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds if self.active_mode == MODE_COMPARISON and panel_index == 1 else 0.0,
+                metal_needle_removal,
             )
             for panel_index, panel in enumerate(self.panels)
         )
@@ -4775,6 +4870,11 @@ class ContrastWindow(QMainWindow):
             "DSA mask subtraction",
             4,
         )
+        self.metal_needle_removal_stage_drawer = StageDrawer(
+            "metal_needle_removal",
+            "Remove stationary metal needle",
+            5,
+        )
         self.brightness_stage_drawer = StageDrawer(
             "brightness_stabilization",
             "Gain / brightness stabilization",
@@ -4808,6 +4908,7 @@ class ContrastWindow(QMainWindow):
         self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
         self.contrast_gain_alignment_stage_check = self.contrast_gain_alignment_stage_drawer.enable_button
         self.background_subtraction_stage_check = self.background_subtraction_stage_drawer.enable_button
+        self.metal_needle_removal_stage_check = self.metal_needle_removal_stage_drawer.enable_button
         self.gain_stage_check = self.gain_stage_drawer.enable_button
         self.brightness_stage_check = self.brightness_stage_drawer.enable_button
         self.roi_stage_check = self.roi_stage_drawer.enable_button
@@ -4826,6 +4927,7 @@ class ContrastWindow(QMainWindow):
             self.temporal_alignment_stage_check,
             self.contrast_gain_alignment_stage_check,
             self.background_subtraction_stage_check,
+            self.metal_needle_removal_stage_check,
         ]
         self.frame_pipeline_stage_checks = [
             self.brightness_stage_check,
@@ -4851,6 +4953,7 @@ class ContrastWindow(QMainWindow):
             self.temporal_alignment_stage_drawer,
             self.contrast_gain_alignment_stage_drawer,
             self.background_subtraction_stage_drawer,
+            self.metal_needle_removal_stage_drawer,
         ]
         self.frame_pipeline_stage_drawers = [
             self.brightness_stage_drawer,
@@ -5528,6 +5631,13 @@ class ContrastWindow(QMainWindow):
         background_hint.setObjectName("subtleLabel")
         background_hint.setWordWrap(True)
         self.background_subtraction_stage_drawer.content_layout.addWidget(background_hint)
+
+        metal_needle_hint = QLabel(
+            "Finds persistent dark metal in the opening frames and replaces it before downstream processing."
+        )
+        metal_needle_hint.setObjectName("subtleLabel")
+        metal_needle_hint.setWordWrap(True)
+        self.metal_needle_removal_stage_drawer.content_layout.addWidget(metal_needle_hint)
         self.background_video_rows: list[QWidget] = []
         background_controls = (
             ("Video 1", "backgroundVideo1Enabled", "backgroundVideo1Level"),
@@ -6386,6 +6496,7 @@ class ContrastWindow(QMainWindow):
             or self._has_enabled_stage("auto_crop")
             or self._has_enabled_stage("temporal_alignment")
             or self._has_enabled_stage("contrast_gain_alignment")
+            or self._has_enabled_stage("metal_needle_removal")
             or any(enabled for enabled, _level in self._background_subtraction_settings())
             or any(
                 panel.crop_rect != panel._full_frame_rect() or panel.trim_start_frame != 0
@@ -6743,6 +6854,7 @@ class ContrastWindow(QMainWindow):
         auto_crop = self._has_enabled_stage("auto_crop")
         temporal_alignment = self._has_enabled_stage("temporal_alignment")
         contrast_gain_alignment = self._has_enabled_stage("contrast_gain_alignment")
+        metal_needle_removal = self._has_enabled_stage("metal_needle_removal")
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         temporal_trim_offset_seconds = self.temporal_trim_offset_spin.value()
         comparison_sync_offset_seconds = self.comparison_sync_offset_spin.value()
@@ -6768,11 +6880,13 @@ class ContrastWindow(QMainWindow):
                 temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds,
                 background_subtraction_settings,
+                metal_needle_removal,
             ),
             auto_crop_size_offset=auto_crop_size_offset,
             temporal_trim_offset_seconds=temporal_trim_offset_seconds,
             comparison_sync_offset_seconds=comparison_sync_offset_seconds,
             background_subtraction_settings=background_subtraction_settings,
+            metal_needle_removal=metal_needle_removal,
             roi_parameters_by_panel=tuple(self._roi_parameters_for_panel(index) for index in range(len(self.panels))),
         )
         self._enhancement_pending_request = request
@@ -6845,10 +6959,11 @@ class ContrastWindow(QMainWindow):
                 request.contrast_gain_alignment,
                 request.background_subtraction_settings[panel_index][0],
                 request.background_subtraction_settings[panel_index][1],
+                request.metal_needle_removal,
             )
 
         if not request.source_pipeline_current:
-            source_stage_count = int(request.auto_crop) + int(request.temporal_alignment)
+            source_stage_count = int(request.auto_crop) + int(request.temporal_alignment) + int(request.metal_needle_removal)
             source_states: list[SourcePipelineState | None] = [None] * len(self.panels)
             with frame_parallel_opencv(), ThreadPoolExecutor(
                 max_workers=len(self.panels),

@@ -14,6 +14,7 @@ from main import (
     _adjust_auto_crop_square,
     _detect_aligned_field_crop,
     _detect_pillarbox_crop,
+    detect_stationary_metal_mask,
     detect_fluoroscope_crop_from_frames,
     detect_pre_injection_trim_start,
     SourcePipelineState,
@@ -23,6 +24,24 @@ from main import (
 
 
 class AutoCropTests(unittest.TestCase):
+    def test_stationary_metal_needle_is_detected_and_replaced_from_local_context(self) -> None:
+        frames: list[np.ndarray] = []
+        for index in range(5):
+            frame = np.full((180, 240), 160, dtype=np.uint8)
+            cv2.rectangle(frame, (12, 28), (34, 152), 12, thickness=-1)
+            cv2.circle(frame, (120 + index * 8, 90), 20, 25, thickness=-1)
+            frames.append(frame)
+
+        mask = detect_stationary_metal_mask(frames)
+
+        self.assertIsNotNone(mask)
+        assert mask is not None
+        self.assertGreater(np.count_nonzero(mask), 2_000)
+        self.assertEqual(mask[90, 120], 0)
+        filtered = VideoPanel._remove_stationary_metal(SimpleNamespace(metal_needle_mask=mask), frames[0])
+        masked = mask > 0
+        self.assertGreater(float(np.mean(filtered[masked])), float(np.mean(frames[0][masked])) + 100.0)
+
     def test_adjusted_crop_stays_square_centered_and_in_frame(self) -> None:
         crop = QRect(120, 40, 160, 160)
 
@@ -95,8 +114,8 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(first.crop_rect.getRect(), expected_crop.getRect())
         self.assertEqual(second.crop_rect.getRect(), expected_crop.getRect())
-        self.assertEqual(first.configuration, (True, False, False, False, 0, 0, 0.0, 0.0))
-        self.assertEqual(second.configuration, (True, False, False, False, 0, 0, 0.0, 0.0))
+        self.assertEqual(first.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, False))
+        self.assertEqual(second.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, False))
         detect_crop.assert_called_once()
 
     def test_temporal_offsets_adjust_detected_trim_without_changing_cache_key(self) -> None:
@@ -125,7 +144,7 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(state.trim_start, 35)
         self.assertEqual(state.detected_trim_start, 30)
-        self.assertEqual(state.configuration, (False, True, False, False, 0, 0, 0.20, 0.30))
+        self.assertEqual(state.configuration, (False, True, False, False, 0, 0, 0.20, 0.30, False))
 
     def test_gain_alignment_raises_only_the_lower_contrast_response(self) -> None:
         common = dict(

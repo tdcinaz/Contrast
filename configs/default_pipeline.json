@@ -61,6 +61,31 @@
       "controls": {},
       "enabled": true,
       "key": "frame_brightness_analysis"
+    },
+    {
+      "controls": {
+        "roiCircleFitEnabled": true,
+        "roiConvexHullEnabled": true,
+        "roiSoftenEnabled": true,
+        "roiSofteningRadius": 0.12,
+        "roiSofteningThreshold": 0.1,
+        "roiVideo1Mode": "auto",
+        "roiVideo2Mode": "auto"
+      },
+      "enabled": true,
+      "key": "roi_extraction"
+    },
+    {
+      "controls": {},
+      "enabled": true,
+      "key": "temporal_change_heatmap"
+    },
+    {
+      "controls": {
+        "analysisThreshold": 0.2
+      },
+      "enabled": true,
+      "key": "roi_residence_analysis"
     }
   ],
   "version": 1

@@ -211,6 +211,7 @@ BUILTIN_STAGES = StageRegistry(
         StageDefinition("temporal_alignment", "Temporal alignment (trim onset)", ExecutionShape.SOURCE, 0.0, 0.0, live_supported=False),
         StageDefinition("contrast_gain_alignment", "Align fluoroscope contrast gain", ExecutionShape.SOURCE, 0.0002, 0.0004, live_supported=False),
         StageDefinition("background_subtraction", "DSA mask subtraction", ExecutionShape.SOURCE, 0.0002, 0.0004, live_supported=True),
+        StageDefinition("metal_needle_removal", "Remove stationary metal needle", ExecutionShape.SOURCE, 0.0003, 0.0006, live_supported=False),
         StageDefinition("brightness_stabilization", "Gain / brightness stabilization", ExecutionShape.SEQUENCE, 0.0020, 0.0030, live_supported=False),
         StageDefinition(
             "roi_extraction",

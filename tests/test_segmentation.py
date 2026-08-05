@@ -313,8 +313,21 @@ class SegmentationTests(unittest.TestCase):
 
         total, rate = compute_temporal_change_summary(frames, fps=2.0)
 
-        np.testing.assert_array_equal(total, np.asarray([[10.0, 2.0], [5.0, 12.0]]))
-        np.testing.assert_array_equal(rate, np.asarray([[10.0, 2.0], [5.0, 12.0]]))
+        np.testing.assert_array_equal(total, np.asarray([[10.0, 0.0], [0.0, 12.0]]))
+        np.testing.assert_array_equal(rate, np.asarray([[10.0, 0.0], [0.0, 12.0]]))
+
+    def test_temporal_change_summary_excludes_stationary_dark_instrument_noise(self) -> None:
+        frames = [
+            np.asarray([[8, 180]], dtype=np.uint8),
+            np.asarray([[11, 165]], dtype=np.uint8),
+            np.asarray([[8, 150]], dtype=np.uint8),
+            np.asarray([[11, 135]], dtype=np.uint8),
+        ]
+
+        total, rate = compute_temporal_change_summary(frames, fps=3.0)
+
+        np.testing.assert_array_equal(total, np.asarray([[0.0, 45.0]]))
+        np.testing.assert_array_equal(rate, np.asarray([[0.0, 45.0]]))
 
     def test_temporal_change_heatmap_uses_shared_comparison_peaks(self) -> None:
         results = {
