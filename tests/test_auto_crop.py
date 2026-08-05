@@ -16,7 +16,9 @@ from main import (
     _detect_pillarbox_crop,
     detect_fluoroscope_crop_from_frames,
     detect_pre_injection_trim_start,
+    SourcePipelineState,
     VideoPanel,
+    align_source_gain_states,
 )
 
 
@@ -93,8 +95,8 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(first.crop_rect.getRect(), expected_crop.getRect())
         self.assertEqual(second.crop_rect.getRect(), expected_crop.getRect())
-        self.assertEqual(first.configuration, (True, False, False, 0, 0, 0.0, 0.0))
-        self.assertEqual(second.configuration, (True, False, False, 0, 0, 0.0, 0.0))
+        self.assertEqual(first.configuration, (True, False, False, False, 0, 0, 0.0, 0.0))
+        self.assertEqual(second.configuration, (True, False, False, False, 0, 0, 0.0, 0.0))
         detect_crop.assert_called_once()
 
     def test_temporal_offsets_adjust_detected_trim_without_changing_cache_key(self) -> None:
@@ -123,17 +125,62 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(state.trim_start, 35)
         self.assertEqual(state.detected_trim_start, 30)
-        self.assertEqual(state.configuration, (False, True, False, 0, 0, 0.20, 0.30))
+        self.assertEqual(state.configuration, (False, True, False, False, 0, 0, 0.20, 0.30))
+
+    def test_gain_alignment_raises_only_the_lower_contrast_response(self) -> None:
+        common = dict(
+            crop_rect=QRect(0, 0, 4, 4),
+            trim_start=0,
+            auto_crop_rect=None,
+            trim_cache_key=None,
+            detected_trim_start=None,
+            background_reference=None,
+            configuration=(False, False, True, False, 0, 0, 0.0, 0.0),
+        )
+
+        states = align_source_gain_states(
+            [
+                SourcePipelineState(**common, gain_alignment_baseline=80.0, gain_alignment_span=20.0),
+                SourcePipelineState(**common, gain_alignment_baseline=120.0, gain_alignment_span=30.0),
+            ]
+        )
+
+        self.assertEqual(states[0].gain_multiplier, 1.5)
+        self.assertEqual(states[0].gain_offset, 0.0)
+        self.assertEqual(states[1].gain_multiplier, 1.0)
+
+    def test_gain_alignment_maps_baseline_and_contrast_span_together(self) -> None:
+        common = dict(
+            crop_rect=QRect(0, 0, 4, 4),
+            trim_start=0,
+            auto_crop_rect=None,
+            trim_cache_key=None,
+            detected_trim_start=None,
+            background_reference=None,
+            configuration=(False, False, True, False, 0, 0, 0.0, 0.0),
+        )
+        states = align_source_gain_states(
+            [
+                SourcePipelineState(**common, gain_alignment_baseline=120.0, gain_alignment_span=20.0),
+                SourcePipelineState(**common, gain_alignment_baseline=150.0, gain_alignment_span=30.0),
+            ]
+        )
+
+        self.assertEqual(states[0].gain_multiplier, 1.5)
+        self.assertEqual(states[0].gain_offset, -30.0)
+        self.assertEqual(120.0 * states[0].gain_multiplier + states[0].gain_offset, 150.0)
 
     def test_background_source_setting_change_invalidates_panel_cache(self) -> None:
         class SourcePanel:
             apply_source_pipeline_state = VideoPanel.apply_source_pipeline_state
 
             def __init__(self) -> None:
-                self.source_pipeline_configuration = (False, False, False, 0, 0, 0.0, 0.0)
+                self.source_pipeline_configuration = (False, False, False, False, 0, 0, 0.0, 0.0)
                 self.background_subtraction_enabled = False
                 self.background_level = 0
                 self.background_reference = None
+                self.source_gain_multiplier = 1.0
+                self.source_gain_offset = 0.0
                 self._auto_crop_rect_cache = None
                 self._trim_start_cache = {}
                 self.info = SimpleNamespace(frame_count=20)
@@ -150,7 +197,7 @@ class AutoCropTests(unittest.TestCase):
             trim_cache_key=None,
             detected_trim_start=None,
             background_reference=np.full((240, 400), 160, dtype=np.uint8),
-            configuration=(False, False, True, 48, 0, 0.0, 0.0),
+            configuration=(False, False, False, True, 48, 0, 0.0, 0.0),
         )
 
         self.assertTrue(panel.apply_source_pipeline_state(state))

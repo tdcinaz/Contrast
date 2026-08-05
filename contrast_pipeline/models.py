@@ -106,3 +106,4 @@ class EnhancementRequest:
     comparison_sync_offset_seconds: float = 0.0
     background_subtraction_settings: tuple[tuple[bool, int], ...] = ()
     roi_parameters_by_panel: tuple[EnhancementParameters, ...] = ()
+    contrast_gain_alignment: bool = False

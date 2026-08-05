@@ -337,7 +337,7 @@ class SegmentationTests(unittest.TestCase):
             drawer.enable_button.setChecked(True)
             drawer.enable_button.blockSignals(False)
         for panel in window.panels:
-            panel.source_pipeline_configuration = (True, True, 0, 0.0, 0.0)
+            panel.source_pipeline_configuration = (True, True, False, False, 0, 0, 0.0, 0.0)
 
         with patch.object(window, "_start_enhancement_request") as start_request:
             window.rebuild_enhancement_pipeline()

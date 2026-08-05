@@ -413,7 +413,23 @@ class SourcePipelineState:
     trim_cache_key: tuple[int, int, int, int] | None
     detected_trim_start: int | None
     background_reference: np.ndarray | None
-    configuration: tuple[bool, bool, bool, int, int, float, float]
+    configuration: tuple[bool, bool, bool, bool, int, int, float, float]
+    gain_alignment_baseline: float = 0.0
+    gain_alignment_span: float = 0.0
+    gain_multiplier: float = 1.0
+    gain_offset: float = 0.0
+
+
+def align_source_gain_states(states: list[SourcePipelineState]) -> list[SourcePipelineState]:
+    target_baseline = max((state.gain_alignment_baseline for state in states), default=0.0)
+    target_span = max((state.gain_alignment_span for state in states), default=0.0)
+    if target_baseline <= 0.0 or target_span <= 0.0:
+        return states
+    return [
+        replace(state, gain_multiplier=gain, gain_offset=target_baseline - gain * state.gain_alignment_baseline)
+        for state in states
+        for gain in (min(2.5, max(1.0, target_span / max(1.0, state.gain_alignment_span))),)
+    ]
 
 
 @dataclass(slots=True)
@@ -725,6 +741,34 @@ def estimate_video_median(path: Path, crop_rect: QRect, start_frame: int, frame_
                 gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
                 medians.append(float(np.median(gray)))
         return float(np.median(medians)) if medians else 128.0
+    finally:
+        capture.release()
+
+
+def estimate_video_contrast_response(
+    path: Path,
+    crop_rect: QRect,
+    start_frame: int,
+    frame_count: int,
+    fps: float,
+) -> tuple[float, float]:
+    capture = cv2.VideoCapture(str(path))
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        signals: list[float] = []
+        for _ in range(frame_count):
+            ok, frame = capture.read()
+            if ok:
+                gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
+                signals.append(_contrast_frame_signal(gray))
+            else:
+                break
+        if not signals:
+            return 128.0, 1.0
+        pre_injection_count = max(3, min(round(fps * 0.4), len(signals)))
+        baseline = float(np.median(signals[:pre_injection_count]))
+        dark_level = float(np.min(smooth_temporal_signal(np.asarray(signals), fps)))
+        return baseline, max(1.0, baseline - dark_level)
     finally:
         capture.release()
 
@@ -1858,6 +1902,8 @@ class VideoPanel(QFrame):
         self.background_subtraction_enabled = False
         self.background_level = 0
         self.background_reference: np.ndarray | None = None
+        self.source_gain_multiplier = 1.0
+        self.source_gain_offset = 0.0
         self.capture = cv2.VideoCapture(str(path))
         self.trim_start_frame = 0
         self.trim_frame_count = self.info.frame_count
@@ -1940,13 +1986,19 @@ class VideoPanel(QFrame):
         auto_crop_size_offset: int = 0,
         temporal_trim_offset_seconds: float = 0.0,
         comparison_sync_offset_seconds: float = 0.0,
+        contrast_gain_alignment_enabled: bool = False,
         background_subtraction_enabled: bool = False,
         background_level: int = 0,
     ) -> SourcePipelineState:
         temporal_alignment_enabled = temporal_alignment_enabled and not self.live_input
         full_rect = self._full_frame_rect()
         next_crop_rect = full_rect
-        source_stage_count = int(auto_crop_enabled) + int(temporal_alignment_enabled) + int(background_subtraction_enabled)
+        source_stage_count = (
+            int(auto_crop_enabled)
+            + int(temporal_alignment_enabled)
+            + int(contrast_gain_alignment_enabled)
+            + int(background_subtraction_enabled)
+        )
         completed_stages = 0
 
         def report(stage: str, done: float, total: float) -> bool:
@@ -1993,6 +2045,19 @@ class VideoPanel(QFrame):
             next_trim_start = max(0, min(self.info.frame_count - 1, cached_trim_start + trim_offset_frames))
             report("Aligning contrast timing", 1.0, 1.0)
 
+        gain_alignment_baseline = 0.0
+        gain_alignment_span = 0.0
+        if contrast_gain_alignment_enabled:
+            gain_alignment_baseline, gain_alignment_span = estimate_video_contrast_response(
+                self.path,
+                next_crop_rect,
+                next_trim_start,
+                max(1, self.info.frame_count - next_trim_start),
+                self.info.fps,
+            )
+            report("Measuring fluoroscope contrast response", 1.0, 1.0)
+            completed_stages += 1
+
         background_reference = None
         if background_subtraction_enabled:
             background_reference = self._sample_background_reference(
@@ -2013,19 +2078,28 @@ class VideoPanel(QFrame):
             configuration=(
                 auto_crop_enabled,
                 temporal_alignment_enabled,
+                contrast_gain_alignment_enabled,
                 background_subtraction_enabled,
                 background_level,
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds,
             ),
+            gain_alignment_baseline=gain_alignment_baseline,
+            gain_alignment_span=gain_alignment_span,
         )
 
     def apply_source_pipeline_state(self, state: SourcePipelineState) -> bool:
-        configuration_changed = self.source_pipeline_configuration != state.configuration
+        configuration_changed = (
+            self.source_pipeline_configuration != state.configuration
+            or self.source_gain_multiplier != state.gain_multiplier
+            or self.source_gain_offset != state.gain_offset
+        )
         self.source_pipeline_configuration = state.configuration
-        self.background_subtraction_enabled = state.configuration[2]
-        self.background_level = state.configuration[3]
+        self.source_gain_multiplier = state.gain_multiplier
+        self.source_gain_offset = state.gain_offset
+        self.background_subtraction_enabled = state.configuration[3]
+        self.background_level = state.configuration[4]
         self.background_reference = state.background_reference
         if state.auto_crop_rect is not None:
             self._auto_crop_rect_cache = QRect(state.auto_crop_rect)
@@ -2055,6 +2129,7 @@ class VideoPanel(QFrame):
         auto_crop_size_offset: int = 0,
         temporal_trim_offset_seconds: float = 0.0,
         comparison_sync_offset_seconds: float = 0.0,
+        contrast_gain_alignment_enabled: bool = False,
         background_subtraction_enabled: bool = False,
         background_level: int = 0,
     ) -> bool:
@@ -2065,6 +2140,7 @@ class VideoPanel(QFrame):
                 auto_crop_size_offset=auto_crop_size_offset,
                 temporal_trim_offset_seconds=temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds=comparison_sync_offset_seconds,
+                contrast_gain_alignment_enabled=contrast_gain_alignment_enabled,
                 background_subtraction_enabled=background_subtraction_enabled,
                 background_level=background_level,
             )
@@ -2122,6 +2198,12 @@ class VideoPanel(QFrame):
         if not self.background_subtraction_enabled or self.background_reference is None:
             return gray
         return subtract_fluoroscopy_background(gray, self.background_reference, self.background_level)
+
+    def _align_source_gain(self, gray: np.ndarray) -> np.ndarray:
+        if self.source_gain_multiplier == 1.0 and self.source_gain_offset == 0.0:
+            return gray
+        aligned = gray.astype(np.float32) * self.source_gain_multiplier + self.source_gain_offset
+        return np.clip(aligned, 0, 255).astype(np.uint8)
 
     def set_trim_window(self, start_frame: int, frame_count: int | None = None) -> None:
         max_start = max(0, self.info.frame_count - 1)
@@ -2611,6 +2693,7 @@ class VideoPanel(QFrame):
                     if not ok:
                         raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
                     gray = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
+                    gray = self._align_source_gain(gray)
                     gray = self._subtract_background(gray)
                     active_seconds += perf_counter() - started_at
                     source_output.append(gray)
@@ -2984,8 +3067,9 @@ class VideoPanel(QFrame):
     def _display_frame(self, frame: np.ndarray, apply_enhancement: bool | None = None) -> None:
         self.current_frame = frame
         source_frame = frame
-        if self.background_subtraction_enabled:
-            source_frame = self._subtract_background(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        if self.source_gain_multiplier != 1.0 or self.source_gain_offset != 0.0 or self.background_subtraction_enabled:
+            source_frame = self._align_source_gain(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            source_frame = self._subtract_background(source_frame)
             source_frame = cv2.cvtColor(source_frame, cv2.COLOR_GRAY2BGR)
         if apply_enhancement is None:
             apply_enhancement = self.enhance_display
@@ -3104,6 +3188,8 @@ class VideoPanel(QFrame):
         self._trim_start_cache.clear()
         self.source_pipeline_configuration = None
         self.background_reference = None
+        self.source_gain_multiplier = 1.0
+        self.source_gain_offset = 0.0
         self.capture = cv2.VideoCapture(str(path))
         self.path_label.setText(path.name)
         self.set_trim_window(0)
@@ -4254,6 +4340,7 @@ class ContrastWindow(QMainWindow):
             return False
         auto_crop_enabled = self._has_enabled_stage("auto_crop")
         temporal_alignment_enabled = self._has_enabled_stage("temporal_alignment")
+        contrast_gain_alignment_enabled = self._has_enabled_stage("contrast_gain_alignment")
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         background_settings = self._background_subtraction_settings()
         states = [
@@ -4267,11 +4354,14 @@ class ContrastWindow(QMainWindow):
                     if self.active_mode == MODE_COMPARISON and panel_index == 1
                     else 0.0
                 ),
+                contrast_gain_alignment_enabled=contrast_gain_alignment_enabled,
                 background_subtraction_enabled=background_settings[panel_index][0],
                 background_level=background_settings[panel_index][1],
             )
             for panel_index, panel in enumerate(self.panels)
         ]
+        if contrast_gain_alignment_enabled:
+            states = align_source_gain_states(states)
         return self._apply_source_pipeline_states(states)
 
     def _apply_source_pipeline_states(self, states: list[SourcePipelineState]) -> bool:
@@ -4292,6 +4382,7 @@ class ContrastWindow(QMainWindow):
         self,
         auto_crop: bool,
         temporal_alignment: bool,
+        contrast_gain_alignment: bool,
         auto_crop_size_offset: int,
         temporal_trim_offset_seconds: float,
         comparison_sync_offset_seconds: float,
@@ -4304,6 +4395,7 @@ class ContrastWindow(QMainWindow):
             == (
                 auto_crop,
                 temporal_alignment,
+                contrast_gain_alignment,
                 background_settings[panel_index][0],
                 background_settings[panel_index][1],
                 auto_crop_size_offset,
@@ -4655,10 +4747,15 @@ class ContrastWindow(QMainWindow):
             "Temporal alignment (trim onset)",
             2,
         )
+        self.contrast_gain_alignment_stage_drawer = StageDrawer(
+            "contrast_gain_alignment",
+            "Align fluoroscope contrast gain",
+            3,
+        )
         self.background_subtraction_stage_drawer = StageDrawer(
             "background_subtraction",
             "Manual background subtraction",
-            3,
+            4,
         )
         self.brightness_stage_drawer = StageDrawer(
             "brightness_stabilization",
@@ -4691,6 +4788,7 @@ class ContrastWindow(QMainWindow):
         )
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
         self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
+        self.contrast_gain_alignment_stage_check = self.contrast_gain_alignment_stage_drawer.enable_button
         self.background_subtraction_stage_check = self.background_subtraction_stage_drawer.enable_button
         self.gain_stage_check = self.gain_stage_drawer.enable_button
         self.brightness_stage_check = self.brightness_stage_drawer.enable_button
@@ -4708,6 +4806,7 @@ class ContrastWindow(QMainWindow):
         self.source_pipeline_stage_checks = [
             self.auto_crop_stage_check,
             self.temporal_alignment_stage_check,
+            self.contrast_gain_alignment_stage_check,
             self.background_subtraction_stage_check,
         ]
         self.frame_pipeline_stage_checks = [
@@ -4732,6 +4831,7 @@ class ContrastWindow(QMainWindow):
         self.source_pipeline_stage_drawers = [
             self.auto_crop_stage_drawer,
             self.temporal_alignment_stage_drawer,
+            self.contrast_gain_alignment_stage_drawer,
             self.background_subtraction_stage_drawer,
         ]
         self.frame_pipeline_stage_drawers = [
@@ -5368,6 +5468,13 @@ class ContrastWindow(QMainWindow):
         temporal_alignment_hint.setObjectName("subtleLabel")
         temporal_alignment_hint.setWordWrap(True)
         self.temporal_alignment_stage_drawer.content_layout.addWidget(temporal_alignment_hint)
+
+        gain_alignment_hint = QLabel(
+            "Matches the lower-gain control's pre-injection brightness and contrast excursion to the stronger comparison source."
+        )
+        gain_alignment_hint.setObjectName("subtleLabel")
+        gain_alignment_hint.setWordWrap(True)
+        self.contrast_gain_alignment_stage_drawer.content_layout.addWidget(gain_alignment_hint)
 
         temporal_trim_row = QHBoxLayout()
         temporal_trim_row.addWidget(QLabel("Start trim offset"))
@@ -6260,6 +6367,7 @@ class ContrastWindow(QMainWindow):
             or self._has_enabled_stage("temporal_change_heatmap")
             or self._has_enabled_stage("auto_crop")
             or self._has_enabled_stage("temporal_alignment")
+            or self._has_enabled_stage("contrast_gain_alignment")
             or any(enabled for enabled, _level in self._background_subtraction_settings())
             or any(
                 panel.crop_rect != panel._full_frame_rect() or panel.trim_start_frame != 0
@@ -6604,6 +6712,7 @@ class ContrastWindow(QMainWindow):
         mode = str(self.enhancement_mode_combo.currentData())
         auto_crop = self._has_enabled_stage("auto_crop")
         temporal_alignment = self._has_enabled_stage("temporal_alignment")
+        contrast_gain_alignment = self._has_enabled_stage("contrast_gain_alignment")
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         temporal_trim_offset_seconds = self.temporal_trim_offset_spin.value()
         comparison_sync_offset_seconds = self.comparison_sync_offset_spin.value()
@@ -6620,9 +6729,11 @@ class ContrastWindow(QMainWindow):
             precision=str(self.inference_precision_combo.currentData()),
             auto_crop=auto_crop,
             temporal_alignment=temporal_alignment,
+            contrast_gain_alignment=contrast_gain_alignment,
             source_pipeline_current=self._source_pipeline_is_current(
                 auto_crop,
                 temporal_alignment,
+                contrast_gain_alignment,
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds,
@@ -6701,6 +6812,7 @@ class ContrastWindow(QMainWindow):
                 request.comparison_sync_offset_seconds
                 if self.active_mode == MODE_COMPARISON and panel_index == 1
                 else 0.0,
+                request.contrast_gain_alignment,
                 request.background_subtraction_settings[panel_index][0],
                 request.background_subtraction_settings[panel_index][1],
             )
@@ -6721,9 +6833,13 @@ class ContrastWindow(QMainWindow):
                     if cancel_event.is_set():
                         return False
 
+            resolved_source_states = [state for state in source_states if state is not None]
+            if request.contrast_gain_alignment:
+                resolved_source_states = align_source_gain_states(resolved_source_states)
+
             source_states_applied = Event()
             self._source_pipeline_events.put(
-                (request.generation, [state for state in source_states if state is not None], source_states_applied)
+                (request.generation, resolved_source_states, source_states_applied)
             )
             while not source_states_applied.wait(0.05):
                 if cancel_event.is_set():
@@ -7050,7 +7166,11 @@ class ContrastWindow(QMainWindow):
         parameters = self.enhancement_parameters()
         backend_id = self._current_backend_id(stages)
         threshold = self.threshold_spin.value()
-        gain_corrected = stages.brightness_stabilization or stages.gain_stabilization
+        gain_corrected = (
+            stages.brightness_stabilization
+            or stages.gain_stabilization
+            or self._has_enabled_stage("contrast_gain_alignment")
+        )
 
         results: dict[str, AnalysisResult] = {}
         for panel in self.panels:
