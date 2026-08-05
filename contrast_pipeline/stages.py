@@ -180,6 +180,10 @@ def _temporal_token(parameters: EnhancementParameters, _backend_id: str, _noise_
     return (round(float(parameters.temporal_motion_sigma), 4),)
 
 
+def _mottle_token(parameters: EnhancementParameters, _backend_id: str, _noise_sigma: int) -> tuple[object, ...]:
+    return round(float(parameters.mottle_similarity_sigma), 4), int(parameters.mottle_window_radius)
+
+
 def _contrast_token(parameters: EnhancementParameters, _backend_id: str, _noise_sigma: int) -> tuple[object, ...]:
     return round(float(parameters.clahe_clip_limit), 4), int(parameters.clahe_tile_size)
 
@@ -228,6 +232,7 @@ BUILTIN_STAGES = StageRegistry(
         StageDefinition("scanline_correction", "Scanline correction", ExecutionShape.FRAME, 0.0025, 0.0035, processor=_scanline, token_builder=_scanline_token),
         StageDefinition("denoise", "Spatial denoising", ExecutionShape.BATCH, 0.0065, 0.0090, processor=_denoise, token_builder=_denoise_token),
         StageDefinition("temporal_filter", "Motion-aware temporal filtering", ExecutionShape.TEMPORAL, 0.0022, 0.0030, token_builder=_temporal_token, live_supported=False),
+        StageDefinition("quantum_mottle_filter", "Quantum mottle reduction", ExecutionShape.TEMPORAL, 0.0110, 0.0150, token_builder=_mottle_token, live_supported=False),
         StageDefinition("local_contrast", "Local contrast (CLAHE)", ExecutionShape.FRAME, 0.0028, 0.0038, processor=_local_contrast, token_builder=_contrast_token),
         StageDefinition("image_adjustments", "Image adjustments", ExecutionShape.FRAME, 0.0016, 0.0026, processor=_image_adjustments, token_builder=_adjustments_token),
         StageDefinition("final_smoothing", "Final Gaussian smoothing", ExecutionShape.FRAME, 0.0010, 0.0015, processor=_smooth, token_builder=_smoothing_token),

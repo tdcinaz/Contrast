@@ -12,6 +12,8 @@ class EnhancementParameters:
     scanline_bias_clip: float = 6.0
     scanline_sigma_y: float = 2.0
     temporal_motion_sigma: float = 12.0
+    mottle_similarity_sigma: float = 12.0
+    mottle_window_radius: int = 2
     clahe_clip_limit: float = 1.0
     clahe_tile_size: int = 6
     adjustments_brightness_offset: int = 0
@@ -46,6 +48,7 @@ class EnhancementStages:
     scanline_correction: bool = False
     denoise: bool = False
     temporal_filter: bool = False
+    quantum_mottle_filter: bool = False
     local_contrast: bool = False
     image_adjustments: bool = False
     final_smoothing: bool = False
@@ -57,6 +60,7 @@ class EnhancementStages:
         "scanline_correction",
         "denoise",
         "temporal_filter",
+        "quantum_mottle_filter",
         "local_contrast",
         "image_adjustments",
         "final_smoothing",

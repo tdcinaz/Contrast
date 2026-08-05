@@ -830,6 +830,28 @@ def motion_aware_temporal_filter(
     return np.clip(temporal, 0, 255).astype(np.uint8)
 
 
+def reduce_quantum_mottle(
+    frames: list[np.ndarray],
+    similarity_sigma: float,
+) -> np.ndarray:
+    if not frames:
+        raise ValueError("Quantum mottle reduction requires at least one frame.")
+
+    center_index = len(frames) // 2
+    center = frames[center_index].astype(np.float32)
+    weighted_sum = center.copy()
+    weight_sum = np.ones_like(center)
+    safe_sigma = max(0.1, float(similarity_sigma))
+    for index, frame in enumerate(frames):
+        if index == center_index:
+            continue
+        neighbor = frame.astype(np.float32)
+        weight = np.exp(-np.abs(neighbor - center) / safe_sigma)
+        weighted_sum += neighbor * weight
+        weight_sum += weight
+    return np.clip(np.rint(weighted_sum / weight_sum), 0, 255).astype(np.uint8)
+
+
 def enhance_local_contrast(gray: np.ndarray, clip_limit: float, tile_size: int) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
     return clahe.apply(gray)
@@ -2549,6 +2571,14 @@ class VideoPanel(QFrame):
                 )
                 return transformed, perf_counter() - started_at
 
+            def apply_mottle(frames: list[np.ndarray]) -> tuple[np.ndarray, float]:
+                started_at = perf_counter()
+                transformed = reduce_quantum_mottle(
+                    frames,
+                    stage_parameters.mottle_similarity_sigma,
+                )
+                return transformed, perf_counter() - started_at
+
             def drain_frame() -> bool:
                 nonlocal active_seconds
                 frame_index, future = pending_frames.popleft()
@@ -2600,6 +2630,47 @@ class VideoPanel(QFrame):
                                 ),
                             )
                         )
+                    while pending_frames:
+                        drain_frame()
+                elif stage_key == "quantum_mottle_filter":
+                    radius = max(1, int(stage_parameters.mottle_window_radius))
+                    window_size = radius * 2 + 1
+                    mottle_window: deque[tuple[int, np.ndarray]] = deque()
+
+                    def submit_mottle_window() -> None:
+                        if len(mottle_window) < window_size:
+                            return
+                        center_index = mottle_window[radius][0]
+                        frames = [frame for _, frame in mottle_window]
+                        pending_frames.append(
+                            (center_index, frame_executor.submit(apply_mottle, frames))
+                        )
+
+                    while True:
+                        item = input_queue.get()
+                        if item is STREAM_END:
+                            break
+                        if cancelled.is_set():
+                            continue
+                        next_item = cast(tuple[int, np.ndarray], item)
+                        if not mottle_window:
+                            mottle_window.extend([next_item] * radius)
+                        mottle_window.append(next_item)
+                        if len(mottle_window) >= window_size:
+                            submit_mottle_window()
+                            mottle_window.popleft()
+                        if len(pending_frames) >= frame_executor.max_workers:
+                            drain_frame()
+
+                    if mottle_window and not cancelled.is_set():
+                        last_item = mottle_window[-1]
+                        for _ in range(radius):
+                            mottle_window.append(last_item)
+                            if len(mottle_window) >= window_size:
+                                submit_mottle_window()
+                                mottle_window.popleft()
+                            if len(pending_frames) >= frame_executor.max_workers:
+                                drain_frame()
                     while pending_frames:
                         drain_frame()
                 elif stage_key == "denoise" and denoiser is not None:
@@ -2936,7 +3007,12 @@ class VideoPanel(QFrame):
         segmentation_mask: np.ndarray | None = None
         for stage in stages.enabled_stage_instances(default_parameters):
             parameters = stage.parameters or default_parameters
-            if stage.key in {"temporal_filter", "brightness_stabilization", "roi_extraction"}:
+            if stage.key in {
+                "temporal_filter",
+                "quantum_mottle_filter",
+                "brightness_stabilization",
+                "roi_extraction",
+            }:
                 continue
             if stage.key == "segmentation":
                 if parameters.segmentation_mode == "dark_contrast":
@@ -3684,6 +3760,7 @@ class ContrastWindow(QMainWindow):
             "brightness_stabilization",
             "roi_extraction",
             "temporal_filter",
+            "quantum_mottle_filter",
         ):
             for drawer in self._stage_drawers(stage_key):
                 if not enabled:
@@ -4544,23 +4621,24 @@ class ContrastWindow(QMainWindow):
         self.scanline_stage_drawer = StageDrawer("scanline_correction", "Scanline correction", 6)
         self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 7)
         self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 8)
-        self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 9)
-        self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 10)
-        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 11)
+        self.mottle_stage_drawer = StageDrawer("quantum_mottle_filter", "Quantum mottle reduction", 9)
+        self.contrast_stage_drawer = StageDrawer("local_contrast", "Local contrast (CLAHE)", 10)
+        self.adjustments_stage_drawer = StageDrawer("image_adjustments", "Image adjustments", 11)
+        self.smoothing_stage_drawer = StageDrawer("final_smoothing", "Final Gaussian smoothing", 12)
         self.segmentation_stage_drawer = StageDrawer(
             "segmentation",
             "Brightness-coded contrast segmentation",
-            12,
+            13,
         )
         self.analysis_stage_drawer = StageDrawer(
             "roi_residence_analysis",
             "ROI residence analysis",
-            13,
+            14,
         )
         self.frame_brightness_analysis_stage_drawer = StageDrawer(
             "frame_brightness_analysis",
             "Frame brightness analysis",
-            14,
+            15,
         )
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
         self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
@@ -4571,6 +4649,7 @@ class ContrastWindow(QMainWindow):
         self.scanline_stage_check = self.scanline_stage_drawer.enable_button
         self.denoise_stage_check = self.denoise_stage_drawer.enable_button
         self.temporal_stage_check = self.temporal_stage_drawer.enable_button
+        self.mottle_stage_check = self.mottle_stage_drawer.enable_button
         self.contrast_stage_check = self.contrast_stage_drawer.enable_button
         self.adjustments_stage_check = self.adjustments_stage_drawer.enable_button
         self.smoothing_stage_check = self.smoothing_stage_drawer.enable_button
@@ -4589,6 +4668,7 @@ class ContrastWindow(QMainWindow):
             self.scanline_stage_check,
             self.denoise_stage_check,
             self.temporal_stage_check,
+            self.mottle_stage_check,
             self.contrast_stage_check,
             self.adjustments_stage_check,
             self.smoothing_stage_check,
@@ -4612,6 +4692,7 @@ class ContrastWindow(QMainWindow):
             self.scanline_stage_drawer,
             self.denoise_stage_drawer,
             self.temporal_stage_drawer,
+            self.mottle_stage_drawer,
             self.contrast_stage_drawer,
             self.adjustments_stage_drawer,
             self.smoothing_stage_drawer,
@@ -4726,6 +4807,8 @@ class ContrastWindow(QMainWindow):
             "scanline_clip_spin": "scanlineBiasClip",
             "scanline_sigma_spin": "scanlineSigmaY",
             "temporal_sigma_spin": "temporalMotionSigma",
+            "mottle_similarity_sigma_spin": "mottleSimilaritySigma",
+            "mottle_window_combo": "mottleWindowRadius",
             "clahe_clip_spin": "claheClipLimit",
             "clahe_tile_spin": "claheTileSize",
             "adjustments_brightness_spin": "adjustmentsBrightness",
@@ -4944,6 +5027,8 @@ class ContrastWindow(QMainWindow):
             scanline_bias_clip=float(value("scanlineBiasClip", 6.0)),
             scanline_sigma_y=float(value("scanlineSigmaY", 2.0)),
             temporal_motion_sigma=float(value("temporalMotionSigma", 12.0)),
+            mottle_similarity_sigma=float(value("mottleSimilaritySigma", 12.0)),
+            mottle_window_radius=int(value("mottleWindowRadius", 2)),
             clahe_clip_limit=float(value("claheClipLimit", 1.0)),
             clahe_tile_size=int(value("claheTileSize", 6)),
             adjustments_brightness_offset=int(value("adjustmentsBrightness", 0)),
@@ -5376,6 +5461,30 @@ class ContrastWindow(QMainWindow):
         temporal_row.addWidget(self.temporal_sigma_spin)
         self.temporal_stage_drawer.content_layout.addLayout(temporal_row)
 
+        mottle_similarity_row = QHBoxLayout()
+        mottle_similarity_row.addWidget(QLabel("Similarity sigma"))
+        self.mottle_similarity_sigma_spin = QDoubleSpinBox()
+        self.mottle_similarity_sigma_spin.setRange(1.0, 60.0)
+        self.mottle_similarity_sigma_spin.setSingleStep(0.5)
+        self.mottle_similarity_sigma_spin.setDecimals(1)
+        self.mottle_similarity_sigma_spin.setValue(12.0)
+        self.mottle_similarity_sigma_spin.setToolTip(
+            "Higher values remove more grain; lower values preserve faster intensity changes"
+        )
+        mottle_similarity_row.addWidget(self.mottle_similarity_sigma_spin)
+        self.mottle_stage_drawer.content_layout.addLayout(mottle_similarity_row)
+
+        mottle_window_row = QHBoxLayout()
+        mottle_window_row.addWidget(QLabel("Temporal window"))
+        self.mottle_window_combo = QComboBox()
+        self.mottle_window_combo.addItem("3 frames", 1)
+        self.mottle_window_combo.addItem("5 frames", 2)
+        self.mottle_window_combo.addItem("7 frames", 3)
+        self.mottle_window_combo.setCurrentIndex(1)
+        self.mottle_window_combo.setToolTip("Longer windows remove more grain but span more time")
+        mottle_window_row.addWidget(self.mottle_window_combo)
+        self.mottle_stage_drawer.content_layout.addLayout(mottle_window_row)
+
         clahe_clip_row = QHBoxLayout()
         clahe_clip_row.addWidget(QLabel("CLAHE clip limit"))
         self.clahe_clip_spin = QDoubleSpinBox()
@@ -5517,6 +5626,7 @@ class ContrastWindow(QMainWindow):
         self.gain_auto_target_check.toggled.connect(self._on_gain_auto_target_toggled)
         self.roi_soften_check.toggled.connect(self._on_roi_soften_toggled)
         self.segmentation_mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
+        self.mottle_window_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         for spin in [
             self.auto_crop_size_offset_spin,
             self.temporal_trim_offset_spin,
@@ -5529,6 +5639,7 @@ class ContrastWindow(QMainWindow):
             self.scanline_clip_spin,
             self.scanline_sigma_spin,
             self.temporal_sigma_spin,
+            self.mottle_similarity_sigma_spin,
             self.clahe_clip_spin,
             self.clahe_tile_spin,
             self.adjustments_brightness_spin,
@@ -6069,6 +6180,7 @@ class ContrastWindow(QMainWindow):
             scanline_correction=self._has_enabled_stage("scanline_correction"),
             denoise=self._has_enabled_stage("denoise"),
             temporal_filter=self._has_enabled_stage("temporal_filter"),
+            quantum_mottle_filter=self._has_enabled_stage("quantum_mottle_filter"),
             local_contrast=self._has_enabled_stage("local_contrast"),
             image_adjustments=self._has_enabled_stage("image_adjustments"),
             final_smoothing=self._has_enabled_stage("final_smoothing"),
@@ -6296,6 +6408,8 @@ class ContrastWindow(QMainWindow):
             scanline_bias_clip=self.scanline_clip_spin.value(),
             scanline_sigma_y=self.scanline_sigma_spin.value(),
             temporal_motion_sigma=self.temporal_sigma_spin.value(),
+            mottle_similarity_sigma=self.mottle_similarity_sigma_spin.value(),
+            mottle_window_radius=int(self.mottle_window_combo.currentData()),
             clahe_clip_limit=self.clahe_clip_spin.value(),
             clahe_tile_size=self.clahe_tile_spin.value(),
             adjustments_brightness_offset=self.adjustments_brightness_spin.value(),
