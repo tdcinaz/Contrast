@@ -404,6 +404,7 @@ class SourcePipelineState:
     detected_trim_start: int | None
     background_reference: np.ndarray | None
     configuration: tuple[object, ...]
+    trim_end: int = 0
     metal_needle_mask: np.ndarray | None = None
     gain_alignment_baseline: float = 0.0
     gain_alignment_span: float = 0.0
@@ -2019,6 +2020,7 @@ class VideoPanel(QFrame):
         progress_callback: Callable[[str, float, float], bool] | None = None,
         auto_crop_size_offset: int = 0,
         temporal_trim_offset_seconds: float = 0.0,
+        temporal_end_trim_seconds: float = 0.0,
         comparison_sync_offset_seconds: float = 0.0,
         contrast_gain_alignment_enabled: bool = False,
         background_subtraction_enabled: bool = False,
@@ -2065,6 +2067,7 @@ class VideoPanel(QFrame):
             completed_stages += 1
 
         next_trim_start = 0
+        next_trim_end = 0
         trim_cache_key: tuple[int, int, int, int] | None = None
         detected_trim_start: int | None = None
         if temporal_alignment_enabled:
@@ -2080,6 +2083,8 @@ class VideoPanel(QFrame):
             detected_trim_start = cached_trim_start
             trim_offset_frames = round((temporal_trim_offset_seconds + comparison_sync_offset_seconds) * self.info.fps)
             next_trim_start = max(0, min(self.info.frame_count - 1, cached_trim_start + trim_offset_frames))
+            end_trim_frames = round(max(0.0, temporal_end_trim_seconds) * self.info.fps)
+            next_trim_end = max(0, min(self.info.frame_count - next_trim_start - 1, end_trim_frames))
             report("Aligning contrast timing", 1.0, 1.0)
 
         gain_alignment_baseline = 0.0
@@ -2125,6 +2130,7 @@ class VideoPanel(QFrame):
         return SourcePipelineState(
             crop_rect=next_crop_rect,
             trim_start=next_trim_start,
+            trim_end=next_trim_end,
             auto_crop_rect=auto_crop_rect,
             trim_cache_key=trim_cache_key,
             detected_trim_start=detected_trim_start,
@@ -2138,6 +2144,7 @@ class VideoPanel(QFrame):
                 background_level,
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
+                temporal_end_trim_seconds,
                 comparison_sync_offset_seconds,
                 metal_needle_removal_enabled,
             ),
@@ -2163,7 +2170,7 @@ class VideoPanel(QFrame):
         if state.trim_cache_key is not None and state.detected_trim_start is not None:
             self._trim_start_cache[state.trim_cache_key] = state.detected_trim_start
 
-        available_frames = max(1, self.info.frame_count - state.trim_start)
+        available_frames = max(1, self.info.frame_count - state.trim_start - state.trim_end)
         if (
             state.crop_rect == self.crop_rect
             and state.trim_start == self.trim_start_frame
@@ -2175,7 +2182,7 @@ class VideoPanel(QFrame):
             return True
 
         self.crop_rect = QRect(state.crop_rect)
-        self.set_trim_window(state.trim_start)
+        self.set_trim_window(state.trim_start, available_frames)
         self._activate_stage_roi_selection(None)
         return True
 
@@ -2185,6 +2192,7 @@ class VideoPanel(QFrame):
         temporal_alignment_enabled: bool,
         auto_crop_size_offset: int = 0,
         temporal_trim_offset_seconds: float = 0.0,
+        temporal_end_trim_seconds: float = 0.0,
         comparison_sync_offset_seconds: float = 0.0,
         contrast_gain_alignment_enabled: bool = False,
         background_subtraction_enabled: bool = False,
@@ -2197,6 +2205,7 @@ class VideoPanel(QFrame):
                 temporal_alignment_enabled,
                 auto_crop_size_offset=auto_crop_size_offset,
                 temporal_trim_offset_seconds=temporal_trim_offset_seconds,
+                temporal_end_trim_seconds=temporal_end_trim_seconds,
                 comparison_sync_offset_seconds=comparison_sync_offset_seconds,
                 contrast_gain_alignment_enabled=contrast_gain_alignment_enabled,
                 background_subtraction_enabled=background_subtraction_enabled,
@@ -4459,6 +4468,7 @@ class ContrastWindow(QMainWindow):
                 temporal_alignment_enabled,
                 auto_crop_size_offset=auto_crop_size_offset,
                 temporal_trim_offset_seconds=self.temporal_trim_offset_spin.value(),
+                temporal_end_trim_seconds=self.temporal_end_trim_spin.value(),
                 comparison_sync_offset_seconds=(
                     self.comparison_sync_offset_spin.value()
                     if self.active_mode == MODE_COMPARISON and panel_index == 1
@@ -4496,6 +4506,7 @@ class ContrastWindow(QMainWindow):
         contrast_gain_alignment: bool,
         auto_crop_size_offset: int,
         temporal_trim_offset_seconds: float,
+        temporal_end_trim_seconds: float,
         comparison_sync_offset_seconds: float,
         background_settings: tuple[tuple[bool, int], ...],
         metal_needle_removal: bool,
@@ -4512,6 +4523,7 @@ class ContrastWindow(QMainWindow):
                 background_settings[panel_index][1],
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
+                temporal_end_trim_seconds,
                 comparison_sync_offset_seconds if self.active_mode == MODE_COMPARISON and panel_index == 1 else 0.0,
                 metal_needle_removal,
             )
@@ -5061,6 +5073,7 @@ class ContrastWindow(QMainWindow):
         widget_names = {
             "auto_crop_size_offset_spin": "autoCropSizeOffset",
             "temporal_trim_offset_spin": "temporalTrimOffset",
+            "temporal_end_trim_spin": "temporalEndTrim",
             "comparison_sync_offset_spin": "comparisonSyncOffset",
             "denoise_strength_label": "denoiseStrengthLabel",
             "enhancement_mode_combo": "denoiseMode",
@@ -5609,6 +5622,19 @@ class ContrastWindow(QMainWindow):
         temporal_trim_row.addWidget(self.temporal_trim_offset_spin)
         self._add_parameter_slider(temporal_trim_row, self.temporal_trim_offset_spin)
         self.temporal_alignment_stage_drawer.content_layout.addLayout(temporal_trim_row)
+
+        temporal_end_trim_row = QHBoxLayout()
+        temporal_end_trim_row.addWidget(QLabel("End trim"))
+        self.temporal_end_trim_spin = QDoubleSpinBox()
+        self.temporal_end_trim_spin.setRange(0.0, 30.0)
+        self.temporal_end_trim_spin.setSingleStep(0.05)
+        self.temporal_end_trim_spin.setDecimals(2)
+        self.temporal_end_trim_spin.setValue(0.0)
+        self.temporal_end_trim_spin.setSuffix(" s")
+        self.temporal_end_trim_spin.setToolTip("Remove this duration from the end of each video after temporal alignment")
+        temporal_end_trim_row.addWidget(self.temporal_end_trim_spin)
+        self._add_parameter_slider(temporal_end_trim_row, self.temporal_end_trim_spin)
+        self.temporal_alignment_stage_drawer.content_layout.addLayout(temporal_end_trim_row)
 
         self.comparison_sync_offset_row = QWidget()
         comparison_sync_layout = QHBoxLayout(self.comparison_sync_offset_row)
@@ -6857,6 +6883,7 @@ class ContrastWindow(QMainWindow):
         metal_needle_removal = self._has_enabled_stage("metal_needle_removal")
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         temporal_trim_offset_seconds = self.temporal_trim_offset_spin.value()
+        temporal_end_trim_seconds = self.temporal_end_trim_spin.value()
         comparison_sync_offset_seconds = self.comparison_sync_offset_spin.value()
         background_subtraction_settings = self._background_subtraction_settings()
         self._enhancement_generation += 1
@@ -6878,12 +6905,14 @@ class ContrastWindow(QMainWindow):
                 contrast_gain_alignment,
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
+                temporal_end_trim_seconds,
                 comparison_sync_offset_seconds,
                 background_subtraction_settings,
                 metal_needle_removal,
             ),
             auto_crop_size_offset=auto_crop_size_offset,
             temporal_trim_offset_seconds=temporal_trim_offset_seconds,
+            temporal_end_trim_seconds=temporal_end_trim_seconds,
             comparison_sync_offset_seconds=comparison_sync_offset_seconds,
             background_subtraction_settings=background_subtraction_settings,
             metal_needle_removal=metal_needle_removal,
@@ -6953,6 +6982,7 @@ class ContrastWindow(QMainWindow):
                 source_progress,
                 request.auto_crop_size_offset,
                 request.temporal_trim_offset_seconds,
+                request.temporal_end_trim_seconds,
                 request.comparison_sync_offset_seconds
                 if self.active_mode == MODE_COMPARISON and panel_index == 1
                 else 0.0,

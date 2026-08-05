@@ -114,8 +114,8 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(first.crop_rect.getRect(), expected_crop.getRect())
         self.assertEqual(second.crop_rect.getRect(), expected_crop.getRect())
-        self.assertEqual(first.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, False))
-        self.assertEqual(second.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, False))
+        self.assertEqual(first.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, 0.0, False))
+        self.assertEqual(second.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, 0.0, False))
         detect_crop.assert_called_once()
 
     def test_temporal_offsets_adjust_detected_trim_without_changing_cache_key(self) -> None:
@@ -139,12 +139,14 @@ class AutoCropTests(unittest.TestCase):
                 False,
                 True,
                 temporal_trim_offset_seconds=0.20,
+                temporal_end_trim_seconds=1.25,
                 comparison_sync_offset_seconds=0.30,
             )
 
         self.assertEqual(state.trim_start, 35)
+        self.assertEqual(state.trim_end, 12)
         self.assertEqual(state.detected_trim_start, 30)
-        self.assertEqual(state.configuration, (False, True, False, False, 0, 0, 0.20, 0.30, False))
+        self.assertEqual(state.configuration, (False, True, False, False, 0, 0, 0.20, 1.25, 0.30, False))
 
     def test_gain_alignment_raises_only_the_lower_contrast_response(self) -> None:
         common = dict(
@@ -207,6 +209,8 @@ class AutoCropTests(unittest.TestCase):
                 self.trim_start_frame = 0
                 self.trim_frame_count = 20
                 self.clear_enhancement_cache = Mock()
+                self.set_trim_window = Mock()
+                self._activate_stage_roi_selection = Mock()
 
         panel = SourcePanel()
         state = main.SourcePipelineState(
@@ -217,13 +221,14 @@ class AutoCropTests(unittest.TestCase):
             detected_trim_start=None,
             background_reference=np.full((240, 400), 160, dtype=np.uint8),
             configuration=(False, False, False, True, 48, 0, 0.0, 0.0),
+            trim_end=4,
         )
 
         self.assertTrue(panel.apply_source_pipeline_state(state))
         self.assertTrue(panel.background_subtraction_enabled)
         self.assertEqual(panel.background_level, 48)
         self.assertIsNotNone(panel.background_reference)
-        panel.clear_enhancement_cache.assert_called_once()
+        panel.set_trim_window.assert_called_once_with(0, 16)
 
     def test_dsa_acquires_mask_before_injection_without_temporal_trimming(self) -> None:
         class Source:

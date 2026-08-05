@@ -466,6 +466,7 @@ class SegmentationTests(unittest.TestCase):
         window.speed_slider.setValue(175)
         window.threshold_spin.setValue(0.35)
         window.temporal_trim_offset_spin.setValue(-0.25)
+        window.temporal_end_trim_spin.setValue(1.50)
         window.comparison_sync_offset_spin.setValue(0.12)
 
         with TemporaryDirectory() as directory:
@@ -492,6 +493,7 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(window.speed_slider.value(), 175)
         self.assertEqual(window.threshold_spin.value(), 0.35)
         self.assertEqual(window.temporal_trim_offset_spin.value(), -0.25)
+        self.assertEqual(window.temporal_end_trim_spin.value(), 1.50)
         self.assertEqual(window.comparison_sync_offset_spin.value(), 0.12)
 
     def test_source_and_live_pipeline_defaults_are_separate(self) -> None:
