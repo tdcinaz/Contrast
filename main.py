@@ -971,10 +971,15 @@ def compute_temporal_change_summary(
     return cumulative_change, cumulative_change / elapsed_seconds
 
 
-def render_temporal_change_heatmap(cumulative_change: np.ndarray, change_rate: np.ndarray) -> np.ndarray:
+def render_temporal_change_heatmap(
+    cumulative_change: np.ndarray,
+    change_rate: np.ndarray,
+    cumulative_peak: float | None = None,
+    rate_peak: float | None = None,
+) -> np.ndarray:
     """Render total change as color and mean change rate as color brightness."""
-    total_peak = float(np.max(cumulative_change))
-    rate_peak = float(np.max(change_rate))
+    total_peak = float(np.max(cumulative_change)) if cumulative_peak is None else float(cumulative_peak)
+    rate_peak = float(np.max(change_rate)) if rate_peak is None else float(rate_peak)
     total_normalized = (
         np.clip(cumulative_change * (255.0 / total_peak), 0, 255).astype(np.uint8)
         if total_peak > 0
@@ -988,6 +993,14 @@ def render_temporal_change_heatmap(cumulative_change: np.ndarray, change_rate: n
     heatmap = cv2.applyColorMap(total_normalized, cv2.COLORMAP_TURBO)
     brightness = 0.25 + 0.75 * (rate_normalized.astype(np.float32) / 255.0)
     return np.clip(heatmap.astype(np.float32) * brightness[..., np.newaxis], 0, 255).astype(np.uint8)
+
+
+def temporal_change_heatmap_peaks(
+    results: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> tuple[float, float]:
+    cumulative_peak = max((float(np.max(cumulative)) for cumulative, _rate in results.values()), default=0.0)
+    rate_peak = max((float(np.max(rate)) for _cumulative, rate in results.values()), default=0.0)
+    return cumulative_peak, rate_peak
 
 
 def detect_aneurysm_roi(
@@ -7383,13 +7396,17 @@ class ContrastWindow(QMainWindow):
         self.frame_brightness_plots.clear()
 
     def refresh_temporal_change_views(self) -> None:
+        shared_scale = self.active_mode == MODE_COMPARISON and len(self.temporal_change_results) > 1
+        cumulative_peak, rate_peak = temporal_change_heatmap_peaks(self.temporal_change_results) if shared_scale else (None, None)
         for panel in self.panels:
             result = self.temporal_change_results.get(panel.label)
             if result is None:
                 panel.set_temporal_change_heatmap(None)
                 continue
             cumulative_change, change_rate = result
-            panel.set_temporal_change_heatmap(render_temporal_change_heatmap(cumulative_change, change_rate))
+            panel.set_temporal_change_heatmap(
+                render_temporal_change_heatmap(cumulative_change, change_rate, cumulative_peak, rate_peak)
+            )
         self.temporal_change_view_check.setEnabled(bool(self.temporal_change_results) and self.active_mode != MODE_LIVE)
         if self.temporal_change_view_check.isChecked():
             for panel in self.panels:

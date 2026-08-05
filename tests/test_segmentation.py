@@ -35,6 +35,7 @@ from main import (
     segment_dark_contrast,
     segment_temporal_change_map,
     segment_temporal_change_contrast,
+    temporal_change_heatmap_peaks,
 )
 
 
@@ -177,6 +178,40 @@ class SegmentationTests(unittest.TestCase):
 
         np.testing.assert_array_equal(total, np.asarray([[10.0, 2.0], [5.0, 12.0]]))
         np.testing.assert_array_equal(rate, np.asarray([[10.0, 2.0], [5.0, 12.0]]))
+
+    def test_temporal_change_heatmap_uses_shared_comparison_peaks(self) -> None:
+        results = {
+            "Pre-deployment": (np.asarray([[3.0, 8.0]]), np.asarray([[1.5, 4.0]])),
+            "Post-deployment": (np.asarray([[5.0, 12.0]]), np.asarray([[2.0, 6.0]])),
+        }
+
+        cumulative_peak, rate_peak = temporal_change_heatmap_peaks(results)
+
+        self.assertEqual(cumulative_peak, 12.0)
+        self.assertEqual(rate_peak, 6.0)
+
+    def test_comparison_heatmap_views_share_rendering_peaks(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window.active_mode = MODE_COMPARISON
+        panels = [
+            SimpleNamespace(label="Pre-deployment", set_temporal_change_heatmap=lambda _heatmap: None),
+            SimpleNamespace(label="Post-deployment", set_temporal_change_heatmap=lambda _heatmap: None),
+        ]
+        window.panels = panels
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        window.temporal_change_results = {
+            "Pre-deployment": (np.asarray([[3.0]]), np.asarray([[1.5]])),
+            "Post-deployment": (np.asarray([[12.0]]), np.asarray([[6.0]])),
+        }
+
+        with patch.object(main, "render_temporal_change_heatmap", return_value=np.zeros((1, 1, 3), dtype=np.uint8)) as render:
+            window.refresh_temporal_change_views()
+
+        self.assertEqual(render.call_count, 2)
+        for call in render.call_args_list:
+            self.assertEqual(call.args[2:], (12.0, 6.0))
 
     def test_temporal_change_view_is_mutually_exclusive_with_source_view(self) -> None:
         app = QApplication.instance() or QApplication([])
