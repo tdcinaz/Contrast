@@ -104,3 +104,4 @@ class EnhancementRequest:
     auto_crop_size_offset: int = 0
     temporal_trim_offset_seconds: float = 0.0
     comparison_sync_offset_seconds: float = 0.0
+    background_subtraction_settings: tuple[tuple[bool, int], ...] = ()

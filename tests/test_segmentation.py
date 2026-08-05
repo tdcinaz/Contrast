@@ -38,6 +38,16 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_comparison_report_title_uses_shared_device_and_test_identifier(self) -> None:
+        self.assertEqual(
+            main.comparison_report_title([Path("CArm_Study42_pre_01.avi"), Path("CArm_Study42_post_02.mov")]),
+            "CArm Study42 - Contrast Residence Comparison",
+        )
+        self.assertEqual(
+            main.comparison_report_title([Path("pre.mp4"), Path("post.mp4")]),
+            "Contrast ROI Residence Comparison",
+        )
+
     def test_comparison_pdf_report_writes_enhanced_images_and_residence_curves(self) -> None:
         QApplication.instance() or QApplication([])
         frame = np.full((40, 60), 120, dtype=np.uint8)
@@ -220,7 +230,10 @@ class SegmentationTests(unittest.TestCase):
             ), patch.object(window, "on_pipeline_stages_changed"):
                 self.assertTrue(window._load_config_file(config_path, show_error=False))
 
-        self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
+        self.assertEqual(
+            [drawer.stage_key for drawer in window.source_pipeline_stage_drawers],
+            ["auto_crop", "temporal_alignment", "background_subtraction"],
+        )
         self.assertTrue(all(not drawer.isHidden() for drawer in window.source_pipeline_stage_drawers))
         self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization", "local_contrast", "local_contrast"])
         self.assertTrue(window.live_pipeline_stage_drawers[1].enable_button.isChecked())
@@ -238,7 +251,10 @@ class SegmentationTests(unittest.TestCase):
         window = ContrastWindow()
         self.addCleanup(window.close)
 
-        self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
+        self.assertEqual(
+            [drawer.stage_key for drawer in window.source_pipeline_stage_drawers],
+            ["auto_crop", "temporal_alignment", "background_subtraction"],
+        )
         self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization"])
 
     def test_default_pipeline_settings_restore_stages_without_video_paths(self) -> None:
@@ -297,10 +313,20 @@ class SegmentationTests(unittest.TestCase):
 
         apply_source.assert_not_called()
         rebuild.assert_called_once()
-        self.assertTrue(all(drawer.enable_button.isChecked() for drawer in window.pipeline_stage_drawers))
+        self.assertTrue(
+            all(
+                drawer.enable_button.isChecked()
+                for drawer in window.pipeline_stage_drawers
+                if drawer.stage_key != "background_subtraction"
+            )
+        )
+        self.assertFalse(window.background_subtraction_stage_check.isChecked())
 
         window._reorder_pipeline_stage_by_key("auto_crop", "brightness_stabilization")
-        self.assertEqual([drawer.stage_key for drawer in window.source_pipeline_stage_drawers], ["auto_crop", "temporal_alignment"])
+        self.assertEqual(
+            [drawer.stage_key for drawer in window.source_pipeline_stage_drawers],
+            ["auto_crop", "temporal_alignment", "background_subtraction"],
+        )
         self.assertEqual([drawer.stage_key for drawer in window.live_pipeline_stage_drawers], ["brightness_stabilization"])
 
     def test_live_mode_disables_temporal_stages_without_precomputing_video(self) -> None:

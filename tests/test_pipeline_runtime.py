@@ -14,6 +14,7 @@ from contrast_pipeline import (
     PipelineStage,
     StageDefinition,
     StageRegistry,
+    subtract_fluoroscopy_background,
 )
 
 
@@ -38,6 +39,15 @@ class PipelineRuntimeTests(unittest.TestCase):
     def test_roi_extraction_does_not_modify_frame_data(self) -> None:
         self.assertFalse(BUILTIN_STAGES.require("roi_extraction").modifies_frame_data)
         self.assertTrue(BUILTIN_STAGES.require("local_contrast").modifies_frame_data)
+
+    def test_manual_background_subtraction_removes_static_dark_background(self) -> None:
+        background = np.array([[40, 75, 100, 200]], dtype=np.uint8)
+        frame = np.array([[40, 75, 70, 230]], dtype=np.uint8)
+
+        result = subtract_fluoroscopy_background(frame, background, 10)
+
+        np.testing.assert_array_equal(result, np.array([[0, 0, 20, 0]], dtype=np.uint8))
+        self.assertEqual(BUILTIN_STAGES.require("background_subtraction").execution_shape, ExecutionShape.SOURCE)
 
     def test_frame_executor_preserves_stage_order_and_instance_settings(self) -> None:
         calls: list[int] = []

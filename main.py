@@ -64,6 +64,7 @@ from contrast_pipeline import (
     ExecutionShape,
     FrameContext,
     PipelineStage,
+    subtract_fluoroscopy_background,
 )
 from frame_scheduler import AdaptiveFrameExecutor
 from logging_setup import configure_logging, install_exception_logging
@@ -81,6 +82,18 @@ MODE_LIVE = "live"
 MODE_RECENT = "recent"
 MODE_SELECT = "select"
 LOGGER = logging.getLogger("contrast.main")
+
+
+def comparison_report_title(paths: list[Path]) -> str:
+    prefixes: list[str] = []
+    for path in paths:
+        parts = path.stem.rsplit("_", 2)
+        if len(parts) != 3 or parts[1].lower() not in {"pre", "post"} or not parts[2].isdigit():
+            return "Contrast ROI Residence Comparison"
+        prefixes.append(parts[0])
+    if len(prefixes) == 2 and prefixes[0] == prefixes[1] and prefixes[0]:
+        return f"{prefixes[0].replace('_', ' ')} - Contrast Residence Comparison"
+    return "Contrast ROI Residence Comparison"
 
 
 def _report_frame(panel: VideoPanel, frame_index: int) -> np.ndarray | None:
@@ -130,9 +143,10 @@ def render_comparison_report(path: Path, panels: list[VideoPanel], results: dict
     frames = [_report_frame(panel, frame_index) for panel in panels]
     if any(frame is None for frame in frames):
         return False
+    report_title = comparison_report_title([panel.path for panel in panels])
     writer = QPdfWriter(str(path))
     writer.setResolution(144)
-    writer.setTitle("Contrast ROI Residence Comparison")
+    writer.setTitle(report_title)
     painter = QPainter(writer)
     page = writer.pageLayout().paintRectPixels(writer.resolution())
     margin = 72
@@ -143,7 +157,7 @@ def render_comparison_report(path: Path, panels: list[VideoPanel], results: dict
     title_font.setBold(True)
     painter.setPen(QColor("#172033"))
     painter.setFont(title_font)
-    painter.drawText(margin, margin, "Contrast ROI Residence Comparison")
+    painter.drawText(margin, margin, report_title)
     body_font = QFont()
     body_font.setPointSize(9)
     painter.setFont(body_font)
@@ -397,7 +411,8 @@ class SourcePipelineState:
     auto_crop_rect: QRect | None
     trim_cache_key: tuple[int, int, int, int] | None
     detected_trim_start: int | None
-    configuration: tuple[bool, bool, int, float, float]
+    background_reference: np.ndarray | None
+    configuration: tuple[bool, bool, bool, int, int, float, float]
 
 
 @dataclass(slots=True)
@@ -1698,7 +1713,10 @@ class VideoPanel(QFrame):
         self.crop_rect = QRect(0, 0, self.info.width, self.info.height)
         self._auto_crop_rect_cache: QRect | None = None
         self._trim_start_cache: dict[tuple[int, int, int, int], int] = {}
-        self.source_pipeline_configuration: tuple[bool, bool] | None = None
+        self.source_pipeline_configuration: tuple[object, ...] | None = None
+        self.background_subtraction_enabled = False
+        self.background_level = 0
+        self.background_reference: np.ndarray | None = None
         self.capture = cv2.VideoCapture(str(path))
         self.trim_start_frame = 0
         self.trim_frame_count = self.info.frame_count
@@ -1778,11 +1796,13 @@ class VideoPanel(QFrame):
         auto_crop_size_offset: int = 0,
         temporal_trim_offset_seconds: float = 0.0,
         comparison_sync_offset_seconds: float = 0.0,
+        background_subtraction_enabled: bool = False,
+        background_level: int = 0,
     ) -> SourcePipelineState:
         temporal_alignment_enabled = temporal_alignment_enabled and not self.live_input
         full_rect = self._full_frame_rect()
         next_crop_rect = full_rect
-        source_stage_count = int(auto_crop_enabled) + int(temporal_alignment_enabled)
+        source_stage_count = int(auto_crop_enabled) + int(temporal_alignment_enabled) + int(background_subtraction_enabled)
         completed_stages = 0
 
         def report(stage: str, done: float, total: float) -> bool:
@@ -1829,15 +1849,28 @@ class VideoPanel(QFrame):
             next_trim_start = max(0, min(self.info.frame_count - 1, cached_trim_start + trim_offset_frames))
             report("Aligning contrast timing", 1.0, 1.0)
 
+        background_reference = None
+        if background_subtraction_enabled:
+            background_reference = self._sample_background_reference(
+                next_crop_rect,
+                next_trim_start,
+                lambda done, total: report("Sampling fluoroscopy background", done, total),
+            )
+            report("Sampling fluoroscopy background", 1.0, 1.0)
+            completed_stages += 1
+
         return SourcePipelineState(
             crop_rect=next_crop_rect,
             trim_start=next_trim_start,
             auto_crop_rect=auto_crop_rect,
             trim_cache_key=trim_cache_key,
             detected_trim_start=detected_trim_start,
+            background_reference=background_reference,
             configuration=(
                 auto_crop_enabled,
                 temporal_alignment_enabled,
+                background_subtraction_enabled,
+                background_level,
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds,
@@ -1845,7 +1878,11 @@ class VideoPanel(QFrame):
         )
 
     def apply_source_pipeline_state(self, state: SourcePipelineState) -> bool:
+        configuration_changed = self.source_pipeline_configuration != state.configuration
         self.source_pipeline_configuration = state.configuration
+        self.background_subtraction_enabled = state.configuration[2]
+        self.background_level = state.configuration[3]
+        self.background_reference = state.background_reference
         if state.auto_crop_rect is not None:
             self._auto_crop_rect_cache = QRect(state.auto_crop_rect)
         if state.trim_cache_key is not None and state.detected_trim_start is not None:
@@ -1857,7 +1894,10 @@ class VideoPanel(QFrame):
             and state.trim_start == self.trim_start_frame
             and self.trim_frame_count == available_frames
         ):
-            return False
+            if not configuration_changed:
+                return False
+            self.clear_enhancement_cache()
+            return True
 
         self.crop_rect = QRect(state.crop_rect)
         self.set_trim_window(state.trim_start)
@@ -1871,6 +1911,8 @@ class VideoPanel(QFrame):
         auto_crop_size_offset: int = 0,
         temporal_trim_offset_seconds: float = 0.0,
         comparison_sync_offset_seconds: float = 0.0,
+        background_subtraction_enabled: bool = False,
+        background_level: int = 0,
     ) -> bool:
         return self.apply_source_pipeline_state(
             self.calculate_source_pipeline(
@@ -1879,6 +1921,8 @@ class VideoPanel(QFrame):
                 auto_crop_size_offset=auto_crop_size_offset,
                 temporal_trim_offset_seconds=temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds=comparison_sync_offset_seconds,
+                background_subtraction_enabled=background_subtraction_enabled,
+                background_level=background_level,
             )
         )
 
@@ -1896,12 +1940,44 @@ class VideoPanel(QFrame):
                 ok, frame = capture.read()
                 if not ok:
                     break
-                gray_frames.append(cv2.cvtColor(crop_frame(frame, active_crop_rect), cv2.COLOR_BGR2GRAY))
+                gray = cv2.cvtColor(crop_frame(frame, active_crop_rect), cv2.COLOR_BGR2GRAY)
+                gray_frames.append(gray)
                 if progress_callback is not None and not progress_callback(frame_index + 1, frame_count):
                     break
         finally:
             capture.release()
         return gray_frames
+
+    def _sample_background_reference(
+        self,
+        crop_rect: QRect,
+        trim_start: int,
+        progress_callback: Callable[[int, int], bool] | None = None,
+    ) -> np.ndarray | None:
+        sample_count = min(
+            self.info.frame_count,
+            max(3, min(round(self.info.fps * 2), trim_start + 1)),
+        )
+        capture = cv2.VideoCapture(str(self.path))
+        samples: list[np.ndarray] = []
+        try:
+            for frame_index in range(sample_count):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                samples.append(cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY))
+                if progress_callback is not None and not progress_callback(frame_index + 1, sample_count):
+                    break
+        finally:
+            capture.release()
+        if not samples:
+            return None
+        return np.percentile(np.stack(samples, axis=0), 75.0, axis=0).astype(np.uint8)
+
+    def _subtract_background(self, gray: np.ndarray) -> np.ndarray:
+        if not self.background_subtraction_enabled or self.background_reference is None:
+            return gray
+        return subtract_fluoroscopy_background(gray, self.background_reference, self.background_level)
 
     def set_trim_window(self, start_frame: int, frame_count: int | None = None) -> None:
         max_start = max(0, self.info.frame_count - 1)
@@ -2415,6 +2491,7 @@ class VideoPanel(QFrame):
                     if not ok:
                         raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
                     gray = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
+                    gray = self._subtract_background(gray)
                     active_seconds += perf_counter() - started_at
                     source_output.append(gray)
                     if not enqueue(queues[0], (index, gray)):
@@ -2810,10 +2887,14 @@ class VideoPanel(QFrame):
 
     def _display_frame(self, frame: np.ndarray, apply_enhancement: bool | None = None) -> None:
         self.current_frame = frame
+        source_frame = frame
+        if self.background_subtraction_enabled:
+            source_frame = self._subtract_background(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            source_frame = cv2.cvtColor(source_frame, cv2.COLOR_GRAY2BGR)
         if apply_enhancement is None:
             apply_enhancement = self.enhance_display
         can_enhance = self.enhanced_frames is not None and 0 <= self.current_frame_index < len(self.enhanced_frames)
-        enhanced_frame = frame
+        enhanced_frame = source_frame
         if apply_enhancement and can_enhance:
             enhanced = cv2.imdecode(self.enhanced_frames[self.current_frame_index], cv2.IMREAD_GRAYSCALE)
             if enhanced is not None:
@@ -2827,7 +2908,7 @@ class VideoPanel(QFrame):
                     mask = cv2.imdecode(self.segmentation_masks[self.current_frame_index], cv2.IMREAD_GRAYSCALE)
                     if mask is not None:
                         enhanced_frame = overlay_segmentation_mask(enhanced_frame, mask)
-        self.display.set_frames(frame, enhanced_frame)
+        self.display.set_frames(source_frame, enhanced_frame)
 
     def read_next(self, playback: bool = False) -> bool:
         if not self.live_input and self.current_frame_index >= self.playback_frame_count - 1:
@@ -2928,6 +3009,7 @@ class VideoPanel(QFrame):
         self._auto_crop_rect_cache = None
         self._trim_start_cache.clear()
         self.source_pipeline_configuration = None
+        self.background_reference = None
         self.capture = cv2.VideoCapture(str(path))
         self.path_label.setText(path.name)
         self.set_trim_window(0)
@@ -3598,6 +3680,7 @@ class ContrastWindow(QMainWindow):
     def _set_live_incompatible_stages_enabled(self, enabled: bool) -> None:
         for stage_key in (
             "temporal_alignment",
+            "background_subtraction",
             "brightness_stabilization",
             "roi_extraction",
             "temporal_filter",
@@ -4058,6 +4141,7 @@ class ContrastWindow(QMainWindow):
         auto_crop_enabled = self._has_enabled_stage("auto_crop")
         temporal_alignment_enabled = self._has_enabled_stage("temporal_alignment")
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
+        background_settings = self._background_subtraction_settings()
         states = [
             panel.calculate_source_pipeline(
                 auto_crop_enabled,
@@ -4069,6 +4153,8 @@ class ContrastWindow(QMainWindow):
                     if self.active_mode == MODE_COMPARISON and panel_index == 1
                     else 0.0
                 ),
+                background_subtraction_enabled=background_settings[panel_index][0],
+                background_level=background_settings[panel_index][1],
             )
             for panel_index, panel in enumerate(self.panels)
         ]
@@ -4095,6 +4181,7 @@ class ContrastWindow(QMainWindow):
         auto_crop_size_offset: int,
         temporal_trim_offset_seconds: float,
         comparison_sync_offset_seconds: float,
+        background_settings: tuple[tuple[bool, int], ...],
     ) -> bool:
         if not self.panels:
             return True
@@ -4103,12 +4190,22 @@ class ContrastWindow(QMainWindow):
             == (
                 auto_crop,
                 temporal_alignment,
+                background_settings[panel_index][0],
+                background_settings[panel_index][1],
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds if self.active_mode == MODE_COMPARISON and panel_index == 1 else 0.0,
             )
             for panel_index, panel in enumerate(self.panels)
         )
+
+    def _background_subtraction_settings(self) -> tuple[tuple[bool, int], ...]:
+        controls = (
+            (self.background_video_one_check, self.background_video_one_level_spin),
+            (self.background_video_two_check, self.background_video_two_level_spin),
+        )
+        stage_enabled = self.background_subtraction_stage_check.isChecked()
+        return tuple((stage_enabled and check.isChecked(), level.value()) for check, level in controls[: len(self.panels)])
 
     def _build_ui(self) -> None:
         self.play_button = QPushButton()
@@ -4432,6 +4529,11 @@ class ContrastWindow(QMainWindow):
             "Temporal alignment (trim onset)",
             2,
         )
+        self.background_subtraction_stage_drawer = StageDrawer(
+            "background_subtraction",
+            "Manual background subtraction",
+            3,
+        )
         self.brightness_stage_drawer = StageDrawer(
             "brightness_stabilization",
             "Gain / brightness stabilization",
@@ -4462,6 +4564,7 @@ class ContrastWindow(QMainWindow):
         )
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
         self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
+        self.background_subtraction_stage_check = self.background_subtraction_stage_drawer.enable_button
         self.gain_stage_check = self.gain_stage_drawer.enable_button
         self.brightness_stage_check = self.brightness_stage_drawer.enable_button
         self.roi_stage_check = self.roi_stage_drawer.enable_button
@@ -4477,6 +4580,7 @@ class ContrastWindow(QMainWindow):
         self.source_pipeline_stage_checks = [
             self.auto_crop_stage_check,
             self.temporal_alignment_stage_check,
+            self.background_subtraction_stage_check,
         ]
         self.frame_pipeline_stage_checks = [
             self.brightness_stage_check,
@@ -4499,6 +4603,7 @@ class ContrastWindow(QMainWindow):
         self.source_pipeline_stage_drawers = [
             self.auto_crop_stage_drawer,
             self.temporal_alignment_stage_drawer,
+            self.background_subtraction_stage_drawer,
         ]
         self.frame_pipeline_stage_drawers = [
             self.brightness_stage_drawer,
@@ -5156,6 +5261,42 @@ class ContrastWindow(QMainWindow):
         self._add_parameter_slider(comparison_sync_layout, self.comparison_sync_offset_spin)
         self.temporal_alignment_stage_drawer.content_layout.addWidget(self.comparison_sync_offset_row)
 
+        background_hint = QLabel(
+            "Builds a pre-injection reference for each video and keeps only darkening caused by injected contrast."
+        )
+        background_hint.setObjectName("subtleLabel")
+        background_hint.setWordWrap(True)
+        self.background_subtraction_stage_drawer.content_layout.addWidget(background_hint)
+        self.background_video_rows: list[QWidget] = []
+        background_controls = (
+            ("Video 1", "backgroundVideo1Enabled", "backgroundVideo1Level"),
+            ("Video 2", "backgroundVideo2Enabled", "backgroundVideo2Level"),
+        )
+        for label, enabled_name, level_name in background_controls:
+            row_widget = QWidget()
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            enabled = QCheckBox(label)
+            enabled.setObjectName(enabled_name)
+            level = QSpinBox()
+            level.setObjectName(level_name)
+            level.setRange(0, 255)
+            level.setValue(0)
+            level.setPrefix("Threshold ")
+            level.setSuffix(" levels")
+            level.setToolTip("Minimum darkening below the reference retained as contrast")
+            row.addWidget(enabled)
+            row.addWidget(level)
+            self._add_parameter_slider(row, level)
+            self.background_subtraction_stage_drawer.content_layout.addWidget(row_widget)
+            self.background_video_rows.append(row_widget)
+            if enabled_name == "backgroundVideo1Enabled":
+                self.background_video_one_check = enabled
+                self.background_video_one_level_spin = level
+            else:
+                self.background_video_two_check = enabled
+                self.background_video_two_level_spin = level
+
         brightness_hint = QLabel(
             "Corrects frame-wide gain and brightness jitter from robust, temporally stable image probes."
         )
@@ -5402,6 +5543,11 @@ class ContrastWindow(QMainWindow):
             self.segmentation_area_spin,
         ]:
             spin.valueChanged.connect(self.on_enhancement_settings_changed)
+        self.background_video_one_check.toggled.connect(self._on_background_subtraction_video_toggled)
+        self.background_video_two_check.toggled.connect(self._on_background_subtraction_video_toggled)
+        self.background_video_one_level_spin.valueChanged.connect(self.on_enhancement_settings_changed)
+        self.background_video_two_level_spin.valueChanged.connect(self.on_enhancement_settings_changed)
+        self.background_subtraction_stage_check.toggled.connect(self._on_background_subtraction_stage_toggled)
 
     def _add_sliders_to_parameter_layout(self, layout: QHBoxLayout | QVBoxLayout) -> None:
         parameter_spins: list[tuple[QHBoxLayout | QVBoxLayout, QSpinBox | QDoubleSpinBox]] = []
@@ -5938,6 +6084,7 @@ class ContrastWindow(QMainWindow):
             or self._has_enabled_stage("frame_brightness_analysis")
             or self._has_enabled_stage("auto_crop")
             or self._has_enabled_stage("temporal_alignment")
+            or any(enabled for enabled, _level in self._background_subtraction_settings())
             or any(
                 panel.crop_rect != panel._full_frame_rect() or panel.trim_start_frame != 0
                 for panel in self.panels
@@ -6103,6 +6250,35 @@ class ContrastWindow(QMainWindow):
 
     def _update_temporal_alignment_controls(self) -> None:
         self.comparison_sync_offset_row.setVisible(self.active_mode == MODE_COMPARISON)
+        labels = ("Pre-deployment", "Post-deployment") if self.active_mode == MODE_COMPARISON else ("Video",)
+        checks = (self.background_video_one_check, self.background_video_two_check)
+        for index, row in enumerate(self.background_video_rows):
+            row.setVisible(index < len(labels))
+            if index < len(labels):
+                checks[index].setText(labels[index])
+
+    def _on_background_subtraction_stage_toggled(self, enabled: bool) -> None:
+        if getattr(self, "_syncing_background_subtraction", False):
+            return
+        self._syncing_background_subtraction = True
+        try:
+            for check in (self.background_video_one_check, self.background_video_two_check):
+                check.setChecked(enabled)
+        finally:
+            self._syncing_background_subtraction = False
+        self.on_enhancement_settings_changed()
+
+    def _on_background_subtraction_video_toggled(self, _enabled: bool) -> None:
+        if getattr(self, "_syncing_background_subtraction", False):
+            return
+        self._syncing_background_subtraction = True
+        try:
+            self.background_subtraction_stage_check.setChecked(
+                self.background_video_one_check.isChecked() or self.background_video_two_check.isChecked()
+            )
+        finally:
+            self._syncing_background_subtraction = False
+        self.on_enhancement_settings_changed()
 
     def enhancement_parameters(self) -> EnhancementParameters:
         gain_min = self.gain_min_spin.value()
@@ -6182,6 +6358,7 @@ class ContrastWindow(QMainWindow):
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         temporal_trim_offset_seconds = self.temporal_trim_offset_spin.value()
         comparison_sync_offset_seconds = self.comparison_sync_offset_spin.value()
+        background_subtraction_settings = self._background_subtraction_settings()
         self._enhancement_generation += 1
         request = EnhancementRequest(
             generation=self._enhancement_generation,
@@ -6200,10 +6377,12 @@ class ContrastWindow(QMainWindow):
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
                 comparison_sync_offset_seconds,
+                background_subtraction_settings,
             ),
             auto_crop_size_offset=auto_crop_size_offset,
             temporal_trim_offset_seconds=temporal_trim_offset_seconds,
             comparison_sync_offset_seconds=comparison_sync_offset_seconds,
+            background_subtraction_settings=background_subtraction_settings,
         )
         self._enhancement_pending_request = request
         if self._enhancement_cancel is not None:
@@ -6272,6 +6451,8 @@ class ContrastWindow(QMainWindow):
                 request.comparison_sync_offset_seconds
                 if self.active_mode == MODE_COMPARISON and panel_index == 1
                 else 0.0,
+                request.background_subtraction_settings[panel_index][0],
+                request.background_subtraction_settings[panel_index][1],
             )
 
         if not request.source_pipeline_current:

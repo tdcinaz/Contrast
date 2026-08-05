@@ -16,6 +16,16 @@
       "key": "temporal_alignment"
     },
     {
+      "controls": {
+        "backgroundVideo1Enabled": false,
+        "backgroundVideo1Level": 0,
+        "backgroundVideo2Enabled": false,
+        "backgroundVideo2Level": 0
+      },
+      "enabled": false,
+      "key": "background_subtraction"
+    },
+    {
       "controls": {},
       "enabled": true,
       "key": "brightness_stabilization"

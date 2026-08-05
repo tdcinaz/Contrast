@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -93,8 +93,8 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(first.crop_rect.getRect(), expected_crop.getRect())
         self.assertEqual(second.crop_rect.getRect(), expected_crop.getRect())
-        self.assertEqual(first.configuration, (True, False, 0, 0.0, 0.0))
-        self.assertEqual(second.configuration, (True, False, 0, 0.0, 0.0))
+        self.assertEqual(first.configuration, (True, False, False, 0, 0, 0.0, 0.0))
+        self.assertEqual(second.configuration, (True, False, False, 0, 0, 0.0, 0.0))
         detect_crop.assert_called_once()
 
     def test_temporal_offsets_adjust_detected_trim_without_changing_cache_key(self) -> None:
@@ -123,7 +123,41 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(state.trim_start, 35)
         self.assertEqual(state.detected_trim_start, 30)
-        self.assertEqual(state.configuration, (False, True, 0, 0.20, 0.30))
+        self.assertEqual(state.configuration, (False, True, False, 0, 0, 0.20, 0.30))
+
+    def test_background_source_setting_change_invalidates_panel_cache(self) -> None:
+        class SourcePanel:
+            apply_source_pipeline_state = VideoPanel.apply_source_pipeline_state
+
+            def __init__(self) -> None:
+                self.source_pipeline_configuration = (False, False, False, 0, 0, 0.0, 0.0)
+                self.background_subtraction_enabled = False
+                self.background_level = 0
+                self.background_reference = None
+                self._auto_crop_rect_cache = None
+                self._trim_start_cache = {}
+                self.info = SimpleNamespace(frame_count=20)
+                self.crop_rect = QRect(0, 0, 400, 240)
+                self.trim_start_frame = 0
+                self.trim_frame_count = 20
+                self.clear_enhancement_cache = Mock()
+
+        panel = SourcePanel()
+        state = main.SourcePipelineState(
+            crop_rect=QRect(0, 0, 400, 240),
+            trim_start=0,
+            auto_crop_rect=None,
+            trim_cache_key=None,
+            detected_trim_start=None,
+            background_reference=np.full((240, 400), 160, dtype=np.uint8),
+            configuration=(False, False, True, 48, 0, 0.0, 0.0),
+        )
+
+        self.assertTrue(panel.apply_source_pipeline_state(state))
+        self.assertTrue(panel.background_subtraction_enabled)
+        self.assertEqual(panel.background_level, 48)
+        self.assertIsNotNone(panel.background_reference)
+        panel.clear_enhancement_cache.assert_called_once()
 
     def test_detects_trim_start_half_second_before_contrast_onset(self) -> None:
         frames: list[np.ndarray] = []

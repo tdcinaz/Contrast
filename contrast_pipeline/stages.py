@@ -146,6 +146,15 @@ def _smooth(frame: np.ndarray, parameters: EnhancementParameters, _context: Fram
     return cv2.GaussianBlur(source, (0, 0), sigmaX=parameters.smoothing_sigma_x)
 
 
+def subtract_fluoroscopy_background(
+    frame: np.ndarray,
+    background_reference: np.ndarray,
+    darkening_threshold: int,
+) -> np.ndarray:
+    darkening = background_reference.astype(np.int16) - frame.astype(np.int16) - int(darkening_threshold)
+    return np.clip(darkening, 0, 255).astype(np.uint8)
+
+
 def _gain_token(parameters: EnhancementParameters, _backend_id: str, _noise_sigma: int) -> tuple[object, ...]:
     target = "auto" if parameters.gain_use_auto_target else int(parameters.gain_target_median)
     return target, round(float(parameters.gain_min), 4), round(float(parameters.gain_max), 4)
@@ -203,6 +212,7 @@ BUILTIN_STAGES = StageRegistry(
     (
         StageDefinition("auto_crop", "Auto-crop fluoroscope field", ExecutionShape.SOURCE, 0.0, 0.0, live_supported=True),
         StageDefinition("temporal_alignment", "Temporal alignment (trim onset)", ExecutionShape.SOURCE, 0.0, 0.0, live_supported=False),
+        StageDefinition("background_subtraction", "Manual background subtraction", ExecutionShape.SOURCE, 0.0002, 0.0004, live_supported=False),
         StageDefinition("brightness_stabilization", "Gain / brightness stabilization", ExecutionShape.SEQUENCE, 0.0020, 0.0030, live_supported=False),
         StageDefinition(
             "roi_extraction",

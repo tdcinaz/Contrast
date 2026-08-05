@@ -2,7 +2,14 @@
 
 from .executor import FramePipelineExecutor
 from .models import EnhancementParameters, EnhancementRequest, EnhancementStages, PipelineStage
-from .stages import BUILTIN_STAGES, ExecutionShape, FrameContext, StageDefinition, StageRegistry
+from .stages import (
+    BUILTIN_STAGES,
+    ExecutionShape,
+    FrameContext,
+    StageDefinition,
+    StageRegistry,
+    subtract_fluoroscopy_background,
+)
 
 __all__ = [
     "BUILTIN_STAGES",
@@ -15,4 +22,5 @@ __all__ = [
     "PipelineStage",
     "StageDefinition",
     "StageRegistry",
+    "subtract_fluoroscopy_background",
 ]
