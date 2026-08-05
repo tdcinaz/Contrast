@@ -563,6 +563,56 @@ class StreamServerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "temporal_filter"):
                 load_stream_configuration(str(config_path))
 
+    def test_accepts_non_local_means_in_headless_configuration(self) -> None:
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "stream.json"
+            config_path.write_text(json.dumps({
+                "stream": {},
+                "pipeline": [{
+                    "key": "denoise",
+                    "enabled": True,
+                    "controls": {
+                        "denoiseMode": "non-local-means",
+                        "denoiseStrength": 5,
+                    },
+                }],
+            }))
+
+            _settings, stages, _parameters, strength, _auto_crop, denoiser = load_stream_configuration(
+                str(config_path)
+            )
+
+            self.assertIn("denoise", stages.enabled_stage_order)
+            self.assertEqual(strength, 5)
+            self.assertEqual(denoiser.mode, "non-local-means")
+
+    def test_accepts_ngc_tensor_nlm_in_headless_configuration(self) -> None:
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "stream.json"
+            config_path.write_text(json.dumps({
+                "stream": {},
+                "pipeline": [{
+                    "key": "denoise",
+                    "enabled": True,
+                    "controls": {
+                        "denoiseMode": "tensor-nlm-ngc",
+                        "denoiseStrength": 5,
+                        "denoiseBatchSize": 4,
+                        "denoisePrecision": "fp16",
+                    },
+                }],
+            }))
+
+            _settings, stages, _parameters, strength, _auto_crop, denoiser = load_stream_configuration(
+                str(config_path)
+            )
+
+            self.assertIn("denoise", stages.enabled_stage_order)
+            self.assertEqual(strength, 5)
+            self.assertEqual(denoiser.mode, "tensor-nlm-ngc")
+            self.assertEqual(denoiser.batch_size, 4)
+            self.assertEqual(denoiser.precision, "fp16")
+
 
 if __name__ == "__main__":
     unittest.main()

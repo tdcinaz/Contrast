@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from deep_denoiser import FFDNetDenoiser
+from deep_denoiser import FFDNetDenoiser, TensorNLMDenoiser
 from logging_setup import configure_logging
 
 
@@ -22,14 +22,19 @@ def respond(payload: dict[str, object]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=("ffdnet",), required=True)
-    parser.add_argument("--weights", type=Path, required=True)
+    parser.add_argument("--model", choices=("ffdnet", "tensor-nlm"), required=True)
+    parser.add_argument("--weights", type=Path)
     parser.add_argument("--precision", choices=("fp16", "fp32"), default="fp16")
     arguments = parser.parse_args()
 
     configure_logging("INFO")
     LOGGER.info("Starting NGC worker: model=%s precision=%s", arguments.model, arguments.precision)
-    denoiser = FFDNetDenoiser(arguments.weights, arguments.precision)
+    if arguments.model == "ffdnet":
+        if arguments.weights is None:
+            parser.error("--weights is required for FFDNet")
+        denoiser = FFDNetDenoiser(arguments.weights, arguments.precision)
+    else:
+        denoiser = TensorNLMDenoiser(arguments.precision)
     input_frames: np.memmap | None = None
     output_frames: np.memmap | None = None
     respond({"status": "ready", "device": denoiser.device_name})

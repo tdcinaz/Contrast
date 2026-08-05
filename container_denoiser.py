@@ -50,7 +50,7 @@ class ContainerDenoiser:
     def __init__(
         self,
         model_name: str,
-        weights_path: Path,
+        weights_path: Path | None,
         batch_size: int = 4,
         precision: str = "fp16",
         image: str = NGC_IMAGE,
@@ -61,8 +61,13 @@ class ContainerDenoiser:
             raise ValueError("NGC batch size must be between 1 and 16.")
         if precision not in {"fp16", "fp32"}:
             raise ValueError(f"Unsupported inference precision: {precision}")
-        weights_path = weights_path.resolve()
-        ensure_model_weights(model_name, weights_path)
+        if model_name not in {*MODEL_WEIGHTS, "tensor-nlm"}:
+            raise ValueError(f"Unsupported NGC model: {model_name}")
+        if model_name in MODEL_WEIGHTS:
+            if weights_path is None:
+                raise ValueError(f"NGC {model_name} requires a model checkpoint path.")
+            weights_path = weights_path.resolve()
+            ensure_model_weights(model_name, weights_path)
         LOGGER.info("Starting NGC %s worker: image=%s precision=%s batch_size=%s", model_name, image, precision, batch_size)
 
         image_check = subprocess.run(
@@ -101,11 +106,16 @@ class ContainerDenoiser:
             "ngc_denoiser_worker.py",
             "--model",
             model_name,
-            "--weights",
-            f"/workspace/contrast/{weights_path.relative_to(project_root)}",
             "--precision",
             precision,
         ]
+        if weights_path is not None:
+            command.extend(
+                (
+                    "--weights",
+                    f"/workspace/contrast/{weights_path.relative_to(project_root)}",
+                )
+            )
         self._process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,

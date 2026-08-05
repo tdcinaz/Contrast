@@ -26,9 +26,41 @@
       "key": "background_subtraction"
     },
     {
+      "controls": {
+        "mottleSimilaritySigma": 12.0,
+        "mottleWindowRadius": "2"
+      },
+      "enabled": true,
+      "key": "quantum_mottle_filter"
+    },
+    {
+      "controls": {
+        "mottleSimilaritySigma": 12.0,
+        "mottleWindowRadius": "2"
+      },
+      "enabled": true,
+      "key": "quantum_mottle_filter"
+    },
+    {
+      "controls": {
+        "mottleSimilaritySigma": 12.0,
+        "mottleWindowRadius": "2"
+      },
+      "enabled": true,
+      "key": "quantum_mottle_filter"
+    },
+    {
+      "controls": {
+        "mottleSimilaritySigma": 12.0,
+        "mottleWindowRadius": "2"
+      },
+      "enabled": true,
+      "key": "quantum_mottle_filter"
+    },
+    {
       "controls": {},
       "enabled": true,
-      "key": "brightness_stabilization"
+      "key": "frame_brightness_analysis"
     }
   ],
   "version": 1

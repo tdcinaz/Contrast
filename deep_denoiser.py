@@ -63,6 +63,110 @@ class FFDNet(nn.Module):
         return self.pixel_shuffle(output)[..., :height, :width]
 
 
+def tensor_non_local_means(
+    image: torch.Tensor,
+    strength: float,
+    template_window_size: int = 7,
+    search_window_size: int = 21,
+    shift_chunk_size: int = 32,
+) -> torch.Tensor:
+    if image.ndim != 4 or image.shape[1] != 1:
+        raise ValueError("Tensor NLM requires a batch of single-channel images.")
+    if template_window_size < 1 or template_window_size % 2 == 0:
+        raise ValueError("NLM template window size must be a positive odd number.")
+    if search_window_size < template_window_size or search_window_size % 2 == 0:
+        raise ValueError("NLM search window size must be odd and at least the template window size.")
+    if shift_chunk_size < 1:
+        raise ValueError("NLM shift chunk size must be positive.")
+    if strength <= 0:
+        return image.clone()
+
+    batch_size, _channels, height, width = image.shape
+    search_radius = search_window_size // 2
+    patch_radius = template_window_size // 2
+    padded = F.pad(image, (search_radius, search_radius, search_radius, search_radius), mode="reflect")
+    offsets = [
+        (offset_y, offset_x)
+        for offset_y in range(-search_radius, search_radius + 1)
+        for offset_x in range(-search_radius, search_radius + 1)
+    ]
+    weighted_sum = torch.zeros_like(image, dtype=torch.float32)
+    weight_sum = torch.zeros_like(image, dtype=torch.float32)
+    denominator = max(float(strength) ** 2, 1e-6)
+
+    for start in range(0, len(offsets), shift_chunk_size):
+        chunk = offsets[start : start + shift_chunk_size]
+        neighbors = torch.stack(
+            [
+                padded[
+                    :,
+                    :,
+                    search_radius + offset_y : search_radius + offset_y + height,
+                    search_radius + offset_x : search_radius + offset_x + width,
+                ]
+                for offset_y, offset_x in chunk
+            ],
+            dim=1,
+        )
+        squared_difference = (neighbors - image.unsqueeze(1)).square()
+        flat_difference = squared_difference.reshape(batch_size * len(chunk), 1, height, width)
+        flat_difference = F.pad(
+            flat_difference,
+            (patch_radius, patch_radius, patch_radius, patch_radius),
+            mode="reflect",
+        )
+        patch_distance = F.avg_pool2d(flat_difference, template_window_size, stride=1)
+        weights = torch.exp(-patch_distance / denominator).reshape(batch_size, len(chunk), 1, height, width)
+        weighted_sum += (neighbors * weights).sum(dim=1, dtype=torch.float32)
+        weight_sum += weights.sum(dim=1, dtype=torch.float32)
+
+    return weighted_sum / weight_sum.clamp_min(1e-12)
+
+
+class TensorNLMDenoiser:
+    def __init__(
+        self,
+        precision: str = "fp16",
+        template_window_size: int = 7,
+        search_window_size: int = 21,
+        shift_chunk_size: int = 32,
+    ) -> None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Tensor NLM requires a CUDA-capable NVIDIA GPU, but CUDA is not available.")
+        _validate_precision(precision)
+        self.precision = precision
+        self.template_window_size = template_window_size
+        self.search_window_size = search_window_size
+        self.shift_chunk_size = shift_chunk_size
+        self.device = torch.device("cuda", 0)
+        self.backend_id = (
+            f"tensor-nlm-ngc-{precision}-t{template_window_size}-s{search_window_size}-c{shift_chunk_size}"
+        )
+
+    @property
+    def device_name(self) -> str:
+        return torch.cuda.get_device_name(self.device)
+
+    def denoise_array(self, images: np.ndarray, noise_sigma: float) -> list[np.ndarray]:
+        if images.ndim != 3 or images.dtype != np.uint8:
+            raise ValueError("Tensor NLM requires a uint8 grayscale frame batch.")
+        if noise_sigma <= 0:
+            return [image.copy() for image in images]
+
+        dtype = torch.float16 if self.precision == "fp16" else torch.float32
+        tensor = torch.from_numpy(images).to(self.device, dtype=dtype, non_blocking=True).unsqueeze(1)
+        with torch.inference_mode():
+            output = tensor_non_local_means(
+                tensor,
+                noise_sigma,
+                self.template_window_size,
+                self.search_window_size,
+                self.shift_chunk_size,
+            )
+        output = output.squeeze(1).round().clamp(0, 255).to(torch.uint8)
+        return list(output.cpu().numpy())
+
+
 def download_weights(destination: Path, url: str, expected_sha256: str) -> str:
     LOGGER.info("Downloading FFDNet weights to %s", destination)
     destination.parent.mkdir(parents=True, exist_ok=True)

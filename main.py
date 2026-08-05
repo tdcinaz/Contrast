@@ -68,6 +68,7 @@ from contrast_pipeline import (
 )
 from frame_scheduler import AdaptiveFrameExecutor
 from logging_setup import configure_logging, install_exception_logging
+from opencv_denoiser import DEFAULT_NLM_BACKEND_ID, NonLocalMeansDenoiser
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIRECTORY = ROOT / "configs"
@@ -2252,6 +2253,10 @@ class VideoPanel(QFrame):
             return 0.0025
         if stage_key == "encode_enhanced":
             return 0.0018
+        if stage_key == "denoise" and str(stage_token[1][0]).startswith("non-local-means"):
+            return 0.0400
+        if stage_key == "denoise" and str(stage_token[1][0]).startswith("tensor-nlm"):
+            return 0.0550
         return BUILTIN_STAGES.require(stage_key).default_seconds_per_frame
 
     def _conservative_stage_seconds_per_frame(self, stage_token: tuple[str, tuple[object, ...]]) -> float:
@@ -2260,6 +2265,10 @@ class VideoPanel(QFrame):
             return 0.0035
         if stage_key == "encode_enhanced":
             return 0.0025
+        if stage_key == "denoise" and str(stage_token[1][0]).startswith("non-local-means"):
+            return 0.0600
+        if stage_key == "denoise" and str(stage_token[1][0]).startswith("tensor-nlm"):
+            return 0.0750
         return BUILTIN_STAGES.require(stage_key).conservative_seconds_per_frame
 
     def _estimated_stage_duration(self, stage_token: tuple[str, tuple[object, ...]], frame_count: int) -> float:
@@ -5054,16 +5063,24 @@ class ContrastWindow(QMainWindow):
             active_mode = str(mode.currentData()) if mode is not None else "ffdnet-ngc"
             stage_enabled = drawer.enable_button.isChecked()
             uses_ffdnet = stage_enabled and active_mode.startswith("ffdnet")
+            uses_nlm = active_mode in {"non-local-means", "tensor-nlm-ngc"}
+            uses_accelerator = uses_ffdnet or active_mode == "tensor-nlm-ngc"
             if strength_label is not None:
-                strength_label.setEnabled(uses_ffdnet)
+                strength_label.setText("NLM filter strength" if uses_nlm else "FFDNet noise sigma")
+                strength_label.setEnabled(stage_enabled)
             if strength is not None:
-                strength.setEnabled(uses_ffdnet)
+                strength.setToolTip(
+                    "OpenCV non-local means luminance filter strength"
+                    if uses_nlm
+                    else "FFDNet's assumed input noise standard deviation"
+                )
+                strength.setEnabled(stage_enabled)
                 self._sync_parameter_slider_enabled(strength)
             if batch_size is not None:
-                batch_size.setEnabled(uses_ffdnet)
+                batch_size.setEnabled(stage_enabled and uses_accelerator)
                 self._sync_parameter_slider_enabled(batch_size)
             if precision is not None:
-                precision.setEnabled(uses_ffdnet)
+                precision.setEnabled(stage_enabled and uses_accelerator)
 
     def _pipeline_scrollbar_reserve_width(self) -> int:
         scrollbar = self.pipeline_controls_scroll.verticalScrollBar()
@@ -5224,6 +5241,8 @@ class ContrastWindow(QMainWindow):
         self.enhancement_mode_combo = QComboBox()
         self.enhancement_mode_combo.addItem("NGC FFDNet (Docker)", "ffdnet-ngc")
         self.enhancement_mode_combo.addItem("Native FFDNet (GPU)", "ffdnet-native")
+        self.enhancement_mode_combo.addItem("NGC Tensor NLM (GPU)", "tensor-nlm-ngc")
+        self.enhancement_mode_combo.addItem("Non-local means (CPU)", "non-local-means")
         enhancement_mode_row.addWidget(self.enhancement_mode_combo, 1)
         self.denoise_stage_drawer.content_layout.addLayout(enhancement_mode_row)
 
@@ -6098,7 +6117,18 @@ class ContrastWindow(QMainWindow):
         denoiser = self.deep_denoisers.get(key)
         if denoiser is not None:
             return denoiser
-        if mode.endswith("-ngc"):
+        if mode == "non-local-means":
+            denoiser = NonLocalMeansDenoiser()
+        elif mode == "tensor-nlm-ngc":
+            from container_denoiser import ContainerDenoiser
+
+            denoiser = ContainerDenoiser(
+                "tensor-nlm",
+                None,
+                self.inference_batch_spin.value(),
+                str(self.inference_precision_combo.currentData()),
+            )
+        elif mode.endswith("-ngc"):
             from container_denoiser import ContainerDenoiser
 
             denoiser = ContainerDenoiser(
@@ -6107,13 +6137,15 @@ class ContrastWindow(QMainWindow):
                 self.inference_batch_spin.value(),
                 str(self.inference_precision_combo.currentData()),
             )
-        else:
+        elif mode == "ffdnet-native":
             from deep_denoiser import FFDNetDenoiser
 
             denoiser = FFDNetDenoiser(
                 ROOT / "models" / "ffdnet_gray.pth",
                 str(self.inference_precision_combo.currentData()),
             )
+        else:
+            raise ValueError(f"Unsupported denoiser mode: {mode}")
         self.deep_denoisers[key] = denoiser
         return denoiser
 
@@ -6140,13 +6172,15 @@ class ContrastWindow(QMainWindow):
         active_mode = str(self.enhancement_mode_combo.currentData())
         stages = self.enhancement_stages()
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
+        uses_accelerator = uses_ffdnet or (stages.denoise and active_mode == "tensor-nlm-ngc")
+        uses_spatial_denoiser = stages.denoise
         self.overlay_mask_check.setEnabled(bool(self.panels) and stages.segmentation)
-        self.denoise_strength_label.setEnabled(uses_ffdnet)
-        self.denoise_strength_spin.setEnabled(uses_ffdnet)
-        self.inference_batch_spin.setEnabled(uses_ffdnet)
+        self.denoise_strength_label.setEnabled(uses_spatial_denoiser)
+        self.denoise_strength_spin.setEnabled(uses_spatial_denoiser)
+        self.inference_batch_spin.setEnabled(uses_accelerator)
         self._sync_parameter_slider_enabled(self.denoise_strength_spin)
         self._sync_parameter_slider_enabled(self.inference_batch_spin)
-        self.inference_precision_combo.setEnabled(uses_ffdnet)
+        self.inference_precision_combo.setEnabled(uses_accelerator)
         self._sync_active_denoise_controls()
         self._refresh_desktop_stream_pipeline()
         if self.active_mode == MODE_LIVE:
@@ -6207,6 +6241,8 @@ class ContrastWindow(QMainWindow):
         mode = str(self.enhancement_mode_combo.currentData())
         if not stages.denoise:
             return "none"
+        if mode == "non-local-means":
+            return DEFAULT_NLM_BACKEND_ID
         precision = str(self.inference_precision_combo.currentData())
         if mode.endswith("-ngc"):
             return f"{mode.removesuffix('-ngc')}-ngc-26.06-{precision}-batch{self.inference_batch_spin.value()}"
@@ -6429,11 +6465,13 @@ class ContrastWindow(QMainWindow):
         stages = self.enhancement_stages()
         active_mode = str(self.enhancement_mode_combo.currentData())
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
+        uses_accelerator = uses_ffdnet or (stages.denoise and active_mode == "tensor-nlm-ngc")
+        uses_spatial_denoiser = stages.denoise
         self.overlay_mask_check.setEnabled(bool(self.panels) and stages.segmentation)
-        self.denoise_strength_label.setEnabled(uses_ffdnet)
-        self.denoise_strength_spin.setEnabled(uses_ffdnet)
-        self.inference_batch_spin.setEnabled(uses_ffdnet)
-        self.inference_precision_combo.setEnabled(uses_ffdnet)
+        self.denoise_strength_label.setEnabled(uses_spatial_denoiser)
+        self.denoise_strength_spin.setEnabled(uses_spatial_denoiser)
+        self.inference_batch_spin.setEnabled(uses_accelerator)
+        self.inference_precision_combo.setEnabled(uses_accelerator)
         self._sync_active_denoise_controls()
         self._refresh_desktop_stream_pipeline()
         if self.active_mode == MODE_LIVE:
@@ -6457,6 +6495,8 @@ class ContrastWindow(QMainWindow):
         self.on_pipeline_stages_changed()
 
     def _denoiser_key(self, mode: str) -> str:
+        if mode == "non-local-means":
+            return mode
         precision = str(self.inference_precision_combo.currentData())
         batch_size = self.inference_batch_spin.value()
         return f"{mode}:{precision}:batch{batch_size}"
@@ -6597,13 +6637,15 @@ class ContrastWindow(QMainWindow):
         if not request.stages.any_enabled:
             return True
 
-        use_deep_model = request.stages.denoise
-        denoiser_base_key = (
-            f"{request.mode}:{request.precision}:batch{request.batch_size}"
-            if use_deep_model
-            else ""
-        )
-        denoiser_count = len(self.panels) if request.mode.endswith("-ngc") and use_deep_model else int(use_deep_model)
+        use_denoiser = request.stages.denoise
+        denoiser_base_key = ""
+        if use_denoiser:
+            denoiser_base_key = (
+                request.mode
+                if request.mode == "non-local-means"
+                else f"{request.mode}:{request.precision}:batch{request.batch_size}"
+            )
+        denoiser_count = len(self.panels) if request.mode.endswith("-ngc") and use_denoiser else int(use_denoiser)
         active_denoiser_keys = {
             f"{denoiser_base_key}:worker{worker_index}"
             for worker_index in range(denoiser_count)
@@ -6617,14 +6659,25 @@ class ContrastWindow(QMainWindow):
             del self.deep_denoisers[key]
 
         denoisers: list[FrameDenoiser] = []
-        if use_deep_model:
+        if use_denoiser:
             for worker_index in range(denoiser_count):
                 denoiser_key = f"{denoiser_base_key}:worker{worker_index}"
                 if denoiser_key not in self.deep_denoisers:
                     with self._enhancement_progress_lock:
                         worker_label = f" worker {worker_index + 1}/{denoiser_count}" if denoiser_count > 1 else ""
                         self._enhancement_message = f"Loading {request.model_label}{worker_label}..."
-                    if request.mode.endswith("-ngc"):
+                    if request.mode == "non-local-means":
+                        self.deep_denoisers[denoiser_key] = NonLocalMeansDenoiser()
+                    elif request.mode == "tensor-nlm-ngc":
+                        from container_denoiser import ContainerDenoiser
+
+                        self.deep_denoisers[denoiser_key] = ContainerDenoiser(
+                            "tensor-nlm",
+                            None,
+                            request.batch_size,
+                            request.precision,
+                        )
+                    elif request.mode.endswith("-ngc"):
                         from container_denoiser import ContainerDenoiser
 
                         self.deep_denoisers[denoiser_key] = ContainerDenoiser(
@@ -6633,13 +6686,15 @@ class ContrastWindow(QMainWindow):
                             request.batch_size,
                             request.precision,
                         )
-                    else:
+                    elif request.mode == "ffdnet-native":
                         from deep_denoiser import FFDNetDenoiser
 
                         self.deep_denoisers[denoiser_key] = FFDNetDenoiser(
                             ROOT / "models" / "ffdnet_gray.pth",
                             request.precision,
                         )
+                    else:
+                        raise ValueError(f"Unsupported denoiser mode: {request.mode}")
                 denoisers.append(self.deep_denoisers[denoiser_key])
 
         if cancel_event.is_set():
@@ -7542,8 +7597,19 @@ def run_headless(config_path: Path) -> None:
     LOGGER.info("Loading headless configuration from %s", config_path)
     settings, stages, parameters, noise_sigma, auto_crop_enabled, denoiser_settings = load_stream_configuration(str(config_path))
     denoiser: FrameDenoiser | None = None
-    if stages.denoise:
-        if denoiser_settings.mode.endswith("-ngc"):
+    if "denoise" in stages.enabled_stage_order:
+        if denoiser_settings.mode == "non-local-means":
+            denoiser = NonLocalMeansDenoiser()
+        elif denoiser_settings.mode == "tensor-nlm-ngc":
+            from container_denoiser import ContainerDenoiser
+
+            denoiser = ContainerDenoiser(
+                "tensor-nlm",
+                None,
+                denoiser_settings.batch_size,
+                denoiser_settings.precision,
+            )
+        elif denoiser_settings.mode.endswith("-ngc"):
             from container_denoiser import ContainerDenoiser
 
             denoiser = ContainerDenoiser(

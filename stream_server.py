@@ -125,7 +125,7 @@ def load_stream_configuration(
         if key == "denoise":
             noise_sigma = int(_control_value(controls, "denoiseStrength", noise_sigma))
             mode = str(_control_value(controls, "denoiseMode", "ffdnet-ngc"))
-            if mode not in {"ffdnet-ngc", "ffdnet-native"}:
+            if mode not in {"ffdnet-ngc", "ffdnet-native", "tensor-nlm-ngc", "non-local-means"}:
                 raise ValueError(f"Unsupported headless denoiser mode: {mode}")
             denoiser_settings = DenoiserSettings(
                 mode=mode,
