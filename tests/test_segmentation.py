@@ -38,6 +38,39 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_manual_roi_selection_bypasses_auto_detection_and_has_a_distinct_cache_token(self) -> None:
+        automatic = EnhancementParameters()
+        manual = EnhancementParameters(roi_mode="manual", roi_manual_rect=(12, 18, 24, 30))
+
+        self.assertNotEqual(
+            main.BUILTIN_STAGES.require("roi_extraction").cache_token(automatic),
+            main.BUILTIN_STAGES.require("roi_extraction").cache_token(manual),
+        )
+        with patch.object(main, "detect_aneurysm_roi") as detect:
+            selection = main.extract_aneurysm_roi([np.zeros((64, 64), dtype=np.uint8)], 10.0, manual)
+
+        self.assertIsNotNone(selection)
+        assert selection is not None
+        self.assertEqual(selection.rect, QRect(12, 18, 24, 30))
+        self.assertTrue(np.all(selection.mask))
+        detect.assert_not_called()
+
+    def test_comparison_roi_modes_produce_independent_panel_parameters(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window._manual_roi_rects = [QRect(4, 6, 20, 24), None]
+        window.roi_mode_combos[0].setCurrentIndex(window.roi_mode_combos[0].findData("manual"))
+        window.roi_mode_combos[1].setCurrentIndex(window.roi_mode_combos[1].findData("auto"))
+
+        pre = window._roi_parameters_for_panel(0)
+        post = window._roi_parameters_for_panel(1)
+
+        self.assertEqual(pre.roi_mode, "manual")
+        self.assertEqual(pre.roi_manual_rect, (4, 6, 20, 24))
+        self.assertEqual(post.roi_mode, "auto")
+        self.assertIsNone(post.roi_manual_rect)
+
     def test_comparison_report_title_uses_shared_device_and_test_identifier(self) -> None:
         self.assertEqual(
             main.comparison_report_title([Path("CArm_Study42_pre_01.avi"), Path("CArm_Study42_post_02.mov")]),

@@ -21,6 +21,8 @@ class EnhancementParameters:
     adjustments_sharpen_amount: float = 0.0
     adjustments_gamma: float = 1.0
     smoothing_sigma_x: float = 0.55
+    roi_mode: str = "auto"
+    roi_manual_rect: tuple[int, int, int, int] | None = None
     roi_softening_enabled: bool = False
     roi_softening_radius_ratio: float = 0.12
     roi_softening_threshold: float = 0.10
@@ -109,3 +111,4 @@ class EnhancementRequest:
     temporal_trim_offset_seconds: float = 0.0
     comparison_sync_offset_seconds: float = 0.0
     background_subtraction_settings: tuple[tuple[bool, int], ...] = ()
+    roi_parameters_by_panel: tuple[EnhancementParameters, ...] = ()

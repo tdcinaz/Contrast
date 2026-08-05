@@ -9,7 +9,7 @@ import sys
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Full, Queue, SimpleQueue
 from threading import Event, Lock, Thread
@@ -1055,6 +1055,24 @@ def detect_aneurysm_roi(
     return ROISelection(roi, cropped_mask.astype(bool))
 
 
+def extract_aneurysm_roi(gray_frames: list[np.ndarray], fps: float, parameters: EnhancementParameters) -> ROISelection | None:
+    if parameters.roi_mode == "manual":
+        rect_values = parameters.roi_manual_rect
+        if rect_values is None:
+            return None
+        rect = QRect(*rect_values).normalized()
+        if rect.width() < 4 or rect.height() < 4:
+            return None
+        return ROISelection(rect, np.ones((rect.height(), rect.width()), dtype=bool))
+    return detect_aneurysm_roi(
+        gray_frames,
+        fps,
+        soften_mask=bool(parameters.roi_softening_enabled),
+        soften_radius_ratio=float(parameters.roi_softening_radius_ratio),
+        soften_threshold=float(parameters.roi_softening_threshold),
+    )
+
+
 def segment_temporal_change_map(
     temporal_change: np.ndarray,
     change_threshold: float,
@@ -1179,6 +1197,7 @@ def roi_mean(gray: np.ndarray, roi: QRect, roi_mask: np.ndarray | None = None) -
 
 class VideoDisplay(QLabel):
     roiChanged = Signal(QRect)
+    roiDrawn = Signal(QRect)
 
     def __init__(self, title: str, color: QColor, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1309,7 +1328,7 @@ class VideoDisplay(QLabel):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No frame loaded")
 
         if self._roi and self._roi.isValid() and self.frame_size != (0, 0):
-            display_roi = self._frame_to_display_rect(self._roi)
+            display_roi = self._frame_to_display_rect(self._roi, self._roi_display_rect())
             pen = QPen(self.roi_color, 2)
             painter.setPen(pen)
             painter.setBrush(QColor(self.roi_color.red(), self.roi_color.green(), self.roi_color.blue(), 35))
@@ -1324,7 +1343,8 @@ class VideoDisplay(QLabel):
                     polygon = QPolygon(
                         [
                             self._frame_to_display_point(
-                                QPoint(self._roi.x() + int(point[0][0]), self._roi.y() + int(point[0][1]))
+                                QPoint(self._roi.x() + int(point[0][0]), self._roi.y() + int(point[0][1])),
+                                self._roi_display_rect(),
                             )
                             for point in contour
                         ]
@@ -1341,7 +1361,7 @@ class VideoDisplay(QLabel):
         if event.button() != Qt.MouseButton.LeftButton or self.frame_size == (0, 0):
             return
         point = event.position().toPoint()
-        if not self._display_rect.contains(point):
+        if not self._roi_display_rect().contains(point):
             return
         self._drag_origin = point
         self._roi_mask = None
@@ -1353,8 +1373,9 @@ class VideoDisplay(QLabel):
         if self._drag_origin is None or self.frame_size == (0, 0):
             return
         point = event.position().toPoint()
-        point.setX(max(self._display_rect.left(), min(point.x(), self._display_rect.right())))
-        point.setY(max(self._display_rect.top(), min(point.y(), self._display_rect.bottom())))
+        display_rect = self._roi_display_rect()
+        point.setX(max(display_rect.left(), min(point.x(), display_rect.right())))
+        point.setY(max(display_rect.top(), min(point.y(), display_rect.bottom())))
         start = self._display_to_frame_point(self._drag_origin)
         end = self._display_to_frame_point(point)
         self._roi = QRect(start, end).normalized()
@@ -1367,37 +1388,44 @@ class VideoDisplay(QLabel):
         if self._roi and self._roi.width() >= 4 and self._roi.height() >= 4:
             self._roi_mask = np.ones((self._roi.height(), self._roi.width()), dtype=bool)
             self.roiChanged.emit(QRect(self._roi))
+            self.roiDrawn.emit(QRect(self._roi))
         else:
             self._roi = None
             self._roi_mask = None
         self.update()
 
     def _display_to_frame_point(self, point: QPoint) -> QPoint:
+        display_rect = self._roi_display_rect()
         width, height = self.frame_size
-        x_fraction = (point.x() - self._display_rect.left()) / max(1, self._display_rect.width())
-        y_fraction = (point.y() - self._display_rect.top()) / max(1, self._display_rect.height())
+        x_fraction = (point.x() - display_rect.left()) / max(1, display_rect.width())
+        y_fraction = (point.y() - display_rect.top()) / max(1, display_rect.height())
         x = round(max(0.0, min(1.0, x_fraction)) * (width - 1))
         y = round(max(0.0, min(1.0, y_fraction)) * (height - 1))
         return QPoint(x, y)
 
-    def _frame_to_display_rect(self, rect: QRect) -> QRect:
+    def _roi_display_rect(self) -> QRect:
+        return self._right_display_rect if self._comparison_enabled else self._display_rect
+
+    def _frame_to_display_rect(self, rect: QRect, display_rect: QRect | None = None) -> QRect:
+        display_rect = display_rect or self._display_rect
         width, height = self.frame_size
-        x_scale = self._display_rect.width() / max(1, width)
-        y_scale = self._display_rect.height() / max(1, height)
+        x_scale = display_rect.width() / max(1, width)
+        y_scale = display_rect.height() / max(1, height)
         return QRect(
-            round(self._display_rect.left() + rect.left() * x_scale),
-            round(self._display_rect.top() + rect.top() * y_scale),
+            round(display_rect.left() + rect.left() * x_scale),
+            round(display_rect.top() + rect.top() * y_scale),
             round(rect.width() * x_scale),
             round(rect.height() * y_scale),
         )
 
-    def _frame_to_display_point(self, point: QPoint) -> QPoint:
+    def _frame_to_display_point(self, point: QPoint, display_rect: QRect | None = None) -> QPoint:
+        display_rect = display_rect or self._display_rect
         width, height = self.frame_size
-        x_scale = self._display_rect.width() / max(1, width)
-        y_scale = self._display_rect.height() / max(1, height)
+        x_scale = display_rect.width() / max(1, width)
+        y_scale = display_rect.height() / max(1, height)
         return QPoint(
-            round(self._display_rect.left() + point.x() * x_scale),
-            round(self._display_rect.top() + point.y() * y_scale),
+            round(display_rect.left() + point.x() * x_scale),
+            round(display_rect.top() + point.y() * y_scale),
         )
 
 
@@ -1714,6 +1742,7 @@ class VideoDropPlaceholder(QFrame):
 
 class VideoPanel(QFrame):
     roiChanged = Signal()
+    roiDrawn = Signal(QRect)
     PANEL_MARGIN = 14
     PANEL_SPACING = 10
     TITLE_HEIGHT = 30
@@ -1765,6 +1794,7 @@ class VideoPanel(QFrame):
         self.display = VideoDisplay(label, color)
         self.display.set_comparison_enabled(self.comparison_display)
         self.display.roiChanged.connect(lambda _roi: self.roiChanged.emit())
+        self.display.roiDrawn.connect(self.roiDrawn.emit)
 
         self.title_label = QLabel(label)
         self.title_label.setObjectName("panelTitle")
@@ -2200,13 +2230,7 @@ class VideoPanel(QFrame):
                 return False
             parameters = stage.parameters or default_parameters
             if stage.key == "roi_extraction" and artifact_key not in self.roi_selection_cache:
-                self.roi_selection_cache[artifact_key] = detect_aneurysm_roi(
-                    frames,
-                    self.info.fps,
-                    soften_mask=bool(parameters.roi_softening_enabled),
-                    soften_radius_ratio=float(parameters.roi_softening_radius_ratio),
-                    soften_threshold=float(parameters.roi_softening_threshold),
-                )
+                self.roi_selection_cache[artifact_key] = extract_aneurysm_roi(frames, self.info.fps, parameters)
             elif stage.key == "segmentation" and artifact_key not in self.segmentation_mask_cache:
                 if parameters.segmentation_mode == "temporal_change":
                     temporal_change = self.temporal_change_map_cache.get(frame_prefix)
@@ -2848,12 +2872,8 @@ class VideoPanel(QFrame):
 
                     if stage_frames and not cancelled.is_set():
                         started_at = perf_counter()
-                        roi_outputs[self._artifact_cache_key(stage_prefix)] = detect_aneurysm_roi(
-                            [frame for _, frame in stage_frames],
-                            self.info.fps,
-                            soften_mask=bool(stage_parameters.roi_softening_enabled),
-                            soften_radius_ratio=float(stage_parameters.roi_softening_radius_ratio),
-                            soften_threshold=float(stage_parameters.roi_softening_threshold),
+                        roi_outputs[self._artifact_cache_key(stage_prefix)] = extract_aneurysm_roi(
+                            [frame for _, frame in stage_frames], self.info.fps, stage_parameters
                         )
                         active_seconds += perf_counter() - started_at
                         for frame_index, frame in stage_frames:
@@ -3624,6 +3644,7 @@ class ContrastWindow(QMainWindow):
         self._enhancement_stage_messages = ["Waiting", "Waiting"]
         self._enhancement_message = "Preparing enhanced videos..."
         self._loading_config = False
+        self._manual_roi_rects: list[QRect | None] = [None, None]
         self.enhancement_poll_timer = QTimer(self)
         self.enhancement_poll_timer.setInterval(30)
         self.enhancement_poll_timer.timeout.connect(self._poll_enhancement)
@@ -3839,10 +3860,14 @@ class ContrastWindow(QMainWindow):
                 else VideoPanel(labels[index], color, path)
             )
             panel.roiChanged.connect(self.on_roi_changed)
+            roi_drawn = getattr(panel, "roiDrawn", None)
+            if roi_drawn is not None:
+                roi_drawn.connect(lambda roi, panel_index=index: self._on_manual_roi_drawn(panel_index, roi))
             self.video_layout.addWidget(panel)
             self.panels.append(panel)
         self.pre_panel = self.panels[0] if self.panels else None
         self.post_panel = self.panels[1] if len(self.panels) > 1 else None
+        self._manual_roi_rects = [None] * len(self.panels)
         self.active_mode = MODE_LIVE if live_input else (MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE)
         self._update_temporal_alignment_controls()
         self.open_pre_action.setText(f"Open {self.pre_panel.label.lower()} video..." if self.pre_panel else "Open video 1...")
@@ -5416,6 +5441,25 @@ class ContrastWindow(QMainWindow):
         roi_hint.setWordWrap(True)
         self.roi_stage_drawer.content_layout.addWidget(roi_hint)
 
+        self.roi_video_mode_rows: list[QWidget] = []
+        self.roi_mode_combos: list[QComboBox] = []
+        for index in range(2):
+            mode_row = QWidget()
+            mode_layout = QHBoxLayout(mode_row)
+            mode_layout.setContentsMargins(0, 0, 0, 0)
+            mode_label = QLabel("ROI mode" if index == 0 else "Post-deployment ROI mode")
+            mode_combo = QComboBox()
+            mode_combo.addItem("Automatic", "auto")
+            mode_combo.addItem("Manual", "manual")
+            mode_combo.setObjectName(f"roiVideo{index + 1}Mode")
+            mode_combo.setToolTip("Draw on the enhanced video to switch this video to manual ROI selection")
+            mode_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
+            mode_layout.addWidget(mode_label)
+            mode_layout.addWidget(mode_combo)
+            self.roi_stage_drawer.content_layout.addWidget(mode_row)
+            self.roi_video_mode_rows.append(mode_row)
+            self.roi_mode_combos.append(mode_combo)
+
         roi_soften_row = QHBoxLayout()
         self.roi_soften_check = QCheckBox("Soften and expand mask")
         self.roi_soften_check.setChecked(False)
@@ -6404,6 +6448,75 @@ class ContrastWindow(QMainWindow):
             row.setVisible(index < len(labels))
             if index < len(labels):
                 checks[index].setText(labels[index])
+        for index, row in enumerate(self.roi_video_mode_rows):
+            row.setVisible(index == 0 or self.active_mode == MODE_COMPARISON)
+            if index == 0:
+                row.findChild(QLabel).setText("Pre-deployment ROI mode" if self.active_mode == MODE_COMPARISON else "ROI mode")
+
+    def _roi_parameters_for_panel(self, panel_index: int) -> EnhancementParameters:
+        parameters = self.enhancement_parameters()
+        mode_combo = self.roi_mode_combos[min(panel_index, len(self.roi_mode_combos) - 1)]
+        manual_rect = self._manual_roi_rects[panel_index] if panel_index < len(self._manual_roi_rects) else None
+        rect_values = None if manual_rect is None else (
+            manual_rect.x(), manual_rect.y(), manual_rect.width(), manual_rect.height()
+        )
+        return replace(parameters, roi_mode=str(mode_combo.currentData()), roi_manual_rect=rect_values)
+
+    def _stages_for_roi_parameters(
+        self,
+        stages: EnhancementStages,
+        roi_parameters: EnhancementParameters,
+    ) -> EnhancementStages:
+        return replace(
+            stages,
+            instances=tuple(
+                replace(stage, parameters=roi_parameters) if stage.key == "roi_extraction" else stage
+                for stage in stages.instances
+            ),
+        )
+
+    def _on_manual_roi_drawn(self, panel_index: int, roi: QRect) -> None:
+        if panel_index >= len(self._manual_roi_rects):
+            return
+        self._manual_roi_rects[panel_index] = QRect(roi)
+        mode_combo = self.roi_mode_combos[min(panel_index, len(self.roi_mode_combos) - 1)]
+        mode_combo.setCurrentIndex(mode_combo.findData("manual"))
+        self.statusBar().showMessage(f"{self.panels[panel_index].label} ROI set to manual selection.")
+
+    def _roi_settings_data(self) -> list[dict[str, object]]:
+        settings: list[dict[str, object]] = []
+        for index, mode_combo in enumerate(self.roi_mode_combos):
+            rect = self._manual_roi_rects[index] if index < len(self._manual_roi_rects) else None
+            settings.append(
+                {
+                    "mode": str(mode_combo.currentData()),
+                    "manual_rect": None if rect is None else [rect.x(), rect.y(), rect.width(), rect.height()],
+                }
+            )
+        return settings
+
+    def _apply_roi_settings_data(self, settings: object) -> None:
+        if not isinstance(settings, list):
+            return
+        for index, value in enumerate(settings[: len(self.roi_mode_combos)]):
+            if not isinstance(value, dict):
+                continue
+            mode = value.get("mode")
+            if mode in {"auto", "manual"}:
+                combo = self.roi_mode_combos[index]
+                combo.blockSignals(True)
+                try:
+                    combo.setCurrentIndex(combo.findData(mode))
+                finally:
+                    combo.blockSignals(False)
+            rect_values = value.get("manual_rect")
+            if (
+                isinstance(rect_values, list)
+                and len(rect_values) == 4
+                and all(isinstance(item, int) and not isinstance(item, bool) for item in rect_values)
+            ):
+                rect = QRect(*rect_values).normalized()
+                self._manual_roi_rects[index] = rect if rect.width() >= 4 and rect.height() >= 4 else None
 
     def _on_background_subtraction_stage_toggled(self, enabled: bool) -> None:
         if getattr(self, "_syncing_background_subtraction", False):
@@ -6537,6 +6650,7 @@ class ContrastWindow(QMainWindow):
             temporal_trim_offset_seconds=temporal_trim_offset_seconds,
             comparison_sync_offset_seconds=comparison_sync_offset_seconds,
             background_subtraction_settings=background_subtraction_settings,
+            roi_parameters_by_panel=tuple(self._roi_parameters_for_panel(index) for index in range(len(self.panels))),
         )
         self._enhancement_pending_request = request
         if self._enhancement_cancel is not None:
@@ -6701,8 +6815,13 @@ class ContrastWindow(QMainWindow):
             return False
         backend_id = denoisers[0].backend_id if denoisers else "none"
         panel_work = [
-            panel.estimate_prepare_work(backend_id, request.noise_sigma, request.stages, request.parameters)
-            for panel in self.panels
+            panel.estimate_prepare_work(
+                backend_id,
+                request.noise_sigma,
+                self._stages_for_roi_parameters(request.stages, request.roi_parameters_by_panel[index]),
+                request.parameters,
+            )
+            for index, panel in enumerate(self.panels)
         ]
         with self._enhancement_progress_lock:
             self._enhancement_progress_totals = [source_stage_count + max(work, 0.001) for work in panel_work]
@@ -6745,7 +6864,7 @@ class ContrastWindow(QMainWindow):
                 panel_denoisers[panel_index],
                 request.noise_sigma,
                 request.batch_size,
-                request.stages,
+                self._stages_for_roi_parameters(request.stages, request.roi_parameters_by_panel[panel_index]),
                 request.parameters,
                 progress_callback,
                 stage_progress_callback,
@@ -7208,6 +7327,7 @@ class ContrastWindow(QMainWindow):
                 "mask_overlay_enabled": self.overlay_mask_check.isChecked(),
                 "playback_speed": self.speed_slider.value(),
                 "frame_index": self.current_frame_index,
+                "roi_settings": self._roi_settings_data(),
             },
             "analysis": {"clearance_threshold": self.threshold_spin.value()},
         }
@@ -7434,6 +7554,7 @@ class ContrastWindow(QMainWindow):
                 show_source = view.get("show_source", view.get("compare_enabled", True))
                 self.compare_view_check.setChecked(bool(show_source))
                 self.overlay_mask_check.setChecked(bool(view.get("mask_overlay_enabled", True)))
+                self._apply_roi_settings_data(view.get("roi_settings"))
                 playback_speed = view.get("playback_speed", 100)
                 if isinstance(playback_speed, int):
                     self.speed_slider.setValue(playback_speed)

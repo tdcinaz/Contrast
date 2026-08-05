@@ -162,6 +162,8 @@ def _gain_token(parameters: EnhancementParameters, _backend_id: str, _noise_sigm
 
 def _roi_token(parameters: EnhancementParameters, _backend_id: str, _noise_sigma: int) -> tuple[object, ...]:
     return (
+        str(parameters.roi_mode),
+        parameters.roi_manual_rect,
         bool(parameters.roi_softening_enabled),
         round(float(parameters.roi_softening_radius_ratio), 4),
         round(float(parameters.roi_softening_threshold), 4),
