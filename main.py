@@ -147,6 +147,23 @@ def _print_optimized_heatmap(heatmap: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(grayscale, cv2.COLOR_GRAY2BGR)
 
 
+def maximum_contrast_frame(results: dict[str, AnalysisResult]) -> int | None:
+    peak_frame: int | None = None
+    peak_signal = -np.inf
+    for result in results.values():
+        if not len(result.normalized_signal) or not len(result.time) or result.fps <= 0:
+            continue
+        signal = np.asarray(result.normalized_signal, dtype=float)
+        valid = np.isfinite(signal)
+        if not np.any(valid):
+            continue
+        peak_index = int(np.argmax(np.where(valid, signal, -np.inf)))
+        if signal[peak_index] > peak_signal:
+            peak_signal = signal[peak_index]
+            peak_frame = round(float(result.time[peak_index]) * result.fps)
+    return peak_frame
+
+
 def render_comparison_report(
     path: Path,
     panels: list[VideoPanel],
@@ -234,6 +251,10 @@ def render_comparison_report(
         painter.drawLine(x, chart.top(), x, chart.bottom())
         painter.setPen(QColor("#526070"))
         painter.drawText(QRect(x - 28, chart.bottom() + 4, 56, tick_label_height), Qt.AlignmentFlag.AlignHCenter, f"{max_time * fraction:.1f}")
+    peak_time = frame_index / max((result.fps for result in results.values()), default=1.0)
+    peak_x = round(chart.left() + chart.width() * peak_time / max_time)
+    painter.setPen(QPen(QColor("#e11d48"), 2, Qt.PenStyle.DashLine))
+    painter.drawLine(peak_x, chart.top(), peak_x, chart.bottom())
     for panel in panels:
         result = results.get(panel.label)
         if result is None or not len(result.time):
@@ -7626,18 +7647,22 @@ class ContrastWindow(QMainWindow):
             report_path = report_path.with_suffix(".pdf")
         screen_report_path = report_path.with_name(f"{report_path.stem}_screen.pdf")
         print_report_path = report_path.with_name(f"{report_path.stem}_print.pdf")
+        frame_index = maximum_contrast_frame(self.results)
+        if frame_index is None:
+            self.statusBar().showMessage("Comparison report export needs valid ROI residence results.")
+            return
         screen_exported = render_comparison_report(
             screen_report_path,
             self.panels,
             self.results,
-            self.current_frame_index,
+            frame_index,
             print_optimized=False,
         )
         print_exported = render_comparison_report(
             print_report_path,
             self.panels,
             self.results,
-            self.current_frame_index,
+            frame_index,
             print_optimized=True,
         )
         if screen_exported and print_exported:

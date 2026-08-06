@@ -208,6 +208,7 @@ class SegmentationTests(unittest.TestCase):
             panel.label: SimpleNamespace(
                 time=np.asarray([0.0, 0.5, 1.0]),
                 normalized_signal=np.asarray([0.0, 1.0, 0.2]),
+                fps=2.0,
             )
             for panel in panels
         }
@@ -238,11 +239,23 @@ class SegmentationTests(unittest.TestCase):
             SimpleNamespace(temporal_change_heatmap=None),
             SimpleNamespace(temporal_change_heatmap=None),
         ]
+        results = {
+            "Pre-deployment": SimpleNamespace(
+                normalized_signal=np.asarray([0.1, 0.4, 0.2]),
+                time=np.asarray([0.0, 0.1, 0.2]),
+                fps=10.0,
+            ),
+            "Post-deployment": SimpleNamespace(
+                normalized_signal=np.asarray([0.1, 1.0, 0.2]),
+                time=np.asarray([0.0, 0.1, 0.2]),
+                fps=10.0,
+            ),
+        }
         status_bar = Mock()
         window = SimpleNamespace(
             active_mode=MODE_COMPARISON,
             panels=panels,
-            results={"Pre-deployment": SimpleNamespace()},
+            results=results,
             current_frame_index=3,
             run_temporal_change_heatmap=Mock(return_value=True),
             statusBar=Mock(return_value=status_bar),
@@ -256,10 +269,26 @@ class SegmentationTests(unittest.TestCase):
 
         window.run_temporal_change_heatmap.assert_called_once_with()
         self.assertEqual(render_report.call_count, 2)
-        self.assertEqual(render_report.call_args_list[0].args, (Path("comparison_screen.pdf"), panels, window.results, 3))
+        self.assertEqual(render_report.call_args_list[0].args, (Path("comparison_screen.pdf"), panels, window.results, 1))
         self.assertEqual(render_report.call_args_list[0].kwargs, {"print_optimized": False})
-        self.assertEqual(render_report.call_args_list[1].args, (Path("comparison_print.pdf"), panels, window.results, 3))
+        self.assertEqual(render_report.call_args_list[1].args, (Path("comparison_print.pdf"), panels, window.results, 1))
         self.assertEqual(render_report.call_args_list[1].kwargs, {"print_optimized": True})
+
+    def test_maximum_contrast_frame_uses_the_shared_signal_peak(self) -> None:
+        results = {
+            "Pre-deployment": SimpleNamespace(
+                normalized_signal=np.asarray([0.1, 0.8, 0.2]),
+                time=np.asarray([0.0, 0.1, 0.2]),
+                fps=10.0,
+            ),
+            "Post-deployment": SimpleNamespace(
+                normalized_signal=np.asarray([0.1, 1.0, 0.2]),
+                time=np.asarray([0.0, 0.1, 0.2]),
+                fps=10.0,
+            ),
+        }
+
+        self.assertEqual(main.maximum_contrast_frame(results), 1)
 
     def test_reordered_roi_analysis_drawer_reflows_when_toggled(self) -> None:
         app = QApplication.instance() or QApplication([])
