@@ -1239,7 +1239,12 @@ def extract_aneurysm_regions(
         aneurysm_region = fit_circle_to_convex_hull(regions == ROI_ANEURYSM_LABEL)
         regions[regions == ROI_ANEURYSM_LABEL] = ROI_VESSEL_LABEL
         regions[aneurysm_region] = ROI_ANEURYSM_LABEL
-    return roi_selection_from_mask(regions == ROI_ANEURYSM_LABEL) or roi, regions
+    segmented_roi = roi_selection_from_mask(regions == ROI_ANEURYSM_LABEL)
+    if segmented_roi is not None:
+        return segmented_roi, regions
+    if parameters.roi_circle_fit_enabled:
+        return ROISelection(roi.rect, fit_circle_to_convex_hull(roi.mask)), regions
+    return roi, regions
 
 
 def segment_temporal_change_map(

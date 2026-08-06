@@ -891,6 +891,30 @@ class SegmentationTests(unittest.TestCase):
         self.assertTrue(circle[60, 90])
         self.assertFalse(circle[60, 125])
 
+    def test_circle_fit_refines_detected_roi_when_temporal_segmentation_has_no_region(self) -> None:
+        detected_mask = np.zeros((50, 50), dtype=bool)
+        cv2.circle(detected_mask, (22, 25), 12, 1, thickness=-1)
+        cv2.rectangle(detected_mask, (31, 20), (44, 30), 1, thickness=-1)
+        detected_roi = main.ROISelection(QRect(40, 30, 50, 50), detected_mask)
+        frames = [np.full((100, 120), 180, dtype=np.uint8) for _ in range(3)]
+
+        with (
+            patch.object(main, "extract_aneurysm_roi", return_value=detected_roi),
+            patch.object(main, "segment_temporal_change_map", return_value=np.zeros((100, 120), dtype=np.uint8)),
+        ):
+            roi, regions = main.extract_aneurysm_regions(
+                frames,
+                fps=10.0,
+                parameters=EnhancementParameters(roi_circle_fit_enabled=True),
+            )
+
+        self.assertIsNotNone(roi)
+        assert roi is not None
+        self.assertEqual(roi.rect, detected_roi.rect)
+        np.testing.assert_array_equal(roi.mask, fit_circle_to_convex_hull(detected_mask))
+        self.assertFalse(roi.mask[25, 44])
+        self.assertFalse(np.any(regions))
+
     def test_temporal_change_map_cache_reuses_raw_measurement(self) -> None:
         panel = VideoPanel.__new__(VideoPanel)
         panel.temporal_change_map_cache = {}
