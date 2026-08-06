@@ -98,8 +98,9 @@ def comparison_report_title(paths: list[Path]) -> str:
 
 
 def _report_frame(panel: VideoPanel, frame_index: int) -> np.ndarray | None:
-    if panel.enhanced_frames is not None and 0 <= frame_index < len(panel.enhanced_frames):
-        enhanced = cv2.imdecode(panel.enhanced_frames[frame_index], cv2.IMREAD_GRAYSCALE)
+    encoded_frames = getattr(panel, "report_encoded_frames", None) or panel.enhanced_frames
+    if encoded_frames is not None and 0 <= frame_index < len(encoded_frames):
+        enhanced = cv2.imdecode(encoded_frames[frame_index], cv2.IMREAD_GRAYSCALE)
         if enhanced is not None:
             return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
     return None if panel.current_frame is None else panel.current_frame.copy()
@@ -2033,6 +2034,7 @@ class VideoPanel(QFrame):
         self.roi_region_overlay_display = True
         self.target_median = 128.0
         self.enhanced_frames: list[np.ndarray] | None = None
+        self.report_encoded_frames: list[np.ndarray] | None = None
         self.temporal_change_heatmap: np.ndarray | None = None
         self.roi_region_masks: list[np.ndarray] | None = None
         self.source_gray_frames: list[np.ndarray] | None = None
@@ -3415,6 +3417,7 @@ class VideoPanel(QFrame):
 
     def clear_enhancement_cache(self) -> None:
         self.enhanced_frames = None
+        self.report_encoded_frames = None
         self.temporal_change_heatmap = None
         self.temporal_change_display = False
         self.roi_region_masks = None
@@ -3429,7 +3432,7 @@ class VideoPanel(QFrame):
         self.inactive_sequence_key = None
         self.stage_duration_per_frame.clear()
 
-    def analysis_frames(
+    def encoded_analysis_frames(
         self,
         backend_id: str,
         noise_sigma: int,
@@ -3439,9 +3442,21 @@ class VideoPanel(QFrame):
         sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
         frame_sequence_key = self._frame_sequence_key(sequence_key)
         if not frame_sequence_key:
-            return self.source_gray_frames
-        encoded_frames = self.encoded_frame_cache.get(frame_sequence_key)
+            return None
+        return self.encoded_frame_cache.get(frame_sequence_key)
+
+    def analysis_frames(
+        self,
+        backend_id: str,
+        noise_sigma: int,
+        stages: EnhancementStages,
+        parameters: EnhancementParameters,
+    ) -> list[np.ndarray] | None:
+        encoded_frames = self.encoded_analysis_frames(backend_id, noise_sigma, stages, parameters)
         if encoded_frames is None:
+            sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
+            if not self._frame_sequence_key(sequence_key):
+                return self.source_gray_frames
             return None
         frames = [cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE) for encoded in encoded_frames]
         return frames if all(frame is not None for frame in frames) else None
@@ -7484,9 +7499,11 @@ class ContrastWindow(QMainWindow):
         results: dict[str, AnalysisResult] = {}
         for panel in self.panels:
             assert panel.roi() is not None
+            encoded_frames = panel.encoded_analysis_frames(backend_id, self.denoise_strength_spin.value(), stages, parameters)
             gray_frames = panel.analysis_frames(backend_id, self.denoise_strength_spin.value(), stages, parameters)
             if gray_frames is None:
                 return False
+            panel.report_encoded_frames = encoded_frames
             results[panel.label] = analyze_gray_frames(
                 panel.label,
                 panel.path,

@@ -248,6 +248,20 @@ class SegmentationTests(unittest.TestCase):
             "Contrast ROI Residence Comparison",
         )
 
+    def test_report_frame_uses_the_enhanced_sequence_from_roi_analysis(self) -> None:
+        analysis_encoded = [cv2.imencode(".png", np.full((2, 2), value, dtype=np.uint8))[1] for value in (10, 20)]
+        current_encoded = [cv2.imencode(".png", np.full((2, 2), value, dtype=np.uint8))[1] for value in (100, 200)]
+        panel = SimpleNamespace(
+            report_encoded_frames=analysis_encoded,
+            enhanced_frames=current_encoded,
+            current_frame=np.full((2, 2, 3), 250, dtype=np.uint8),
+        )
+
+        frame = main._report_frame(panel, 1)
+
+        self.assertIsNotNone(frame)
+        np.testing.assert_array_equal(frame, np.full((2, 2, 3), 20, dtype=np.uint8))
+
     def test_comparison_pdf_report_writes_matched_heatmaps_before_residence_curve(self) -> None:
         QApplication.instance() or QApplication([])
         frame = np.full((40, 60), 120, dtype=np.uint8)
