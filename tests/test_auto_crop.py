@@ -20,6 +20,7 @@ from main import (
     SourcePipelineState,
     VideoPanel,
     align_source_gain_states,
+        align_source_histogram_states,
 )
 
 
@@ -114,8 +115,8 @@ class AutoCropTests(unittest.TestCase):
 
         self.assertEqual(first.crop_rect.getRect(), expected_crop.getRect())
         self.assertEqual(second.crop_rect.getRect(), expected_crop.getRect())
-        self.assertEqual(first.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, 0.0, False))
-        self.assertEqual(second.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, 0.0, False))
+        self.assertEqual(first.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, 0.0, False, False))
+        self.assertEqual(second.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, 0.0, False, False))
         detect_crop.assert_called_once()
 
     def test_temporal_offsets_adjust_detected_trim_without_changing_cache_key(self) -> None:
@@ -146,7 +147,7 @@ class AutoCropTests(unittest.TestCase):
         self.assertEqual(state.trim_start, 35)
         self.assertEqual(state.trim_end, 12)
         self.assertEqual(state.detected_trim_start, 30)
-        self.assertEqual(state.configuration, (False, True, False, False, 0, 0, 0.20, 1.25, 0.30, False))
+        self.assertEqual(state.configuration, (False, True, False, False, 0, 0, 0.20, 1.25, 0.30, False, False))
 
     def test_gain_alignment_raises_only_the_lower_contrast_response(self) -> None:
         common = dict(
@@ -190,6 +191,34 @@ class AutoCropTests(unittest.TestCase):
         self.assertEqual(states[0].gain_multiplier, 1.5)
         self.assertEqual(states[0].gain_offset, -30.0)
         self.assertEqual(120.0 * states[0].gain_multiplier + states[0].gain_offset, 150.0)
+
+    def test_histogram_matching_maps_post_source_to_pre_source_without_changing_pre(self) -> None:
+        common = dict(
+            crop_rect=QRect(0, 0, 4, 4),
+            trim_start=0,
+            auto_crop_rect=None,
+            trim_cache_key=None,
+            detected_trim_start=None,
+            background_reference=None,
+            configuration=(False, False, False, True, False, 0, 0, 0.0, 0.0, 0.0, False),
+        )
+        reference_histogram = np.zeros(256, dtype=np.int64)
+        reference_histogram[80] = 75
+        reference_histogram[160] = 25
+        source_histogram = np.zeros(256, dtype=np.int64)
+        source_histogram[40] = 75
+        source_histogram[100] = 25
+
+        states = align_source_histogram_states(
+            [
+                SourcePipelineState(**common, histogram=reference_histogram),
+                SourcePipelineState(**common, histogram=source_histogram),
+            ]
+        )
+
+        self.assertIsNone(states[0].histogram_match_lut)
+        assert states[1].histogram_match_lut is not None
+        np.testing.assert_array_equal(states[1].histogram_match_lut[[40, 100]], np.array([80, 160], dtype=np.uint8))
 
     def test_background_source_setting_change_invalidates_panel_cache(self) -> None:
         class SourcePanel:

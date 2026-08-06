@@ -108,4 +108,5 @@ class EnhancementRequest:
     background_subtraction_settings: tuple[tuple[bool, int], ...] = ()
     roi_parameters_by_panel: tuple[EnhancementParameters, ...] = ()
     contrast_gain_alignment: bool = False
+    histogram_matching: bool = False
     metal_needle_removal: bool = False

@@ -432,6 +432,8 @@ class SourcePipelineState:
     gain_alignment_span: float = 0.0
     gain_multiplier: float = 1.0
     gain_offset: float = 0.0
+    histogram: np.ndarray | None = None
+    histogram_match_lut: np.ndarray | None = None
 
 
 def align_source_gain_states(states: list[SourcePipelineState]) -> list[SourcePipelineState]:
@@ -444,6 +446,24 @@ def align_source_gain_states(states: list[SourcePipelineState]) -> list[SourcePi
         for state in states
         for gain in (min(2.5, max(1.0, target_span / max(1.0, state.gain_alignment_span))),)
     ]
+
+
+def align_source_histogram_states(states: list[SourcePipelineState]) -> list[SourcePipelineState]:
+    if len(states) < 2 or states[0].histogram is None:
+        return states
+    reference_histogram = states[0].histogram.astype(np.float64, copy=False)
+    if reference_histogram.sum() <= 0.0:
+        return states
+    reference_cdf = np.cumsum(reference_histogram) / reference_histogram.sum()
+    aligned = [states[0]]
+    for state in states[1:]:
+        if state.histogram is None or state.histogram.sum() <= 0.0:
+            aligned.append(state)
+            continue
+        source_cdf = np.cumsum(state.histogram.astype(np.float64, copy=False)) / state.histogram.sum()
+        lut = np.searchsorted(reference_cdf, source_cdf, side="left").clip(0, 255).astype(np.uint8)
+        aligned.append(replace(state, histogram_match_lut=lut))
+    return aligned
 
 
 @dataclass(slots=True)
@@ -797,6 +817,22 @@ def estimate_video_contrast_response(
         baseline = float(np.median(signals[:pre_injection_count]))
         dark_level = float(np.min(smooth_temporal_signal(np.asarray(signals), fps)))
         return baseline, max(1.0, baseline - dark_level)
+    finally:
+        capture.release()
+
+
+def estimate_video_histogram(path: Path, crop_rect: QRect, start_frame: int, frame_count: int) -> np.ndarray:
+    capture = cv2.VideoCapture(str(path))
+    try:
+        histogram = np.zeros(256, dtype=np.int64)
+        sample_indexes = np.unique(np.linspace(0, max(0, frame_count - 1), num=min(24, max(1, frame_count)), dtype=int))
+        for frame_index in sample_indexes:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame + int(frame_index))
+            ok, frame = capture.read()
+            if ok:
+                gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
+                histogram += np.bincount(gray.ravel(), minlength=256)
+        return histogram
     finally:
         capture.release()
 
@@ -2023,6 +2059,7 @@ class VideoPanel(QFrame):
         self.metal_needle_mask: np.ndarray | None = None
         self.source_gain_multiplier = 1.0
         self.source_gain_offset = 0.0
+        self.source_histogram_match_lut: np.ndarray | None = None
         self.capture = cv2.VideoCapture(str(path))
         self.trim_start_frame = 0
         self.trim_frame_count = self.info.frame_count
@@ -2108,6 +2145,7 @@ class VideoPanel(QFrame):
         temporal_end_trim_seconds: float = 0.0,
         comparison_sync_offset_seconds: float = 0.0,
         contrast_gain_alignment_enabled: bool = False,
+        histogram_matching_enabled: bool = False,
         background_subtraction_enabled: bool = False,
         background_level: int = 0,
         metal_needle_removal_enabled: bool = False,
@@ -2120,6 +2158,7 @@ class VideoPanel(QFrame):
             int(auto_crop_enabled)
             + int(temporal_alignment_enabled)
             + int(contrast_gain_alignment_enabled)
+            + int(histogram_matching_enabled)
             + int(background_subtraction_enabled)
             + int(metal_needle_removal_enabled)
         )
@@ -2174,6 +2213,7 @@ class VideoPanel(QFrame):
 
         gain_alignment_baseline = 0.0
         gain_alignment_span = 0.0
+        histogram = None
         if contrast_gain_alignment_enabled:
             gain_alignment_baseline, gain_alignment_span = estimate_video_contrast_response(
                 self.path,
@@ -2183,6 +2223,16 @@ class VideoPanel(QFrame):
                 self.info.fps,
             )
             report("Measuring fluoroscope contrast response", 1.0, 1.0)
+            completed_stages += 1
+
+        if histogram_matching_enabled:
+            histogram = estimate_video_histogram(
+                self.path,
+                next_crop_rect,
+                next_trim_start,
+                max(1, self.info.frame_count - next_trim_start - next_trim_end),
+            )
+            report("Measuring comparison histogram", 1.0, 1.0)
             completed_stages += 1
 
         background_reference = None
@@ -2232,9 +2282,11 @@ class VideoPanel(QFrame):
                 temporal_end_trim_seconds,
                 comparison_sync_offset_seconds,
                 metal_needle_removal_enabled,
+                histogram_matching_enabled,
             ),
             gain_alignment_baseline=gain_alignment_baseline,
             gain_alignment_span=gain_alignment_span,
+            histogram=histogram,
         )
 
     def apply_source_pipeline_state(self, state: SourcePipelineState) -> bool:
@@ -2242,10 +2294,12 @@ class VideoPanel(QFrame):
             self.source_pipeline_configuration != state.configuration
             or self.source_gain_multiplier != state.gain_multiplier
             or self.source_gain_offset != state.gain_offset
+            or not np.array_equal(self.source_histogram_match_lut, state.histogram_match_lut)
         )
         self.source_pipeline_configuration = state.configuration
         self.source_gain_multiplier = state.gain_multiplier
         self.source_gain_offset = state.gain_offset
+        self.source_histogram_match_lut = state.histogram_match_lut
         self.background_subtraction_enabled = state.configuration[3]
         self.background_level = state.configuration[4]
         self.background_reference = state.background_reference
@@ -2280,6 +2334,7 @@ class VideoPanel(QFrame):
         temporal_end_trim_seconds: float = 0.0,
         comparison_sync_offset_seconds: float = 0.0,
         contrast_gain_alignment_enabled: bool = False,
+        histogram_matching_enabled: bool = False,
         background_subtraction_enabled: bool = False,
         background_level: int = 0,
         metal_needle_removal_enabled: bool = False,
@@ -2293,6 +2348,7 @@ class VideoPanel(QFrame):
                 temporal_end_trim_seconds=temporal_end_trim_seconds,
                 comparison_sync_offset_seconds=comparison_sync_offset_seconds,
                 contrast_gain_alignment_enabled=contrast_gain_alignment_enabled,
+                histogram_matching_enabled=histogram_matching_enabled,
                 background_subtraction_enabled=background_subtraction_enabled,
                 background_level=background_level,
                 metal_needle_removal_enabled=metal_needle_removal_enabled,
@@ -2390,6 +2446,11 @@ class VideoPanel(QFrame):
             return gray
         aligned = gray.astype(np.float32) * self.source_gain_multiplier + self.source_gain_offset
         return np.clip(aligned, 0, 255).astype(np.uint8)
+
+    def _match_source_histogram(self, gray: np.ndarray) -> np.ndarray:
+        if self.source_histogram_match_lut is None:
+            return gray
+        return cv2.LUT(gray, self.source_histogram_match_lut)
 
     def set_trim_window(self, start_frame: int, frame_count: int | None = None) -> None:
         max_start = max(0, self.info.frame_count - 1)
@@ -2881,6 +2942,7 @@ class VideoPanel(QFrame):
                     gray = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
                     gray = self._remove_stationary_metal(gray)
                     gray = self._align_source_gain(gray)
+                    gray = self._match_source_histogram(gray)
                     gray = self._subtract_background(gray)
                     active_seconds += perf_counter() - started_at
                     source_output.append(gray)
@@ -3257,10 +3319,12 @@ class VideoPanel(QFrame):
         if (
             self.source_gain_multiplier != 1.0
             or self.source_gain_offset != 0.0
+            or self.source_histogram_match_lut is not None
             or self.background_subtraction_enabled
             or self.metal_needle_mask is not None
         ):
             source_frame = self._align_source_gain(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            source_frame = self._match_source_histogram(source_frame)
             source_frame = self._remove_stationary_metal(source_frame)
             source_frame = self._subtract_background(source_frame)
             source_frame = cv2.cvtColor(source_frame, cv2.COLOR_GRAY2BGR)
@@ -3384,6 +3448,7 @@ class VideoPanel(QFrame):
         self.metal_needle_mask = None
         self.source_gain_multiplier = 1.0
         self.source_gain_offset = 0.0
+        self.source_histogram_match_lut = None
         self.capture = cv2.VideoCapture(str(path))
         self.path_label.setText(path.name)
         self.set_trim_window(0)
@@ -4566,6 +4631,7 @@ class ContrastWindow(QMainWindow):
         auto_crop_enabled = self._has_enabled_stage("auto_crop")
         temporal_alignment_enabled = self._has_enabled_stage("temporal_alignment")
         contrast_gain_alignment_enabled = self._has_enabled_stage("contrast_gain_alignment")
+        histogram_matching_enabled = self.active_mode == MODE_COMPARISON and self._has_enabled_stage("histogram_matching")
         metal_needle_removal_enabled = self._has_enabled_stage("metal_needle_removal")
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         background_settings = self._background_subtraction_settings()
@@ -4582,6 +4648,7 @@ class ContrastWindow(QMainWindow):
                     else 0.0
                 ),
                 contrast_gain_alignment_enabled=contrast_gain_alignment_enabled,
+                histogram_matching_enabled=histogram_matching_enabled,
                 background_subtraction_enabled=background_settings[panel_index][0],
                 background_level=background_settings[panel_index][1],
                 metal_needle_removal_enabled=metal_needle_removal_enabled,
@@ -4590,6 +4657,8 @@ class ContrastWindow(QMainWindow):
         ]
         if contrast_gain_alignment_enabled:
             states = align_source_gain_states(states)
+        if histogram_matching_enabled and self.active_mode == MODE_COMPARISON:
+            states = align_source_histogram_states(states)
         return self._apply_source_pipeline_states(states)
 
     def _apply_source_pipeline_states(self, states: list[SourcePipelineState]) -> bool:
@@ -4611,6 +4680,7 @@ class ContrastWindow(QMainWindow):
         auto_crop: bool,
         temporal_alignment: bool,
         contrast_gain_alignment: bool,
+        histogram_matching: bool,
         auto_crop_size_offset: int,
         temporal_trim_offset_seconds: float,
         temporal_end_trim_seconds: float,
@@ -4633,6 +4703,7 @@ class ContrastWindow(QMainWindow):
                 temporal_end_trim_seconds,
                 comparison_sync_offset_seconds if self.active_mode == MODE_COMPARISON and panel_index == 1 else 0.0,
                 metal_needle_removal,
+                histogram_matching,
             )
             for panel_index, panel in enumerate(self.panels)
         )
@@ -4984,15 +5055,20 @@ class ContrastWindow(QMainWindow):
             "Align fluoroscope contrast gain",
             3,
         )
+        self.histogram_matching_stage_drawer = StageDrawer(
+            "histogram_matching",
+            "Match comparison histogram",
+            4,
+        )
         self.background_subtraction_stage_drawer = StageDrawer(
             "background_subtraction",
             "DSA mask subtraction",
-            4,
+            5,
         )
         self.metal_needle_removal_stage_drawer = StageDrawer(
             "metal_needle_removal",
             "Remove stationary metal needle",
-            5,
+            6,
         )
         self.brightness_stage_drawer = StageDrawer(
             "brightness_stabilization",
@@ -5026,6 +5102,7 @@ class ContrastWindow(QMainWindow):
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
         self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
         self.contrast_gain_alignment_stage_check = self.contrast_gain_alignment_stage_drawer.enable_button
+        self.histogram_matching_stage_check = self.histogram_matching_stage_drawer.enable_button
         self.background_subtraction_stage_check = self.background_subtraction_stage_drawer.enable_button
         self.metal_needle_removal_stage_check = self.metal_needle_removal_stage_drawer.enable_button
         self.gain_stage_check = self.gain_stage_drawer.enable_button
@@ -5045,6 +5122,7 @@ class ContrastWindow(QMainWindow):
             self.auto_crop_stage_check,
             self.temporal_alignment_stage_check,
             self.contrast_gain_alignment_stage_check,
+            self.histogram_matching_stage_check,
             self.background_subtraction_stage_check,
             self.metal_needle_removal_stage_check,
         ]
@@ -5071,6 +5149,7 @@ class ContrastWindow(QMainWindow):
             self.auto_crop_stage_drawer,
             self.temporal_alignment_stage_drawer,
             self.contrast_gain_alignment_stage_drawer,
+            self.histogram_matching_stage_drawer,
             self.background_subtraction_stage_drawer,
             self.metal_needle_removal_stage_drawer,
         ]
@@ -5739,6 +5818,13 @@ class ContrastWindow(QMainWindow):
         gain_alignment_hint.setObjectName("subtleLabel")
         gain_alignment_hint.setWordWrap(True)
         self.contrast_gain_alignment_stage_drawer.content_layout.addWidget(gain_alignment_hint)
+
+        histogram_matching_hint = QLabel(
+            "Matches the post-deployment source histogram to the pre-deployment source before enhancement."
+        )
+        histogram_matching_hint.setObjectName("subtleLabel")
+        histogram_matching_hint.setWordWrap(True)
+        self.histogram_matching_stage_drawer.content_layout.addWidget(histogram_matching_hint)
 
         temporal_trim_row = QHBoxLayout()
         temporal_trim_row.addWidget(QLabel("Start trim offset"))
@@ -6671,6 +6757,7 @@ class ContrastWindow(QMainWindow):
             or self._has_enabled_stage("auto_crop")
             or self._has_enabled_stage("temporal_alignment")
             or self._has_enabled_stage("contrast_gain_alignment")
+                or self._has_enabled_stage("histogram_matching")
             or self._has_enabled_stage("metal_needle_removal")
             or any(enabled for enabled, _level in self._background_subtraction_settings())
             or any(
@@ -6840,6 +6927,11 @@ class ContrastWindow(QMainWindow):
 
     def _update_temporal_alignment_controls(self) -> None:
         self.comparison_sync_offset_row.setVisible(self.active_mode == MODE_COMPARISON)
+        histogram_matching_available = self.active_mode == MODE_COMPARISON
+        self.histogram_matching_stage_check.setEnabled(histogram_matching_available)
+        self.histogram_matching_stage_check.setToolTip(
+            "Enable stage" if histogram_matching_available else "Available only for two-video comparison"
+        )
         labels = ("Pre-deployment", "Post-deployment") if self.active_mode == MODE_COMPARISON else ("Video",)
         checks = (self.background_video_one_check, self.background_video_two_check)
         for index, row in enumerate(self.background_video_rows):
@@ -7029,6 +7121,7 @@ class ContrastWindow(QMainWindow):
         auto_crop = self._has_enabled_stage("auto_crop")
         temporal_alignment = self._has_enabled_stage("temporal_alignment")
         contrast_gain_alignment = self._has_enabled_stage("contrast_gain_alignment")
+        histogram_matching = self.active_mode == MODE_COMPARISON and self._has_enabled_stage("histogram_matching")
         metal_needle_removal = self._has_enabled_stage("metal_needle_removal")
         auto_crop_size_offset = self.auto_crop_size_offset_spin.value()
         temporal_trim_offset_seconds = self.temporal_trim_offset_spin.value()
@@ -7048,10 +7141,12 @@ class ContrastWindow(QMainWindow):
             auto_crop=auto_crop,
             temporal_alignment=temporal_alignment,
             contrast_gain_alignment=contrast_gain_alignment,
+            histogram_matching=histogram_matching,
             source_pipeline_current=self._source_pipeline_is_current(
                 auto_crop,
                 temporal_alignment,
                 contrast_gain_alignment,
+                histogram_matching,
                 auto_crop_size_offset,
                 temporal_trim_offset_seconds,
                 temporal_end_trim_seconds,
@@ -7136,6 +7231,7 @@ class ContrastWindow(QMainWindow):
                 if self.active_mode == MODE_COMPARISON and panel_index == 1
                 else 0.0,
                 request.contrast_gain_alignment,
+                request.histogram_matching,
                 request.background_subtraction_settings[panel_index][0],
                 request.background_subtraction_settings[panel_index][1],
                 request.metal_needle_removal,
@@ -7160,6 +7256,8 @@ class ContrastWindow(QMainWindow):
             resolved_source_states = [state for state in source_states if state is not None]
             if request.contrast_gain_alignment:
                 resolved_source_states = align_source_gain_states(resolved_source_states)
+            if request.histogram_matching and self.active_mode == MODE_COMPARISON:
+                resolved_source_states = align_source_histogram_states(resolved_source_states)
 
             source_states_applied = Event()
             self._source_pipeline_events.put(
