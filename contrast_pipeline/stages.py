@@ -249,7 +249,7 @@ BUILTIN_STAGES = StageRegistry(
         ),
         StageDefinition(
             "temporal_change_heatmap",
-            "Temporal pixel-change heatmap",
+            "Contrast residence heatmap",
             ExecutionShape.ANALYSIS,
             0.0,
             0.0,

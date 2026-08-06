@@ -210,7 +210,7 @@ def render_comparison_report(
     heatmap_top = image_top + image_height + 76
     painter.setPen(QColor("#172033"))
     painter.setFont(title_font)
-    painter.drawText(margin, heatmap_top - 30, "Temporal Pixel Change")
+    painter.drawText(margin, heatmap_top - 30, "Contrast Residence Heatmap")
     for index, (panel, heatmap) in enumerate(zip(panels, heatmaps, strict=True)):
         x = margin + index * (image_width + image_gap)
         _draw_report_image(
@@ -990,65 +990,108 @@ def compute_temporal_change_summary(
     gray_frames: list[np.ndarray],
     fps: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return cumulative absolute change and its mean per-second rate for every pixel."""
+    """Return time-integrated dark contrast and peak darkening for every pixel."""
     if not gray_frames:
         empty = np.zeros((1, 1), dtype=np.float32)
         return empty, empty
 
-    source_frames = [np.clip(frame, 0, 255).astype(np.float32) for frame in gray_frames]
-    shape = source_frames[0].shape
-    if any(frame.shape != shape for frame in source_frames):
-        raise ValueError("Temporal pixel-change analysis requires consistently sized frames.")
-    if len(source_frames) == 1:
+    shape = gray_frames[0].shape
+    if any(frame.shape != shape for frame in gray_frames):
+        raise ValueError("Contrast residence analysis requires consistently sized frames.")
+    if len(gray_frames) == 1:
         empty = np.zeros(shape, dtype=np.float32)
         return empty, empty
 
-    cumulative_change = np.zeros(shape, dtype=np.float32)
-    previous = source_frames[0]
-    for current in source_frames[1:]:
-        cumulative_change += np.abs(current - previous)
-        previous = current
+    baseline_count = min(len(gray_frames) - 1, max(3, round(max(float(fps), 1.0) * 0.75)))
 
-    # A fixed opaque instrument is dark but can retain low-level acquisition noise.
-    # Exclude that background signal so it cannot determine the heatmap scale.
-    median_intensity = np.median(np.stack(source_frames, axis=0), axis=0)
-    median_frame_change = cumulative_change / (len(source_frames) - 1)
-    stationary_dark = (median_intensity <= 32.0) & (median_frame_change <= 4.0)
-    cumulative_change[stationary_dark] = 0.0
-    elapsed_seconds = (len(source_frames) - 1) / max(float(fps), 1e-6)
-    return cumulative_change, cumulative_change / elapsed_seconds
+    # Remove frame-wide fluoroscope gain changes before measuring local darkening.
+    baseline_source = [np.clip(frame, 0, 255).astype(np.float32) for frame in gray_frames[:baseline_count]]
+    baseline_levels = np.asarray([np.median(frame) for frame in baseline_source], dtype=np.float32)
+    baseline_level = float(np.median(baseline_levels))
+    baseline_frames = np.stack(
+        [
+            np.clip(frame + (baseline_level - level), 0.0, 255.0)
+            for frame, level in zip(baseline_source, baseline_levels, strict=True)
+        ],
+        axis=0,
+    )
+    baseline = np.percentile(baseline_frames, 75.0, axis=0)
+    baseline_noise = np.percentile(np.abs(baseline_frames - baseline), 95.0, axis=0)
+    noise_floor = np.maximum(2.0, baseline_noise * 2.0)
+
+    contrast_burden = np.zeros(shape, dtype=np.float32)
+    peak_contrast = np.zeros(shape, dtype=np.float32)
+    for frame in gray_frames[baseline_count:]:
+        source = np.clip(frame, 0, 255).astype(np.float32)
+        corrected = np.clip(source + (baseline_level - float(np.median(source))), 0.0, 255.0)
+        dark_contrast = np.clip(baseline - corrected - noise_floor, 0.0, None).astype(np.float32)
+        contrast_burden += dark_contrast
+        np.maximum(peak_contrast, dark_contrast, out=peak_contrast)
+    contrast_burden /= max(float(fps), 1e-6)
+    return contrast_burden, peak_contrast
+
+
+def _robust_positive_peak(values: list[np.ndarray], percentile: float = 99.0) -> float:
+    positive_values = [value[value > 0] for value in values if np.any(value > 0)]
+    if not positive_values:
+        return 0.0
+    combined = np.concatenate(positive_values)
+    if combined.size < 100:
+        return float(np.max(combined))
+    return float(np.percentile(combined, percentile))
+
+
+HEATMAP_COLORMAPS = {
+    "hot": cv2.COLORMAP_HOT,
+    "inferno": cv2.COLORMAP_INFERNO,
+    "turbo": cv2.COLORMAP_TURBO,
+    "viridis": cv2.COLORMAP_VIRIDIS,
+    "cividis": cv2.COLORMAP_CIVIDIS,
+}
 
 
 def render_temporal_change_heatmap(
-    cumulative_change: np.ndarray,
-    change_rate: np.ndarray,
-    cumulative_peak: float | None = None,
-    rate_peak: float | None = None,
+    contrast_burden: np.ndarray,
+    peak_contrast: np.ndarray,
+    burden_peak: float | None = None,
+    contrast_peak: float | None = None,
+    colormap: str = "hot",
 ) -> np.ndarray:
-    """Render total change as color and mean change rate as color brightness."""
-    total_peak = float(np.max(cumulative_change)) if cumulative_peak is None else float(cumulative_peak)
-    rate_peak = float(np.max(change_rate)) if rate_peak is None else float(rate_peak)
-    total_normalized = (
-        np.clip(cumulative_change * (255.0 / total_peak), 0, 255).astype(np.uint8)
-        if total_peak > 0
-        else np.zeros(cumulative_change.shape, dtype=np.uint8)
+    """Render contrast residence as heat and peak vessel contrast as brightness."""
+    burden_peak = (
+        _robust_positive_peak([contrast_burden])
+        if burden_peak is None
+        else float(burden_peak)
     )
-    rate_normalized = (
-        np.clip(change_rate * (255.0 / rate_peak), 0, 255).astype(np.uint8)
-        if rate_peak > 0
-        else np.zeros(change_rate.shape, dtype=np.uint8)
+    contrast_peak = (
+        _robust_positive_peak([peak_contrast])
+        if contrast_peak is None
+        else float(contrast_peak)
     )
-    heatmap = cv2.applyColorMap(total_normalized, cv2.COLORMAP_TURBO)
-    brightness = 0.25 + 0.75 * (rate_normalized.astype(np.float32) / 255.0)
-    return np.clip(heatmap.astype(np.float32) * brightness[..., np.newaxis], 0, 255).astype(np.uint8)
+    burden_normalized = (
+        np.clip(contrast_burden / burden_peak, 0.0, 1.0)
+        if burden_peak > 0
+        else np.zeros(contrast_burden.shape, dtype=np.float32)
+    )
+    contrast_normalized = (
+        np.clip(peak_contrast / contrast_peak, 0.0, 1.0)
+        if contrast_peak > 0
+        else np.zeros(peak_contrast.shape, dtype=np.float32)
+    )
+    heat_levels = np.round(np.power(burden_normalized, 0.55) * 255.0).astype(np.uint8)
+    heatmap = cv2.applyColorMap(heat_levels, HEATMAP_COLORMAPS.get(colormap, cv2.COLORMAP_HOT))
+    brightness = 0.08 + 0.92 * np.power(contrast_normalized, 0.45)
+    rendered = np.clip(heatmap.astype(np.float32) * brightness[..., np.newaxis], 0, 255).astype(np.uint8)
+    rendered[contrast_burden <= 0] = 0
+    return rendered
 
 
 def temporal_change_heatmap_peaks(
     results: dict[str, tuple[np.ndarray, np.ndarray]],
 ) -> tuple[float, float]:
-    cumulative_peak = max((float(np.max(cumulative)) for cumulative, _rate in results.values()), default=0.0)
-    rate_peak = max((float(np.max(rate)) for _cumulative, rate in results.values()), default=0.0)
-    return cumulative_peak, rate_peak
+    burden_peak = _robust_positive_peak([burden for burden, _peak in results.values()])
+    contrast_peak = _robust_positive_peak([peak for _burden, peak in results.values()])
+    return burden_peak, contrast_peak
 
 
 def detect_aneurysm_roi(
@@ -3227,7 +3270,7 @@ class VideoPanel(QFrame):
                             (self.color.blue(), self.color.green(), self.color.red()),
                         )
         left_frame = self.temporal_change_heatmap if self.temporal_change_display and self.temporal_change_heatmap is not None else source_frame
-        left_label = "Pixel change" if self.temporal_change_display and self.temporal_change_heatmap is not None else "Source"
+        left_label = "Contrast residence" if self.temporal_change_display and self.temporal_change_heatmap is not None else "Source"
         self.display.set_frames(left_frame, enhanced_frame, left_label)
 
     def read_next(self, playback: bool = False) -> bool:
@@ -4657,7 +4700,7 @@ class ContrastWindow(QMainWindow):
         self.temporal_change_view_check = QCheckBox("Heatmap")
         self.temporal_change_view_check.setChecked(False)
         self.temporal_change_view_check.setEnabled(False)
-        self.temporal_change_view_check.setToolTip("Show the temporal pixel-change heatmap beside enhanced output")
+        self.temporal_change_view_check.setToolTip("Show the contrast residence heatmap beside enhanced output")
         self.temporal_change_view_check.toggled.connect(self.on_temporal_change_view_toggled)
 
         self.overlay_mask_check = QCheckBox("ROI")
@@ -4939,7 +4982,7 @@ class ContrastWindow(QMainWindow):
         )
         self.temporal_change_heatmap_stage_drawer = StageDrawer(
             "temporal_change_heatmap",
-            "Temporal pixel-change heatmap",
+            "Contrast residence heatmap",
             16,
         )
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
@@ -5127,6 +5170,7 @@ class ContrastWindow(QMainWindow):
             "adjustments_sharpen_spin": "adjustmentsSharpen",
             "adjustments_gamma_spin": "adjustmentsGamma",
             "smoothing_sigma_spin": "smoothingSigma",
+            "heatmap_colormap_combo": "heatmapColormap",
         }
         for attribute, object_name in widget_names.items():
             getattr(self, attribute).setObjectName(object_name)
@@ -5192,7 +5236,10 @@ class ContrastWindow(QMainWindow):
         for check in drawer.findChildren(QCheckBox):
             check.toggled.connect(self.on_enhancement_settings_changed)
         for combo in drawer.findChildren(QComboBox):
-            combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
+            if combo.objectName() == "heatmapColormap":
+                combo.currentIndexChanged.connect(self.on_heatmap_colormap_changed)
+            else:
+                combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
         for spin in [*drawer.findChildren(QSpinBox), *drawer.findChildren(QDoubleSpinBox)]:
             spin.valueChanged.connect(self.on_enhancement_settings_changed)
         for button in drawer.findChildren(QPushButton):
@@ -5919,6 +5966,18 @@ class ContrastWindow(QMainWindow):
         smoothing_row.addWidget(self.smoothing_sigma_spin)
         self.smoothing_stage_drawer.content_layout.addLayout(smoothing_row)
 
+        heatmap_colormap_row = QHBoxLayout()
+        heatmap_colormap_row.addWidget(QLabel("Color map"))
+        self.heatmap_colormap_combo = QComboBox()
+        self.heatmap_colormap_combo.addItem("Hot", "hot")
+        self.heatmap_colormap_combo.addItem("Inferno", "inferno")
+        self.heatmap_colormap_combo.addItem("Turbo", "turbo")
+        self.heatmap_colormap_combo.addItem("Viridis", "viridis")
+        self.heatmap_colormap_combo.addItem("Cividis", "cividis")
+        self.heatmap_colormap_combo.setToolTip("Choose the color scale without recomputing contrast residence")
+        heatmap_colormap_row.addWidget(self.heatmap_colormap_combo)
+        self.temporal_change_heatmap_stage_drawer.content_layout.addLayout(heatmap_colormap_row)
+
         for drawer in self.frame_pipeline_stage_drawers:
             self._add_sliders_to_parameter_layout(drawer.content_layout)
 
@@ -5927,6 +5986,7 @@ class ContrastWindow(QMainWindow):
         self.roi_convex_hull_check.toggled.connect(self.on_enhancement_settings_changed)
         self.roi_circle_fit_check.toggled.connect(self.on_enhancement_settings_changed)
         self.mottle_window_combo.currentIndexChanged.connect(self.on_enhancement_settings_changed)
+        self.heatmap_colormap_combo.currentIndexChanged.connect(self.on_heatmap_colormap_changed)
         for spin in [
             self.auto_crop_size_offset_spin,
             self.temporal_trim_offset_spin,
@@ -6299,7 +6359,7 @@ class ContrastWindow(QMainWindow):
             for drawer in frame_brightness_drawers:
                 drawer.set_status("Load video files to run frame brightness analysis.", frame_brightness_enabled)
             for drawer in temporal_change_drawers:
-                drawer.set_status("Load video files to build a temporal pixel-change heatmap.", temporal_change_enabled)
+                drawer.set_status("Load video files to build a contrast residence heatmap.", temporal_change_enabled)
             return
         if not self._has_enabled_stage("roi_extraction"):
             extraction_message = "Disabled. Enable this stage to extract aneurysm ROI masks from the current enhanced video."
@@ -6351,7 +6411,7 @@ class ContrastWindow(QMainWindow):
                 drawer.set_status("Waiting for enhanced video frames.", False)
         else:
             for drawer in temporal_change_drawers:
-                drawer.set_status("Ready to map total and per-second pixel change.", False)
+                drawer.set_status("Ready to map time-integrated and peak dark contrast.", False)
 
     def on_roi_changed(self) -> None:
         if self.active_mode == MODE_LIVE and self._network_stream_display is not None:
@@ -6473,8 +6533,14 @@ class ContrastWindow(QMainWindow):
         for panel in self.panels:
             panel.set_temporal_change_display(enabled, self.current_frame_index)
         self.statusBar().showMessage(
-            "Showing pixel change beside enhanced output." if enabled else "Showing enhanced output only."
+            "Showing contrast residence beside enhanced output." if enabled else "Showing enhanced output only."
         )
+
+    def on_heatmap_colormap_changed(self) -> None:
+        if not self.temporal_change_results:
+            return
+        self.refresh_temporal_change_views()
+        self.statusBar().showMessage("Contrast residence heatmap color map updated.")
 
     def on_roi_region_overlay_toggled(self, enabled: bool) -> None:
         if not self.panels:
@@ -7457,7 +7523,7 @@ class ContrastWindow(QMainWindow):
         self.temporal_change_results = results
         self.refresh_temporal_change_views()
         self._update_stage_statuses()
-        self.statusBar().showMessage("Temporal pixel-change heatmap updated from the current enhanced pipeline output.")
+        self.statusBar().showMessage("Contrast residence heatmap updated from the current enhanced pipeline output.")
         return True
 
     def refresh_analysis_from_existing(self) -> None:
@@ -7566,6 +7632,10 @@ class ContrastWindow(QMainWindow):
     def refresh_temporal_change_views(self) -> None:
         shared_scale = self.active_mode == MODE_COMPARISON and len(self.temporal_change_results) > 1
         cumulative_peak, rate_peak = temporal_change_heatmap_peaks(self.temporal_change_results) if shared_scale else (None, None)
+        heatmap_drawers = self._stage_drawers("temporal_change_heatmap")
+        active_drawer = next((drawer for drawer in heatmap_drawers if drawer.enable_button.isChecked()), None)
+        colormap_combo = active_drawer.findChild(QComboBox, "heatmapColormap") if active_drawer is not None else None
+        colormap = str(colormap_combo.currentData()) if colormap_combo is not None else "hot"
         for panel in self.panels:
             result = self.temporal_change_results.get(panel.label)
             if result is None:
@@ -7573,7 +7643,13 @@ class ContrastWindow(QMainWindow):
                 continue
             cumulative_change, change_rate = result
             panel.set_temporal_change_heatmap(
-                render_temporal_change_heatmap(cumulative_change, change_rate, cumulative_peak, rate_peak)
+                render_temporal_change_heatmap(
+                    cumulative_change,
+                    change_rate,
+                    cumulative_peak,
+                    rate_peak,
+                    colormap=colormap,
+                )
             )
         self.temporal_change_view_check.setEnabled(bool(self.temporal_change_results) and self.active_mode != MODE_LIVE)
         if self.temporal_change_view_check.isChecked():

@@ -15,7 +15,7 @@ import numpy as np
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QFrame, QSpinBox
+from PySide6.QtWidgets import QApplication, QComboBox, QDoubleSpinBox, QFrame, QSpinBox
 
 import main
 from main import (
@@ -333,30 +333,98 @@ class SegmentationTests(unittest.TestCase):
 
         np.testing.assert_array_equal(average_frame_brightness(frames), np.asarray([3.0, 13.0]))
 
-    def test_temporal_change_summary_accumulates_change_and_normalizes_rate(self) -> None:
-        frames = [
-            np.asarray([[0, 10], [20, 30]], dtype=np.uint8),
-            np.asarray([[4, 8], [20, 36]], dtype=np.uint8),
-            np.asarray([[10, 8], [15, 42]], dtype=np.uint8),
-        ]
+    def test_temporal_change_summary_emphasizes_persistent_dark_contrast(self) -> None:
+        baseline = np.full((4, 4), 180, dtype=np.uint8)
+        frames = [baseline.copy() for _ in range(3)]
+        for frame_index in range(4):
+            frame = baseline.copy()
+            if frame_index == 0:
+                frame[1, 1] = 130
+            frame[1, 2] = 130
+            frames.append(frame)
 
-        total, rate = compute_temporal_change_summary(frames, fps=2.0)
+        burden, peak = compute_temporal_change_summary(frames, fps=1.0)
 
-        np.testing.assert_array_equal(total, np.asarray([[10.0, 0.0], [0.0, 12.0]]))
-        np.testing.assert_array_equal(rate, np.asarray([[10.0, 0.0], [0.0, 12.0]]))
+        self.assertGreater(burden[1, 2], burden[1, 1] * 3.5)
+        self.assertAlmostEqual(float(peak[1, 1]), float(peak[1, 2]), delta=0.01)
+        self.assertEqual(float(burden[0, 0]), 0.0)
 
-    def test_temporal_change_summary_excludes_stationary_dark_instrument_noise(self) -> None:
-        frames = [
-            np.asarray([[8, 180]], dtype=np.uint8),
-            np.asarray([[11, 165]], dtype=np.uint8),
-            np.asarray([[8, 150]], dtype=np.uint8),
-            np.asarray([[11, 135]], dtype=np.uint8),
-        ]
+    def test_temporal_change_summary_rejects_global_fluoroscopy_flicker(self) -> None:
+        frames = [np.full((4, 4), value, dtype=np.uint8) for value in (180, 184, 177, 183, 178, 181)]
 
-        total, rate = compute_temporal_change_summary(frames, fps=3.0)
+        burden, peak = compute_temporal_change_summary(frames, fps=2.0)
 
-        np.testing.assert_array_equal(total, np.asarray([[0.0, 45.0]]))
-        np.testing.assert_array_equal(rate, np.asarray([[0.0, 45.0]]))
+        np.testing.assert_array_equal(burden, np.zeros((4, 4), dtype=np.float32))
+        np.testing.assert_array_equal(peak, np.zeros((4, 4), dtype=np.float32))
+
+    def test_temporal_change_heatmap_is_black_for_static_pixels_and_brightest_for_long_residence(self) -> None:
+        burden = np.asarray([[0.0, 1.0, 16.0]], dtype=np.float32)
+        peak = np.asarray([[0.0, 50.0, 50.0]], dtype=np.float32)
+
+        heatmap = main.render_temporal_change_heatmap(burden, peak, burden_peak=16.0, contrast_peak=50.0)
+
+        np.testing.assert_array_equal(heatmap[0, 0], np.zeros(3, dtype=np.uint8))
+        self.assertGreater(float(np.mean(heatmap[0, 2])), float(np.mean(heatmap[0, 1])) * 2.0)
+
+    def test_temporal_change_heatmap_supports_distinct_colormaps(self) -> None:
+        burden = np.asarray([[0.0, 4.0, 16.0]], dtype=np.float32)
+        peak = np.asarray([[0.0, 50.0, 50.0]], dtype=np.float32)
+
+        hot = main.render_temporal_change_heatmap(
+            burden,
+            peak,
+            burden_peak=16.0,
+            contrast_peak=50.0,
+            colormap="hot",
+        )
+        viridis = main.render_temporal_change_heatmap(
+            burden,
+            peak,
+            burden_peak=16.0,
+            contrast_peak=50.0,
+            colormap="viridis",
+        )
+
+        np.testing.assert_array_equal(hot[0, 0], np.zeros(3, dtype=np.uint8))
+        np.testing.assert_array_equal(viridis[0, 0], np.zeros(3, dtype=np.uint8))
+        self.assertFalse(np.array_equal(hot[0, 1:], viridis[0, 1:]))
+
+    def test_temporal_change_heatmap_colormap_control_is_serialized(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        drawer = window._stage_drawers("temporal_change_heatmap")[0]
+        combo = drawer.findChild(QComboBox, "heatmapColormap")
+
+        self.assertIsNotNone(combo)
+        assert combo is not None
+        self.assertEqual([combo.itemData(index) for index in range(combo.count())], ["hot", "inferno", "turbo", "viridis", "cividis"])
+        combo.setCurrentIndex(combo.findData("viridis"))
+
+        self.assertEqual(window._drawer_control_values(drawer)["heatmapColormap"], "viridis")
+        combo.setCurrentIndex(combo.findData("hot"))
+        window._set_drawer_control_values(drawer, {"heatmapColormap": "viridis"})
+        self.assertEqual(combo.currentData(), "viridis")
+
+    def test_temporal_change_heatmap_colormap_change_only_rerenders_cached_results(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        drawer = window._stage_drawers("temporal_change_heatmap")[0]
+        combo = drawer.findChild(QComboBox, "heatmapColormap")
+        assert combo is not None
+        window.temporal_change_results = {
+            "video": (np.asarray([[1.0]], dtype=np.float32), np.asarray([[1.0]], dtype=np.float32))
+        }
+
+        with (
+            patch.object(window, "refresh_temporal_change_views") as refresh,
+            patch.object(window, "rebuild_enhancement_pipeline") as rebuild,
+        ):
+            combo.setCurrentIndex(combo.findData("inferno"))
+
+        refresh.assert_called_once_with()
+        rebuild.assert_not_called()
 
     def test_temporal_change_heatmap_uses_shared_comparison_peaks(self) -> None:
         results = {
@@ -391,6 +459,7 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(render.call_count, 2)
         for call in render.call_args_list:
             self.assertEqual(call.args[2:], (12.0, 6.0))
+            self.assertEqual(call.kwargs, {"colormap": "hot"})
 
     def test_temporal_change_view_is_mutually_exclusive_with_source_view(self) -> None:
         app = QApplication.instance() or QApplication([])
