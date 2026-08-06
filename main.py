@@ -471,6 +471,14 @@ def average_frame_brightness(frames: list[np.ndarray]) -> np.ndarray:
     return np.asarray([float(np.mean(frame)) for frame in frames], dtype=float)
 
 
+def temporal_derivative(time: np.ndarray, values: np.ndarray) -> np.ndarray:
+    if len(time) != len(values):
+        raise ValueError("Time and value arrays must have the same length")
+    if len(values) < 2:
+        return np.zeros_like(values, dtype=float)
+    return np.gradient(values.astype(float), time.astype(float))
+
+
 @dataclass(frozen=True, slots=True)
 class ROISelection:
     rect: QRect
@@ -4306,6 +4314,7 @@ class ContrastWindow(QMainWindow):
         selected = np.isfinite(roi_values)
         self.normalized_plot.clear()
         self.raw_plot.clear()
+        self.derivative_plot.clear()
         if not np.any(selected):
             return
         raw = roi_values[selected]
@@ -4319,8 +4328,15 @@ class ContrastWindow(QMainWindow):
             pg.InfiniteLine(pos=self.threshold_spin.value(), angle=0, pen=pg.mkPen("#e2e8f0", width=1, style=Qt.PenStyle.DashLine))
         )
         self.raw_plot.plot(live_time, raw, pen=pg.mkPen(PANEL_COLORS[0].name(), width=2.5), name="Live ROI")
+        self.derivative_plot.plot(
+            live_time,
+            temporal_derivative(live_time, normalized),
+            pen=pg.mkPen(PANEL_COLORS[0].name(), width=2.5),
+            name="Live ROI",
+        )
         self.normalized_plot.setXRange(-60, 0, padding=0)
         self.raw_plot.setXRange(-60, 0, padding=0)
+        self.derivative_plot.setXRange(-60, 0, padding=0)
 
     def _placeholder_labels(self, mode: str) -> list[str]:
         if mode == MODE_COMPARISON:
@@ -5473,14 +5489,19 @@ class ContrastWindow(QMainWindow):
         roi_brightness_layout = QGridLayout(roi_brightness_panel)
         roi_brightness_layout.setContentsMargins(0, 0, 0, 0)
         roi_brightness_layout.setSpacing(10)
+        derivative_panel = QWidget()
+        derivative_layout = QGridLayout(derivative_panel)
+        derivative_layout.setContentsMargins(0, 0, 0, 0)
+        derivative_layout.setSpacing(10)
         self.normalized_plot = pg.PlotWidget(title="Normalized Contrast Residence")
         self.raw_plot = pg.PlotWidget(title="Denoised ROI Brightness")
+        self.derivative_plot = pg.PlotWidget(title="Normalized Contrast Derivative")
         self.frame_brightness_panel = QWidget()
         self.frame_brightness_layout = QVBoxLayout(self.frame_brightness_panel)
         self.frame_brightness_layout.setContentsMargins(0, 0, 0, 0)
         self.frame_brightness_layout.setSpacing(10)
         self.frame_brightness_plots: dict[str, pg.PlotWidget] = {}
-        for plot in [self.normalized_plot, self.raw_plot]:
+        for plot in [self.normalized_plot, self.raw_plot, self.derivative_plot]:
             plot.setBackground("#111827")
             plot.showGrid(x=True, y=True, alpha=0.25)
             plot.getAxis("bottom").setPen("#8aa0b8")
@@ -5492,11 +5513,15 @@ class ContrastWindow(QMainWindow):
         self.normalized_plot.setLabel("left", "Normalized signal")
         self.raw_plot.setLabel("bottom", "Time", units="s")
         self.raw_plot.setLabel("left", "Mean pixel value")
+        self.derivative_plot.setLabel("bottom", "Time", units="s")
+        self.derivative_plot.setLabel("left", "Signal change", units="1/s")
 
         residence_layout.addWidget(self.normalized_plot, 0, 0)
         roi_brightness_layout.addWidget(self.raw_plot, 0, 0)
+        derivative_layout.addWidget(self.derivative_plot, 0, 0)
         self.analysis_tabs.addTab(residence_panel, "ROI residence")
         self.analysis_tabs.addTab(roi_brightness_panel, "ROI brightness")
+        self.analysis_tabs.addTab(derivative_panel, "Derivative")
         self.analysis_tabs.addTab(self.frame_brightness_panel, "Frame brightness")
         plot_layout.addWidget(self.analysis_tabs, 0, 0)
         return plot_group
@@ -7536,6 +7561,7 @@ class ContrastWindow(QMainWindow):
     def clear_plots_and_metrics(self) -> None:
         self.normalized_plot.clear()
         self.raw_plot.clear()
+        self.derivative_plot.clear()
         self._clear_frame_brightness_plots()
         self.frame_brightness_results.clear()
         self.temporal_change_results.clear()
@@ -7551,6 +7577,7 @@ class ContrastWindow(QMainWindow):
     def refresh_plots_and_metrics(self) -> None:
         self.normalized_plot.clear()
         self.raw_plot.clear()
+        self.derivative_plot.clear()
         pens = {
             panel.label: pg.mkPen(panel.color.name(), width=2.5)
             for panel in self.panels
@@ -7560,6 +7587,12 @@ class ContrastWindow(QMainWindow):
             pen = pens.get(label, pg.mkPen("#cbd5e1", width=2.5))
             self.normalized_plot.plot(result.time, result.normalized_signal, pen=pen, name=label)
             self.raw_plot.plot(result.time, result.mean_intensity, pen=pen, name=label)
+            self.derivative_plot.plot(
+                result.time,
+                temporal_derivative(result.time, result.normalized_signal),
+                pen=pen,
+                name=label,
+            )
 
         if self.results:
             max_time = max(result.time[-1] for result in self.results.values() if len(result.time))
@@ -7567,6 +7600,7 @@ class ContrastWindow(QMainWindow):
             self.normalized_plot.addItem(threshold_line)
             self.normalized_plot.setXRange(0, max_time, padding=0)
             self.normalized_plot.setYRange(0, 1.05, padding=0)
+            self.derivative_plot.setXRange(0, max_time, padding=0)
 
         pre = self.results.get("Pre-deployment")
         post = self.results.get("Post-deployment")

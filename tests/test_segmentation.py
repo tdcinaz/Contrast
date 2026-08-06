@@ -38,11 +38,47 @@ from main import (
     roi_selection_from_mask,
     segment_temporal_change_map,
     segment_temporal_change_contrast,
+    temporal_derivative,
     temporal_change_heatmap_peaks,
 )
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_temporal_derivative_uses_time_spacing(self) -> None:
+        derivative = temporal_derivative(
+            np.asarray([0.0, 0.5, 2.0]),
+            np.asarray([0.0, 1.0, 4.0]),
+        )
+
+        np.testing.assert_allclose(derivative, np.asarray([2.0, 2.0, 2.0]))
+
+    def test_analysis_drawer_plots_normalized_signal_derivative(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        label = "Pre-deployment"
+        window.panels = [SimpleNamespace(label=label, color=QColor("#38bdf8"))]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        window.results = {
+            label: build_analysis_result(
+                label,
+                Path("pre.mov"),
+                2.0,
+                QRect(0, 0, 1, 1),
+                np.asarray([100.0, 75.0, 0.0]),
+                np.asarray([], dtype=float),
+                0.2,
+                False,
+            )
+        }
+
+        window.refresh_plots_and_metrics()
+
+        self.assertEqual(window.analysis_tabs.tabText(2), "Derivative")
+        curve = window.derivative_plot.listDataItems()[0]
+        _, derivative = curve.getData()
+        np.testing.assert_allclose(derivative, temporal_derivative(window.results[label].time, window.results[label].normalized_signal))
+
     def test_manual_roi_selection_bypasses_auto_detection_and_has_a_distinct_cache_token(self) -> None:
         automatic = EnhancementParameters()
         manual = EnhancementParameters(roi_mode="manual", roi_manual_circle=(24, 30, 12))
