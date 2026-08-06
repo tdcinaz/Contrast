@@ -479,6 +479,12 @@ def temporal_derivative(time: np.ndarray, values: np.ndarray) -> np.ndarray:
     return np.gradient(values.astype(float), time.astype(float))
 
 
+def baseline_to_apex_normalized_signal(result: AnalysisResult) -> np.ndarray:
+    if result.peak_signal <= 0:
+        return np.zeros_like(result.contrast_signal)
+    return result.contrast_signal / result.peak_signal
+
+
 @dataclass(frozen=True, slots=True)
 class ROISelection:
     rect: QRect
@@ -4315,6 +4321,7 @@ class ContrastWindow(QMainWindow):
         self.normalized_plot.clear()
         self.raw_plot.clear()
         self.derivative_plot.clear()
+        self.baseline_to_apex_plot.clear()
         if not np.any(selected):
             return
         raw = roi_values[selected]
@@ -5496,12 +5503,17 @@ class ContrastWindow(QMainWindow):
         self.normalized_plot = pg.PlotWidget(title="Normalized Contrast Residence")
         self.raw_plot = pg.PlotWidget(title="Denoised ROI Brightness")
         self.derivative_plot = pg.PlotWidget(title="Normalized Contrast Derivative")
+        baseline_to_apex_panel = QWidget()
+        baseline_to_apex_layout = QGridLayout(baseline_to_apex_panel)
+        baseline_to_apex_layout.setContentsMargins(0, 0, 0, 0)
+        baseline_to_apex_layout.setSpacing(10)
+        self.baseline_to_apex_plot = pg.PlotWidget(title="Baseline-to-Apex Contrast")
         self.frame_brightness_panel = QWidget()
         self.frame_brightness_layout = QVBoxLayout(self.frame_brightness_panel)
         self.frame_brightness_layout.setContentsMargins(0, 0, 0, 0)
         self.frame_brightness_layout.setSpacing(10)
         self.frame_brightness_plots: dict[str, pg.PlotWidget] = {}
-        for plot in [self.normalized_plot, self.raw_plot, self.derivative_plot]:
+        for plot in [self.normalized_plot, self.raw_plot, self.derivative_plot, self.baseline_to_apex_plot]:
             plot.setBackground("#111827")
             plot.showGrid(x=True, y=True, alpha=0.25)
             plot.getAxis("bottom").setPen("#8aa0b8")
@@ -5515,13 +5527,18 @@ class ContrastWindow(QMainWindow):
         self.raw_plot.setLabel("left", "Mean pixel value")
         self.derivative_plot.setLabel("bottom", "Time", units="s")
         self.derivative_plot.setLabel("left", "Signal change", units="1/s")
+        self.baseline_to_apex_plot.setLabel("bottom", "Time", units="s")
+        self.baseline_to_apex_plot.setLabel("left", "Baseline to apex", units="normalized")
 
         residence_layout.addWidget(self.normalized_plot, 0, 0)
         roi_brightness_layout.addWidget(self.raw_plot, 0, 0)
         derivative_layout.addWidget(self.derivative_plot, 0, 0)
+        baseline_to_apex_layout.addWidget(self.baseline_to_apex_plot, 0, 0)
         self.analysis_tabs.addTab(residence_panel, "ROI residence")
         self.analysis_tabs.addTab(roi_brightness_panel, "ROI brightness")
         self.analysis_tabs.addTab(derivative_panel, "Derivative")
+        self.baseline_to_apex_tab_index = self.analysis_tabs.addTab(baseline_to_apex_panel, "Baseline to apex")
+        self.analysis_tabs.setTabVisible(self.baseline_to_apex_tab_index, False)
         self.analysis_tabs.addTab(self.frame_brightness_panel, "Frame brightness")
         plot_layout.addWidget(self.analysis_tabs, 0, 0)
         return plot_group
@@ -7562,6 +7579,7 @@ class ContrastWindow(QMainWindow):
         self.normalized_plot.clear()
         self.raw_plot.clear()
         self.derivative_plot.clear()
+        self.baseline_to_apex_plot.clear()
         self._clear_frame_brightness_plots()
         self.frame_brightness_results.clear()
         self.temporal_change_results.clear()
@@ -7578,6 +7596,9 @@ class ContrastWindow(QMainWindow):
         self.normalized_plot.clear()
         self.raw_plot.clear()
         self.derivative_plot.clear()
+        self.baseline_to_apex_plot.clear()
+        comparison_active = self.active_mode == MODE_COMPARISON and len(self.results) > 1
+        self.analysis_tabs.setTabVisible(self.baseline_to_apex_tab_index, comparison_active)
         pens = {
             panel.label: pg.mkPen(panel.color.name(), width=2.5)
             for panel in self.panels
@@ -7593,6 +7614,13 @@ class ContrastWindow(QMainWindow):
                 pen=pen,
                 name=label,
             )
+            if comparison_active:
+                self.baseline_to_apex_plot.plot(
+                    result.time,
+                    baseline_to_apex_normalized_signal(result),
+                    pen=pen,
+                    name=label,
+                )
 
         if self.results:
             max_time = max(result.time[-1] for result in self.results.values() if len(result.time))
@@ -7601,6 +7629,9 @@ class ContrastWindow(QMainWindow):
             self.normalized_plot.setXRange(0, max_time, padding=0)
             self.normalized_plot.setYRange(0, 1.05, padding=0)
             self.derivative_plot.setXRange(0, max_time, padding=0)
+            if comparison_active:
+                self.baseline_to_apex_plot.setXRange(0, max_time, padding=0)
+                self.baseline_to_apex_plot.setYRange(0, 1.05, padding=0)
 
         pre = self.results.get("Pre-deployment")
         post = self.results.get("Post-deployment")

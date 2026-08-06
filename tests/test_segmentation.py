@@ -32,6 +32,7 @@ from main import (
     compute_temporal_change_summary,
     detect_aneurysm_roi,
     build_analysis_result,
+    baseline_to_apex_normalized_signal,
     normalize_analysis_results,
     overlay_roi_regions,
     fit_circle_to_convex_hull,
@@ -51,6 +52,16 @@ class SegmentationTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(derivative, np.asarray([2.0, 2.0, 2.0]))
+
+    def test_baseline_to_apex_normalization_scales_each_result_independently(self) -> None:
+        roi = QRect(0, 0, 1, 1)
+        pre = build_analysis_result("Pre-deployment", Path("pre.mov"), 1.0, roi, np.asarray([100.0, 80.0]), np.asarray([]), 0.2, False)
+        post = build_analysis_result("Post-deployment", Path("post.mov"), 1.0, roi, np.asarray([100.0, 20.0]), np.asarray([]), 0.2, False)
+        results = normalize_analysis_results({pre.label: pre, post.label: post}, 0.2)
+
+        np.testing.assert_allclose(results[pre.label].normalized_signal, [0.0, 0.25])
+        np.testing.assert_allclose(baseline_to_apex_normalized_signal(results[pre.label]), [0.0, 1.0])
+        np.testing.assert_allclose(baseline_to_apex_normalized_signal(results[post.label]), [0.0, 1.0])
 
     def test_analysis_drawer_plots_normalized_signal_derivative(self) -> None:
         QApplication.instance() or QApplication([])
@@ -78,6 +89,33 @@ class SegmentationTests(unittest.TestCase):
         curve = window.derivative_plot.listDataItems()[0]
         _, derivative = curve.getData()
         np.testing.assert_allclose(derivative, temporal_derivative(window.results[label].time, window.results[label].normalized_signal))
+
+    def test_comparison_drawer_plots_baseline_to_apex_curves(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window.active_mode = MODE_COMPARISON
+        window.panels = [
+            SimpleNamespace(label="Pre-deployment", color=QColor("#38bdf8")),
+            SimpleNamespace(label="Post-deployment", color=QColor("#f97316")),
+        ]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        roi = QRect(0, 0, 1, 1)
+        window.results = normalize_analysis_results(
+            {
+                "Pre-deployment": build_analysis_result("Pre-deployment", Path("pre.mov"), 1.0, roi, np.asarray([100.0, 80.0]), np.asarray([]), 0.2, False),
+                "Post-deployment": build_analysis_result("Post-deployment", Path("post.mov"), 1.0, roi, np.asarray([100.0, 20.0]), np.asarray([]), 0.2, False),
+            },
+            0.2,
+        )
+
+        window.refresh_plots_and_metrics()
+
+        self.assertTrue(window.analysis_tabs.isTabVisible(window.baseline_to_apex_tab_index))
+        curves = [curve.getData()[1] for curve in window.baseline_to_apex_plot.listDataItems()]
+        self.assertEqual(len(curves), 2)
+        for curve in curves:
+            np.testing.assert_allclose(curve, [0.0, 1.0])
 
     def test_manual_roi_selection_bypasses_auto_detection_and_has_a_distinct_cache_token(self) -> None:
         automatic = EnhancementParameters()
