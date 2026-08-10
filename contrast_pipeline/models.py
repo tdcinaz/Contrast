@@ -110,3 +110,4 @@ class EnhancementRequest:
     contrast_gain_alignment: bool = False
     histogram_matching: bool = False
     metal_needle_removal: bool = False
+    prepare_source_frames: bool = False

@@ -7369,6 +7369,7 @@ class ContrastWindow(QMainWindow):
             comparison_sync_offset_seconds=comparison_sync_offset_seconds,
             background_subtraction_settings=background_subtraction_settings,
             metal_needle_removal=metal_needle_removal,
+            prepare_source_frames=self._has_enabled_stage("frame_brightness_analysis"),
             roi_parameters_by_panel=tuple(self._roi_parameters_for_panel(index) for index in range(len(self.panels))),
         )
         self._enhancement_pending_request = request
@@ -7477,7 +7478,7 @@ class ContrastWindow(QMainWindow):
                     return False
             if cancel_event.is_set():
                 return False
-        if not request.stages.any_enabled:
+        if not request.stages.any_enabled and not request.prepare_source_frames:
             return True
 
         use_denoiser = request.stages.denoise
@@ -8066,18 +8067,26 @@ class ContrastWindow(QMainWindow):
             plot.setLabel("bottom", "Time", units="s")
             plot.setLabel("left", "Mean pixel value")
             plot.addLegend(offset=(12, 12))
-            plot.plot(
-                time,
-                source_brightness,
-                pen=pg.mkPen(color, width=1.5, style=Qt.PenStyle.DashLine),
-                name="Original",
-            )
-            plot.plot(
-                time,
-                enhanced_brightness,
-                pen=pg.mkPen(color, width=2.5),
-                name="Enhanced",
-            )
+            if np.array_equal(source_brightness, enhanced_brightness):
+                plot.plot(
+                    time,
+                    source_brightness,
+                    pen=pg.mkPen(color, width=2.5),
+                    name="Frame brightness",
+                )
+            else:
+                plot.plot(
+                    time,
+                    source_brightness,
+                    pen=pg.mkPen(color, width=1.5, style=Qt.PenStyle.DashLine),
+                    name="Original",
+                )
+                plot.plot(
+                    time,
+                    enhanced_brightness,
+                    pen=pg.mkPen(color, width=2.5),
+                    name="Enhanced",
+                )
             if len(time):
                 if self.active_mode == MODE_LIVE:
                     plot.setXRange(-60, 0, padding=0)

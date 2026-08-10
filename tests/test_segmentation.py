@@ -720,6 +720,52 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(set(window.frame_brightness_plots), {"Pre-deployment", "Post-deployment"})
         self.assertEqual(window.frame_brightness_layout.count(), 2)
 
+    def test_frame_brightness_analysis_without_enhancement_uses_a_single_curve(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        window.panels = [SimpleNamespace(label="Video", color=QColor("#38bdf8"))]
+        brightness = np.asarray([80.0, 81.0])
+        window.frame_brightness_results = {"Video": (np.asarray([0.0, 1.0]), brightness, brightness.copy())}
+
+        window.refresh_frame_brightness_plot()
+
+        plot = window.frame_brightness_plots["Video"]
+        self.assertEqual(len(plot.listDataItems()), 1)
+        self.assertEqual(plot.plotItem.legend.items[0][1].text, "Frame brightness")
+        app.quit()
+
+    def test_analysis_only_request_prepares_source_frames_for_brightness(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        panel = Mock()
+        panel.estimate_prepare_work.return_value = 0.0
+        panel.prepare_enhanced_frames.return_value = True
+        window.panels = [panel]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        request = EnhancementRequest(
+            generation=1,
+            mode="ffdnet-native",
+            model_label="FFDNet",
+            stages=EnhancementStages(),
+            parameters=EnhancementParameters(),
+            noise_sigma=10,
+            batch_size=1,
+            precision="fp16",
+            auto_crop=False,
+            temporal_alignment=False,
+            source_pipeline_current=True,
+            prepare_source_frames=True,
+            roi_parameters_by_panel=(EnhancementParameters(),),
+        )
+
+        self.assertTrue(window._run_enhancement_request(request, Event()))
+
+        panel.prepare_enhanced_frames.assert_called_once()
+        app.quit()
+
     def test_current_source_pipeline_skips_source_preparation(self) -> None:
         request = EnhancementRequest(
             generation=1,
