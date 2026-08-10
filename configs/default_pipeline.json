@@ -2,7 +2,7 @@
   "pipeline": [
     {
       "controls": {
-        "autoCropSizeOffset": -60
+        "autoCropSizeOffset": -10
       },
       "enabled": true,
       "key": "auto_crop"
@@ -15,20 +15,12 @@
     {
       "controls": {
         "comparisonSyncOffset": 0.0,
+        "temporalEndTrim": 0.0,
+        "temporalGainNormalization": true,
         "temporalTrimOffset": -2.0
       },
       "enabled": true,
       "key": "temporal_alignment"
-    },
-    {
-      "controls": {
-        "backgroundVideo1Enabled": false,
-        "backgroundVideo1Level": 0,
-        "backgroundVideo2Enabled": false,
-        "backgroundVideo2Level": 0
-      },
-      "enabled": false,
-      "key": "background_subtraction"
     },
     {
       "controls": {
@@ -68,27 +60,17 @@
       "key": "frame_brightness_analysis"
     },
     {
-      "controls": {},
-      "enabled": true,
-      "key": "needle_segmentation"
-    },
-    {
       "controls": {
         "roiCircleFitEnabled": true,
         "roiConvexHullEnabled": true,
         "roiSoftenEnabled": true,
         "roiSofteningRadius": 0.12,
         "roiSofteningThreshold": 0.1,
-        "roiVideo1Mode": "auto",
-        "roiVideo2Mode": "auto"
+        "roiVideo1Mode": "manual",
+        "roiVideo2Mode": "manual"
       },
       "enabled": true,
       "key": "roi_extraction"
-    },
-    {
-      "controls": {},
-      "enabled": true,
-      "key": "temporal_change_heatmap"
     },
     {
       "controls": {
@@ -96,6 +78,11 @@
       },
       "enabled": true,
       "key": "roi_residence_analysis"
+    },
+    {
+      "controls": {},
+      "enabled": true,
+      "key": "needle_segmentation"
     }
   ],
   "version": 1

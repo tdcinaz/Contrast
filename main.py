@@ -426,6 +426,8 @@ class SourcePipelineState:
     detected_trim_start: int | None
     background_reference: np.ndarray | None
     configuration: tuple[object, ...]
+    frame_brightness_onset: int | None = None
+    comparison_sync_offset_frames: int = 0
     trim_end: int = 0
     metal_needle_mask: np.ndarray | None = None
     gain_alignment_baseline: float = 0.0
@@ -463,6 +465,26 @@ def align_source_histogram_states(states: list[SourcePipelineState]) -> list[Sou
         source_cdf = np.cumsum(state.histogram.astype(np.float64, copy=False)) / state.histogram.sum()
         lut = np.searchsorted(reference_cdf, source_cdf, side="left").clip(0, 255).astype(np.uint8)
         aligned.append(replace(state, histogram_match_lut=lut))
+    return aligned
+
+
+def align_source_brightness_onsets(states: list[SourcePipelineState]) -> list[SourcePipelineState]:
+    if len(states) < 2 or states[0].frame_brightness_onset is None:
+        return states
+    reference_position = states[0].frame_brightness_onset - states[0].trim_start
+    aligned = [states[0]]
+    for state in states[1:]:
+        if state.frame_brightness_onset is None:
+            aligned.append(state)
+            continue
+        trim_start = max(
+            0,
+            min(
+                state.frame_brightness_onset - reference_position + state.comparison_sync_offset_frames,
+                state.frame_brightness_onset,
+            ),
+        )
+        aligned.append(replace(state, trim_start=trim_start))
     return aligned
 
 
@@ -605,13 +627,20 @@ def _contrast_frame_signal(gray: np.ndarray) -> float:
     return float(0.6 * np.mean(center) + 0.4 * np.percentile(center, 30))
 
 
-def detect_pre_injection_trim_start(gray_frames: list[np.ndarray], fps: float) -> int:
+def detect_pre_injection_trim_start(
+    gray_frames: list[np.ndarray],
+    fps: float,
+    gain_normalization_enabled: bool = True,
+) -> int:
     if len(gray_frames) < 3:
         return 0
 
-    target_median = float(np.median([np.median(gray) for gray in gray_frames]))
-    stabilized_frames = [stabilize_frame_gain(gray, target_median, 0.70, 1.45) for gray in gray_frames]
-    signals = np.asarray([_contrast_frame_signal(gray) for gray in stabilized_frames], dtype=float)
+    if gain_normalization_enabled:
+        target_median = float(np.median([np.median(gray) for gray in gray_frames]))
+        source_frames = [stabilize_frame_gain(gray, target_median, 0.70, 1.45) for gray in gray_frames]
+    else:
+        source_frames = gray_frames
+    signals = average_frame_brightness(source_frames)
     smoothed = smooth_temporal_signal(signals, fps)
     baseline_window = min(len(smoothed), max(3, round(fps * 1.5)))
     baseline = float(np.median(smoothed[:baseline_window]))
@@ -635,6 +664,21 @@ def detect_pre_injection_trim_start(gray_frames: list[np.ndarray], fps: float) -
             onset_index = baseline_window
 
     return max(0, onset_index - round(fps * 0.5))
+
+
+def detect_frame_brightness_onset(gray_frames: list[np.ndarray], fps: float) -> int | None:
+    if len(gray_frames) < 3:
+        return None
+    brightness = smooth_temporal_signal(average_frame_brightness(gray_frames), fps)
+    baseline_window = min(len(brightness), max(3, round(fps * 1.5)))
+    baseline = float(np.median(brightness[:baseline_window]))
+    baseline_noise = float(np.median(np.abs(brightness[:baseline_window] - baseline)))
+    threshold = baseline - max(0.5, baseline_noise * 8.0)
+    sustain_window = max(3, round(fps * 0.35))
+    for index in range(baseline_window, len(brightness) - sustain_window + 1):
+        if np.all(brightness[index : index + sustain_window] <= threshold):
+            return index
+    return None
 
 
 def _detect_aligned_field_crop(gray_frames: list[np.ndarray]) -> QRect | None:
@@ -2264,6 +2308,7 @@ class VideoPanel(QFrame):
         background_level: int = 0,
         metal_needle_removal_enabled: bool = False,
         startup_stabilization_enabled: bool = False,
+        temporal_gain_normalization_enabled: bool = True,
     ) -> SourcePipelineState:
         temporal_alignment_enabled = temporal_alignment_enabled and not self.live_input
         background_subtraction_enabled = background_subtraction_enabled and not self.live_input
@@ -2310,6 +2355,7 @@ class VideoPanel(QFrame):
         next_trim_end = 0
         trim_cache_key: tuple[int, int, int, int] | None = None
         detected_trim_start: int | None = None
+        frame_brightness_onset: int | None = None
         if startup_stabilization_enabled:
             gray_frames = self._sample_cropped_gray_frames(
                 next_crop_rect,
@@ -2325,17 +2371,25 @@ class VideoPanel(QFrame):
             crop_key = self._crop_rect_key(next_crop_rect)
             trim_cache_key = crop_key
             cached_trim_start = self._trim_start_cache.get(crop_key)
+            gray_frames = self._sample_cropped_gray_frames(
+                next_crop_rect,
+                lambda done, total: report("Aligning contrast timing", done, total),
+            )
             if cached_trim_start is None:
-                gray_frames = self._sample_cropped_gray_frames(
-                    next_crop_rect,
-                    lambda done, total: report("Aligning contrast timing", done, total),
-                )
                 cached_trim_start = (
-                    detect_pre_injection_trim_start(gray_frames[next_trim_start:], self.info.fps)
+                    detect_pre_injection_trim_start(
+                        gray_frames[next_trim_start:],
+                        self.info.fps,
+                        temporal_gain_normalization_enabled,
+                    )
                     + next_trim_start
                 )
             detected_trim_start = cached_trim_start
-            trim_offset_frames = round((temporal_trim_offset_seconds + comparison_sync_offset_seconds) * self.info.fps)
+            visible_onset = detect_frame_brightness_onset(gray_frames[next_trim_start:], self.info.fps)
+            if visible_onset is not None:
+                frame_brightness_onset = next_trim_start + visible_onset
+            comparison_sync_offset_frames = round(comparison_sync_offset_seconds * self.info.fps)
+            trim_offset_frames = round(temporal_trim_offset_seconds * self.info.fps) + comparison_sync_offset_frames
             next_trim_start = max(0, min(self.info.frame_count - 1, cached_trim_start + trim_offset_frames))
             end_trim_frames = round(max(0.0, temporal_end_trim_seconds) * self.info.fps)
             next_trim_end = max(0, min(self.info.frame_count - next_trim_start - 1, end_trim_frames))
@@ -2399,6 +2453,8 @@ class VideoPanel(QFrame):
             auto_crop_rect=auto_crop_rect,
             trim_cache_key=trim_cache_key,
             detected_trim_start=detected_trim_start,
+            frame_brightness_onset=frame_brightness_onset,
+            comparison_sync_offset_frames=comparison_sync_offset_frames if temporal_alignment_enabled else 0,
             background_reference=background_reference,
             metal_needle_mask=metal_needle_mask,
             configuration=(
@@ -2413,7 +2469,7 @@ class VideoPanel(QFrame):
                 comparison_sync_offset_seconds,
                 metal_needle_removal_enabled,
                 histogram_matching_enabled,
-            ) + ((True,) if startup_stabilization_enabled else ()),
+            ) + ((True,) if startup_stabilization_enabled else ()) + ((False,) if not temporal_gain_normalization_enabled else ()),
             gain_alignment_baseline=gain_alignment_baseline,
             gain_alignment_span=gain_alignment_span,
             histogram=histogram,
@@ -4833,6 +4889,7 @@ class ContrastWindow(QMainWindow):
                 background_level=background_settings[panel_index][1],
                 metal_needle_removal_enabled=metal_needle_removal_enabled,
                 startup_stabilization_enabled=startup_stabilization_enabled,
+                temporal_gain_normalization_enabled=self.temporal_gain_normalization_check.isChecked(),
             )
             for panel_index, panel in enumerate(self.panels)
         ]
@@ -4840,6 +4897,8 @@ class ContrastWindow(QMainWindow):
             states = align_source_gain_states(states)
         if histogram_matching_enabled and self.active_mode == MODE_COMPARISON:
             states = align_source_histogram_states(states)
+        if temporal_alignment_enabled and self.active_mode == MODE_COMPARISON:
+            states = align_source_brightness_onsets(states)
         return self._apply_source_pipeline_states(states)
 
     def _apply_source_pipeline_states(self, states: list[SourcePipelineState]) -> bool:
@@ -4860,6 +4919,7 @@ class ContrastWindow(QMainWindow):
         self,
         auto_crop: bool,
         startup_stabilization_trim: bool,
+        temporal_gain_normalization: bool,
         temporal_alignment: bool,
         contrast_gain_alignment: bool,
         histogram_matching: bool,
@@ -4886,7 +4946,7 @@ class ContrastWindow(QMainWindow):
                 comparison_sync_offset_seconds if self.active_mode == MODE_COMPARISON and panel_index == 1 else 0.0,
                 metal_needle_removal,
                 histogram_matching,
-            ) + ((True,) if startup_stabilization_trim else ())
+            ) + ((True,) if startup_stabilization_trim else ()) + ((False,) if not temporal_gain_normalization else ())
             for panel_index, panel in enumerate(self.panels)
         )
 
@@ -5460,6 +5520,7 @@ class ContrastWindow(QMainWindow):
             "temporal_trim_offset_spin": "temporalTrimOffset",
             "temporal_end_trim_spin": "temporalEndTrim",
             "comparison_sync_offset_spin": "comparisonSyncOffset",
+            "temporal_gain_normalization_check": "temporalGainNormalization",
             "denoise_strength_label": "denoiseStrengthLabel",
             "enhancement_mode_combo": "denoiseMode",
             "denoise_strength_spin": "denoiseStrength",
@@ -6024,6 +6085,14 @@ class ContrastWindow(QMainWindow):
         temporal_alignment_hint.setObjectName("subtleLabel")
         temporal_alignment_hint.setWordWrap(True)
         self.temporal_alignment_stage_drawer.content_layout.addWidget(temporal_alignment_hint)
+
+        self.temporal_gain_normalization_check = QCheckBox("Normalize gain before onset detection")
+        self.temporal_gain_normalization_check.setChecked(True)
+        self.temporal_gain_normalization_check.setToolTip(
+            "Compensate frame-wide fluoroscope gain changes before detecting the whole-frame brightness drop"
+        )
+        self.temporal_gain_normalization_check.toggled.connect(self.on_enhancement_settings_changed)
+        self.temporal_alignment_stage_drawer.content_layout.addWidget(self.temporal_gain_normalization_check)
 
         gain_alignment_hint = QLabel(
             "Matches the lower-gain control's pre-injection brightness and contrast excursion to the stronger comparison source."
@@ -7377,6 +7446,7 @@ class ContrastWindow(QMainWindow):
         mode = str(self.enhancement_mode_combo.currentData())
         auto_crop = self._has_enabled_stage("auto_crop")
         startup_stabilization_trim = self._has_enabled_stage("startup_stabilization_trim")
+        temporal_gain_normalization = self.temporal_gain_normalization_check.isChecked()
         temporal_alignment = self._has_enabled_stage("temporal_alignment")
         contrast_gain_alignment = self._has_enabled_stage("contrast_gain_alignment")
         histogram_matching = self.active_mode == MODE_COMPARISON and self._has_enabled_stage("histogram_matching")
@@ -7398,12 +7468,14 @@ class ContrastWindow(QMainWindow):
             precision=str(self.inference_precision_combo.currentData()),
             auto_crop=auto_crop,
             startup_stabilization_trim=startup_stabilization_trim,
+            temporal_gain_normalization=temporal_gain_normalization,
             temporal_alignment=temporal_alignment,
             contrast_gain_alignment=contrast_gain_alignment,
             histogram_matching=histogram_matching,
             source_pipeline_current=self._source_pipeline_is_current(
                 auto_crop,
                 startup_stabilization_trim,
+                temporal_gain_normalization,
                 temporal_alignment,
                 contrast_gain_alignment,
                 histogram_matching,
@@ -7496,6 +7568,7 @@ class ContrastWindow(QMainWindow):
                 request.background_subtraction_settings[panel_index][1],
                 request.metal_needle_removal,
                 request.startup_stabilization_trim,
+                request.temporal_gain_normalization,
             )
 
         if not request.source_pipeline_current:
@@ -7524,6 +7597,8 @@ class ContrastWindow(QMainWindow):
                 resolved_source_states = align_source_gain_states(resolved_source_states)
             if request.histogram_matching and self.active_mode == MODE_COMPARISON:
                 resolved_source_states = align_source_histogram_states(resolved_source_states)
+            if request.temporal_alignment and self.active_mode == MODE_COMPARISON:
+                resolved_source_states = align_source_brightness_onsets(resolved_source_states)
 
             source_states_applied = Event()
             self._source_pipeline_events.put(

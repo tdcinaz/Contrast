@@ -112,3 +112,4 @@ class EnhancementRequest:
     metal_needle_removal: bool = False
     prepare_source_frames: bool = False
     startup_stabilization_trim: bool = False
+    temporal_gain_normalization: bool = True

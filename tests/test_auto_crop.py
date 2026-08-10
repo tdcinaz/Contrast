@@ -20,12 +20,32 @@ from main import (
     detect_pre_injection_trim_start,
     SourcePipelineState,
     VideoPanel,
+    align_source_brightness_onsets,
     align_source_gain_states,
         align_source_histogram_states,
 )
 
 
 class AutoCropTests(unittest.TestCase):
+    def test_visible_brightness_onsets_share_a_graph_time_after_alignment(self) -> None:
+        common = dict(
+            crop_rect=QRect(0, 0, 4, 4),
+            auto_crop_rect=None,
+            trim_cache_key=None,
+            detected_trim_start=None,
+            background_reference=None,
+            configuration=(False, True, False, False, 0, 0, -2.0, 0.0, 0.0, False, False),
+        )
+        states = align_source_brightness_onsets(
+            [
+                SourcePipelineState(trim_start=110, frame_brightness_onset=143, **common),
+                SourcePipelineState(trim_start=120, frame_brightness_onset=169, **common),
+            ]
+        )
+
+        self.assertEqual(states[0].frame_brightness_onset - states[0].trim_start, 33)
+        self.assertEqual(states[1].frame_brightness_onset - states[1].trim_start, 33)
+
     def test_detects_delayed_fluoroscope_startup_stabilization(self) -> None:
         fps = 10.0
         levels = [80, 120] * 18 + [100] * 30
@@ -316,14 +336,23 @@ class AutoCropTests(unittest.TestCase):
         self.assertGreaterEqual(trim_start, 24)
         self.assertLessEqual(trim_start, 26)
 
-    def test_detected_trim_ignores_peripheral_change_in_expanded_crop(self) -> None:
+    def test_onset_detection_can_disable_gain_normalization(self) -> None:
+        frames = [np.full((32, 32), 160 if index < 30 else 120, dtype=np.uint8) for index in range(60)]
+        with patch.object(main, "stabilize_frame_gain", wraps=main.stabilize_frame_gain) as stabilize:
+            detect_pre_injection_trim_start(frames, fps=10.0)
+            self.assertGreater(stabilize.call_count, 0)
+            stabilize.reset_mock()
+
+            detect_pre_injection_trim_start(frames, fps=10.0, gain_normalization_enabled=False)
+
+        stabilize.assert_not_called()
+
+    def test_detected_trim_uses_whole_frame_brightness(self) -> None:
         frames: list[np.ndarray] = []
         for index in range(70):
             frame = np.full((320, 320), 160, dtype=np.uint8)
             if index >= 30:
-                cv2.circle(frame, (160, 160), 17, 85, thickness=-1)
-            if index >= 50:
-                cv2.rectangle(frame, (80, 120), (95, 200), 80, thickness=-1)
+                cv2.rectangle(frame, (0, 0), (79, 319), 80, thickness=-1)
             frames.append(frame)
 
         trim_start = detect_pre_injection_trim_start(frames, fps=10.0)
