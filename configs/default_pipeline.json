@@ -8,6 +8,11 @@
       "key": "auto_crop"
     },
     {
+      "controls": {},
+      "enabled": true,
+      "key": "startup_stabilization_trim"
+    },
+    {
       "controls": {
         "comparisonSyncOffset": 0.0,
         "temporalTrimOffset": -2.0

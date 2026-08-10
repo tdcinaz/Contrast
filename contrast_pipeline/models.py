@@ -111,3 +111,4 @@ class EnhancementRequest:
     histogram_matching: bool = False
     metal_needle_removal: bool = False
     prepare_source_frames: bool = False
+    startup_stabilization_trim: bool = False

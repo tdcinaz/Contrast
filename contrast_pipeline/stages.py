@@ -208,6 +208,7 @@ def _smoothing_token(parameters: EnhancementParameters, _backend_id: str, _noise
 BUILTIN_STAGES = StageRegistry(
     (
         StageDefinition("auto_crop", "Auto-crop fluoroscope field", ExecutionShape.SOURCE, 0.0, 0.0, live_supported=True),
+        StageDefinition("startup_stabilization_trim", "Trim fluoroscope startup settling", ExecutionShape.SOURCE, 0.0, 0.0, live_supported=False),
         StageDefinition("temporal_alignment", "Temporal alignment (trim onset)", ExecutionShape.SOURCE, 0.0, 0.0, live_supported=False),
         StageDefinition("contrast_gain_alignment", "Align fluoroscope contrast gain", ExecutionShape.SOURCE, 0.0002, 0.0004, live_supported=False),
         StageDefinition("histogram_matching", "Match comparison histogram", ExecutionShape.SOURCE, 0.0004, 0.0008, live_supported=False),

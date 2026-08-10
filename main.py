@@ -492,6 +492,25 @@ def average_frame_brightness(frames: list[np.ndarray]) -> np.ndarray:
     return np.asarray([float(np.mean(frame)) for frame in frames], dtype=float)
 
 
+def detect_fluoroscope_stabilization_frame(gray_frames: list[np.ndarray], fps: float) -> int:
+    """Return the first frame after initial fluoroscope gain/offset settling."""
+    if len(gray_frames) < 3:
+        return 0
+    levels = np.asarray([float(np.mean(frame)) for frame in gray_frames], dtype=float)
+    scan_count = min(len(levels), max(3, round(max(fps, 1.0) * 8.0)))
+    startup_levels = levels[:scan_count]
+    reference_window = max(3, round(max(fps, 1.0)))
+    reference = float(np.median(startup_levels[-reference_window:]))
+    frame_noise = float(np.median(np.abs(np.diff(startup_levels[-reference_window:]))))
+    tolerance = max(0.25, frame_noise * 6.0)
+    if np.max(np.abs(startup_levels - reference)) <= tolerance:
+        return 0
+    for frame_index in range(scan_count - reference_window + 1):
+        if np.max(np.abs(startup_levels[frame_index:] - reference)) <= tolerance:
+            return frame_index
+    return 0
+
+
 def temporal_derivative(time: np.ndarray, values: np.ndarray) -> np.ndarray:
     if len(time) != len(values):
         raise ValueError("Time and value arrays must have the same length")
@@ -2244,6 +2263,7 @@ class VideoPanel(QFrame):
         background_subtraction_enabled: bool = False,
         background_level: int = 0,
         metal_needle_removal_enabled: bool = False,
+        startup_stabilization_enabled: bool = False,
     ) -> SourcePipelineState:
         temporal_alignment_enabled = temporal_alignment_enabled and not self.live_input
         background_subtraction_enabled = background_subtraction_enabled and not self.live_input
@@ -2251,6 +2271,7 @@ class VideoPanel(QFrame):
         next_crop_rect = full_rect
         source_stage_count = (
             int(auto_crop_enabled)
+            + int(startup_stabilization_enabled)
             + int(temporal_alignment_enabled)
             + int(contrast_gain_alignment_enabled)
             + int(histogram_matching_enabled)
@@ -2289,6 +2310,17 @@ class VideoPanel(QFrame):
         next_trim_end = 0
         trim_cache_key: tuple[int, int, int, int] | None = None
         detected_trim_start: int | None = None
+        if startup_stabilization_enabled:
+            gray_frames = self._sample_cropped_gray_frames(
+                next_crop_rect,
+                lambda done, total: report("Detecting fluoroscope startup stabilization", done, total),
+            )
+            next_trim_start = min(
+                max(0, self.info.frame_count - 1),
+                detect_fluoroscope_stabilization_frame(gray_frames, self.info.fps),
+            )
+            report("Detecting fluoroscope startup stabilization", 1.0, 1.0)
+            completed_stages += 1
         if temporal_alignment_enabled:
             crop_key = self._crop_rect_key(next_crop_rect)
             trim_cache_key = crop_key
@@ -2298,7 +2330,10 @@ class VideoPanel(QFrame):
                     next_crop_rect,
                     lambda done, total: report("Aligning contrast timing", done, total),
                 )
-                cached_trim_start = detect_pre_injection_trim_start(gray_frames, self.info.fps)
+                cached_trim_start = (
+                    detect_pre_injection_trim_start(gray_frames[next_trim_start:], self.info.fps)
+                    + next_trim_start
+                )
             detected_trim_start = cached_trim_start
             trim_offset_frames = round((temporal_trim_offset_seconds + comparison_sync_offset_seconds) * self.info.fps)
             next_trim_start = max(0, min(self.info.frame_count - 1, cached_trim_start + trim_offset_frames))
@@ -2378,7 +2413,7 @@ class VideoPanel(QFrame):
                 comparison_sync_offset_seconds,
                 metal_needle_removal_enabled,
                 histogram_matching_enabled,
-            ),
+            ) + ((True,) if startup_stabilization_enabled else ()),
             gain_alignment_baseline=gain_alignment_baseline,
             gain_alignment_span=gain_alignment_span,
             histogram=histogram,
@@ -4773,6 +4808,7 @@ class ContrastWindow(QMainWindow):
         if not self.panels:
             return False
         auto_crop_enabled = self._has_enabled_stage("auto_crop")
+        startup_stabilization_enabled = self._has_enabled_stage("startup_stabilization_trim")
         temporal_alignment_enabled = self._has_enabled_stage("temporal_alignment")
         contrast_gain_alignment_enabled = self._has_enabled_stage("contrast_gain_alignment")
         histogram_matching_enabled = self.active_mode == MODE_COMPARISON and self._has_enabled_stage("histogram_matching")
@@ -4796,6 +4832,7 @@ class ContrastWindow(QMainWindow):
                 background_subtraction_enabled=background_settings[panel_index][0],
                 background_level=background_settings[panel_index][1],
                 metal_needle_removal_enabled=metal_needle_removal_enabled,
+                startup_stabilization_enabled=startup_stabilization_enabled,
             )
             for panel_index, panel in enumerate(self.panels)
         ]
@@ -4822,6 +4859,7 @@ class ContrastWindow(QMainWindow):
     def _source_pipeline_is_current(
         self,
         auto_crop: bool,
+        startup_stabilization_trim: bool,
         temporal_alignment: bool,
         contrast_gain_alignment: bool,
         histogram_matching: bool,
@@ -4848,7 +4886,7 @@ class ContrastWindow(QMainWindow):
                 comparison_sync_offset_seconds if self.active_mode == MODE_COMPARISON and panel_index == 1 else 0.0,
                 metal_needle_removal,
                 histogram_matching,
-            )
+            ) + ((True,) if startup_stabilization_trim else ())
             for panel_index, panel in enumerate(self.panels)
         )
 
@@ -5189,10 +5227,15 @@ class ContrastWindow(QMainWindow):
             "Auto-crop fluoroscope field",
             1,
         )
+        self.startup_stabilization_trim_stage_drawer = StageDrawer(
+            "startup_stabilization_trim",
+            "Trim fluoroscope startup settling",
+            2,
+        )
         self.temporal_alignment_stage_drawer = StageDrawer(
             "temporal_alignment",
             "Temporal alignment (trim onset)",
-            2,
+            3,
         )
         self.contrast_gain_alignment_stage_drawer = StageDrawer(
             "contrast_gain_alignment",
@@ -5249,6 +5292,7 @@ class ContrastWindow(QMainWindow):
             17,
         )
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
+        self.startup_stabilization_trim_stage_check = self.startup_stabilization_trim_stage_drawer.enable_button
         self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
         self.contrast_gain_alignment_stage_check = self.contrast_gain_alignment_stage_drawer.enable_button
         self.histogram_matching_stage_check = self.histogram_matching_stage_drawer.enable_button
@@ -5270,6 +5314,7 @@ class ContrastWindow(QMainWindow):
         self.temporal_change_heatmap_stage_check = self.temporal_change_heatmap_stage_drawer.enable_button
         self.source_pipeline_stage_checks = [
             self.auto_crop_stage_check,
+            self.startup_stabilization_trim_stage_check,
             self.temporal_alignment_stage_check,
             self.contrast_gain_alignment_stage_check,
             self.histogram_matching_stage_check,
@@ -5298,6 +5343,7 @@ class ContrastWindow(QMainWindow):
         ]
         self.source_pipeline_stage_drawers = [
             self.auto_crop_stage_drawer,
+            self.startup_stabilization_trim_stage_drawer,
             self.temporal_alignment_stage_drawer,
             self.contrast_gain_alignment_stage_drawer,
             self.histogram_matching_stage_drawer,
@@ -5337,6 +5383,7 @@ class ContrastWindow(QMainWindow):
             check.setChecked(
                 check in {
                     self.auto_crop_stage_check,
+                    self.startup_stabilization_trim_stage_check,
                     self.temporal_alignment_stage_check,
                     self.brightness_stage_check,
                 }
@@ -6949,6 +6996,7 @@ class ContrastWindow(QMainWindow):
             or self._has_enabled_stage("needle_segmentation")
             or self._has_enabled_stage("temporal_change_heatmap")
             or self._has_enabled_stage("auto_crop")
+            or self._has_enabled_stage("startup_stabilization_trim")
             or self._has_enabled_stage("temporal_alignment")
             or self._has_enabled_stage("contrast_gain_alignment")
                 or self._has_enabled_stage("histogram_matching")
@@ -7328,6 +7376,7 @@ class ContrastWindow(QMainWindow):
             return
         mode = str(self.enhancement_mode_combo.currentData())
         auto_crop = self._has_enabled_stage("auto_crop")
+        startup_stabilization_trim = self._has_enabled_stage("startup_stabilization_trim")
         temporal_alignment = self._has_enabled_stage("temporal_alignment")
         contrast_gain_alignment = self._has_enabled_stage("contrast_gain_alignment")
         histogram_matching = self.active_mode == MODE_COMPARISON and self._has_enabled_stage("histogram_matching")
@@ -7348,11 +7397,13 @@ class ContrastWindow(QMainWindow):
             batch_size=self.inference_batch_spin.value(),
             precision=str(self.inference_precision_combo.currentData()),
             auto_crop=auto_crop,
+            startup_stabilization_trim=startup_stabilization_trim,
             temporal_alignment=temporal_alignment,
             contrast_gain_alignment=contrast_gain_alignment,
             histogram_matching=histogram_matching,
             source_pipeline_current=self._source_pipeline_is_current(
                 auto_crop,
+                startup_stabilization_trim,
                 temporal_alignment,
                 contrast_gain_alignment,
                 histogram_matching,
@@ -7418,7 +7469,6 @@ class ContrastWindow(QMainWindow):
         if not self.panels:
             return request.source_pipeline_current and not request.stages.any_enabled
         source_stage_count = 0
-
         def calculate_source_panel(panel_index: int) -> SourcePipelineState:
             panel = self.panels[panel_index]
 
@@ -7445,10 +7495,16 @@ class ContrastWindow(QMainWindow):
                 request.background_subtraction_settings[panel_index][0],
                 request.background_subtraction_settings[panel_index][1],
                 request.metal_needle_removal,
+                request.startup_stabilization_trim,
             )
 
         if not request.source_pipeline_current:
-            source_stage_count = int(request.auto_crop) + int(request.temporal_alignment) + int(request.metal_needle_removal)
+            source_stage_count = (
+                int(request.auto_crop)
+                + int(request.startup_stabilization_trim)
+                + int(request.temporal_alignment)
+                + int(request.metal_needle_removal)
+            )
             source_states: list[SourcePipelineState | None] = [None] * len(self.panels)
             with frame_parallel_opencv(), ThreadPoolExecutor(
                 max_workers=len(self.panels),

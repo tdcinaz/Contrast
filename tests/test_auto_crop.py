@@ -16,6 +16,7 @@ from main import (
     _detect_pillarbox_crop,
     detect_stationary_metal_mask,
     detect_fluoroscope_crop_from_frames,
+    detect_fluoroscope_stabilization_frame,
     detect_pre_injection_trim_start,
     SourcePipelineState,
     VideoPanel,
@@ -25,6 +26,25 @@ from main import (
 
 
 class AutoCropTests(unittest.TestCase):
+    def test_detects_delayed_fluoroscope_startup_stabilization(self) -> None:
+        fps = 10.0
+        levels = [80, 120] * 18 + [100] * 30
+        frames = [np.full((32, 32), level, dtype=np.uint8) for level in levels]
+
+        trim_start = detect_fluoroscope_stabilization_frame(frames, fps)
+
+        self.assertEqual(trim_start, 36)
+
+    def test_detects_smooth_ramp_and_late_gain_step_before_stabilization(self) -> None:
+        fps = 10.0
+        pre_levels = np.r_[np.linspace(80, 100, 36), np.full(44, 100.0)]
+        post_levels = np.r_[np.linspace(160, 170, 20), np.full(16, 170.0), np.full(44, 100.0)]
+        pre_frames = [np.full((32, 32), round(level), dtype=np.uint8) for level in pre_levels]
+        post_frames = [np.full((32, 32), round(level), dtype=np.uint8) for level in post_levels]
+
+        self.assertEqual(detect_fluoroscope_stabilization_frame(pre_frames, fps), 35)
+        self.assertEqual(detect_fluoroscope_stabilization_frame(post_frames, fps), 36)
+
     def test_stationary_metal_needle_is_detected_and_replaced_from_local_context(self) -> None:
         frames: list[np.ndarray] = []
         for index in range(5):
