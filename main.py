@@ -580,7 +580,7 @@ def smooth_temporal_signal(values: np.ndarray, fps: float) -> np.ndarray:
 
 def _contrast_frame_signal(gray: np.ndarray) -> float:
     height, width = gray.shape
-    center = gray[height // 4 : height * 3 // 4, width // 4 : width * 3 // 4]
+    center = gray[height * 3 // 10 : height * 7 // 10, width * 3 // 10 : width * 7 // 10]
     if center.size == 0:
         center = gray
     return float(0.6 * np.mean(center) + 0.4 * np.percentile(center, 30))

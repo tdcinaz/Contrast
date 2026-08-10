@@ -296,6 +296,21 @@ class AutoCropTests(unittest.TestCase):
         self.assertGreaterEqual(trim_start, 24)
         self.assertLessEqual(trim_start, 26)
 
+    def test_detected_trim_ignores_peripheral_change_in_expanded_crop(self) -> None:
+        frames: list[np.ndarray] = []
+        for index in range(70):
+            frame = np.full((320, 320), 160, dtype=np.uint8)
+            if index >= 30:
+                cv2.circle(frame, (160, 160), 17, 85, thickness=-1)
+            if index >= 50:
+                cv2.rectangle(frame, (80, 120), (95, 200), 80, thickness=-1)
+            frames.append(frame)
+
+        trim_start = detect_pre_injection_trim_start(frames, fps=10.0)
+
+        self.assertGreaterEqual(trim_start, 24)
+        self.assertLessEqual(trim_start, 27)
+
 
 if __name__ == "__main__":
     unittest.main()
