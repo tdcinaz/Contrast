@@ -37,6 +37,7 @@ from main import (
     overlay_roi_regions,
     fit_circle_to_convex_hull,
     masked_average_brightness,
+    needle_average_brightness,
     roi_selection_from_mask,
     segment_pre_injection_needle,
     segment_temporal_change_map,
@@ -66,6 +67,21 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(mask[40, 70], 0)
         self.assertEqual(mask[8, 90], 0)
         np.testing.assert_allclose(masked_average_brightness(frames, mask), np.arange(18.0, 30.0))
+
+    def test_needle_brightness_ignores_transient_mask_edge_pixels(self) -> None:
+        mask = np.zeros((40, 60), dtype=np.uint8)
+        cv2.rectangle(mask, (8, 14), (51, 25), 255, thickness=-1)
+        frames = [np.full(mask.shape, 160, dtype=np.uint8) for _ in range(5)]
+        for frame in frames:
+            frame[mask > 0] = 24
+        boundary = mask - cv2.erode(mask, np.ones((3, 3), dtype=np.uint8), iterations=3)
+        frames[2][boundary > 0] = 80
+
+        raw_trace = masked_average_brightness(frames, mask)
+        core_trace = needle_average_brightness(frames, mask)
+
+        self.assertGreater(raw_trace[2], raw_trace[1] + 20.0)
+        np.testing.assert_allclose(core_trace, np.full(5, 24.0))
 
     def test_temporal_derivative_uses_time_spacing(self) -> None:
         derivative = temporal_derivative(
@@ -146,6 +162,8 @@ class SegmentationTests(unittest.TestCase):
         time, brightness = window.needle_brightness_plot.listDataItems()[0].getData()
         np.testing.assert_allclose(time, np.arange(10, dtype=float) / 4.0)
         np.testing.assert_allclose(brightness, np.arange(20.0, 30.0))
+        y_range = window.needle_brightness_plot.viewRange()[1]
+        self.assertGreaterEqual(y_range[1] - y_range[0], 10.0)
 
     def test_comparison_drawer_plots_baseline_to_apex_curves(self) -> None:
         QApplication.instance() or QApplication([])

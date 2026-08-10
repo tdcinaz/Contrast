@@ -1100,6 +1100,16 @@ def masked_average_brightness(gray_frames: list[np.ndarray], mask: np.ndarray) -
     return np.asarray([float(np.mean(frame[selected])) for frame in gray_frames], dtype=float)
 
 
+def needle_average_brightness(gray_frames: list[np.ndarray], mask: np.ndarray) -> np.ndarray:
+    """Measure the stable metal core without subpixel contamination at mask edges."""
+    selected = (mask > 0).astype(np.uint8)
+    if not np.any(selected):
+        raise ValueError("Needle brightness requires a non-empty segmentation mask.")
+    distance = cv2.distanceTransform(selected, cv2.DIST_L2, 5)
+    core = (distance >= float(np.max(distance)) * 0.55).astype(np.uint8) * 255
+    return masked_average_brightness(gray_frames, core)
+
+
 def compute_temporal_change_summary(
     gray_frames: list[np.ndarray],
     fps: float,
@@ -7850,7 +7860,7 @@ class ContrastWindow(QMainWindow):
             if mask is None:
                 continue
             time = np.arange(len(enhanced_frames), dtype=float) / panel.info.fps
-            results[panel.label] = (time, masked_average_brightness(enhanced_frames, mask))
+            results[panel.label] = (time, needle_average_brightness(enhanced_frames, mask))
 
         self.needle_brightness_results = results
         self.refresh_needle_brightness_plot()
@@ -8010,11 +8020,13 @@ class ContrastWindow(QMainWindow):
 
     def refresh_needle_brightness_plot(self) -> None:
         self.needle_brightness_plot.clear()
+        plotted_brightness: list[np.ndarray] = []
         for panel in self.panels:
             result = self.needle_brightness_results.get(panel.label)
             if result is None:
                 continue
             time, brightness = result
+            plotted_brightness.append(brightness)
             self.needle_brightness_plot.plot(
                 time,
                 brightness,
@@ -8028,6 +8040,14 @@ class ContrastWindow(QMainWindow):
                 if len(time)
             )
             self.needle_brightness_plot.setXRange(0, max_time, padding=0)
+        if plotted_brightness:
+            values = np.concatenate(plotted_brightness)
+            data_min = float(np.min(values))
+            data_max = float(np.max(values))
+            display_span = max(10.0, data_max - data_min)
+            center = (data_min + data_max) / 2.0
+            lower = max(0.0, min(255.0 - display_span, center - display_span / 2.0))
+            self.needle_brightness_plot.setYRange(lower, lower + display_span, padding=0)
 
     def _clear_frame_brightness_plots(self) -> None:
         while self.frame_brightness_layout.count():
