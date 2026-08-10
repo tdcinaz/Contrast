@@ -4116,6 +4116,7 @@ class ContrastWindow(QMainWindow):
         self.results: dict[str, AnalysisResult] = {}
         self.frame_brightness_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self.needle_brightness_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.needle_brightness_baselines: dict[str, float] = {}
         self.temporal_change_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.deep_denoisers: dict[str, FrameDenoiser] = {}
         self._enhancement_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="enhancement-coordinator")
@@ -4551,6 +4552,13 @@ class ContrastWindow(QMainWindow):
             pg.InfiniteLine(pos=self.threshold_spin.value(), angle=0, pen=pg.mkPen("#e2e8f0", width=1, style=Qt.PenStyle.DashLine))
         )
         self.raw_plot.plot(live_time, raw, pen=pg.mkPen(PANEL_COLORS[0].name(), width=2.5), name="Live ROI")
+        self.raw_plot.addItem(
+            pg.InfiniteLine(
+                pos=baseline,
+                angle=0,
+                pen=pg.mkPen(PANEL_COLORS[0].name(), width=1.5, style=Qt.PenStyle.DashLine),
+            )
+        )
         self.derivative_plot.plot(
             live_time,
             temporal_derivative(live_time, normalized),
@@ -7276,6 +7284,7 @@ class ContrastWindow(QMainWindow):
         self.overlay_mask_check.setEnabled(bool(self.panels) and (stages.roi_extraction or needle_enabled))
         if not needle_enabled:
             self.needle_brightness_results.clear()
+            self.needle_brightness_baselines.clear()
             self.needle_brightness_plot.clear()
             for panel in self.panels:
                 panel.set_needle_segmentation_mask(None, self.current_frame_index)
@@ -7885,6 +7894,7 @@ class ContrastWindow(QMainWindow):
         parameters = self.enhancement_parameters()
         backend_id = self._current_backend_id(stages)
         results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        baselines: dict[str, float] = {}
         for panel in self.panels:
             enhanced_frames = panel.analysis_frames(
                 backend_id,
@@ -7900,9 +7910,16 @@ class ContrastWindow(QMainWindow):
             if mask is None:
                 continue
             time = np.arange(len(enhanced_frames), dtype=float) / panel.info.fps
-            results[panel.label] = (time, needle_average_brightness(enhanced_frames, mask))
+            brightness = needle_average_brightness(enhanced_frames, mask)
+            pre_injection_count = min(
+                len(brightness),
+                max(1, detect_pre_injection_trim_start(enhanced_frames, panel.info.fps) + max(1, round(float(panel.info.fps) * 0.5))),
+            )
+            results[panel.label] = (time, brightness)
+            baselines[panel.label] = float(np.mean(brightness[:pre_injection_count]))
 
         self.needle_brightness_results = results
+        self.needle_brightness_baselines = baselines
         self.refresh_needle_brightness_plot()
         self._update_stage_statuses()
         if results:
@@ -7952,6 +7969,7 @@ class ContrastWindow(QMainWindow):
         self.frame_brightness_results.clear()
         self.needle_brightness_plot.clear()
         self.needle_brightness_results.clear()
+        self.needle_brightness_baselines.clear()
         for panel in self.panels:
             panel.needle_segmentation_mask = None
         self.temporal_change_results.clear()
@@ -7980,6 +7998,16 @@ class ContrastWindow(QMainWindow):
             pen = pens.get(label, pg.mkPen("#cbd5e1", width=2.5))
             self.normalized_plot.plot(result.time, result.normalized_signal, pen=pen, name=label)
             self.raw_plot.plot(result.time, result.mean_intensity, pen=pen, name=label)
+            if len(result.mean_intensity):
+                baseline_count = baseline_sample_count(result.fps, len(result.mean_intensity))
+                baseline = float(np.median(result.mean_intensity[:baseline_count]))
+                self.raw_plot.addItem(
+                    pg.InfiniteLine(
+                        pos=baseline,
+                        angle=0,
+                        pen=pg.mkPen(pen.color(), width=1.5, style=Qt.PenStyle.DashLine),
+                    )
+                )
             self.derivative_plot.plot(
                 result.time,
                 temporal_derivative(result.time, result.normalized_signal),
@@ -8073,6 +8101,16 @@ class ContrastWindow(QMainWindow):
                 pen=pg.mkPen(panel.color.name(), width=2.5),
                 name=panel.label,
             )
+            baseline = self.needle_brightness_baselines.get(panel.label)
+            if baseline is not None:
+                self.needle_brightness_plot.addItem(
+                    pg.InfiniteLine(
+                        pos=baseline,
+                        angle=0,
+                        pen=pg.mkPen(panel.color.name(), width=1.5, style=Qt.PenStyle.DashLine),
+                    )
+                )
+                plotted_brightness.append(np.asarray([baseline]))
         if self.needle_brightness_results:
             max_time = max(
                 time[-1]

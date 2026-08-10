@@ -162,8 +162,45 @@ class SegmentationTests(unittest.TestCase):
         time, brightness = window.needle_brightness_plot.listDataItems()[0].getData()
         np.testing.assert_allclose(time, np.arange(10, dtype=float) / 4.0)
         np.testing.assert_allclose(brightness, np.arange(20.0, 30.0))
+        self.assertAlmostEqual(window.needle_brightness_baselines["Video"], 22.5)
+        reference_lines = [
+            item
+            for item in window.needle_brightness_plot.plotItem.items
+            if isinstance(item, main.pg.InfiniteLine)
+        ]
+        self.assertEqual(len(reference_lines), 1)
         y_range = window.needle_brightness_plot.viewRange()[1]
         self.assertGreaterEqual(y_range[1] - y_range[0], 10.0)
+
+    def test_comparison_needle_brightness_plot_shows_one_baseline_per_video(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window.active_mode = MODE_COMPARISON
+        window.panels = [
+            SimpleNamespace(label="Pre-deployment", color=QColor("#38bdf8")),
+            SimpleNamespace(label="Post-deployment", color=QColor("#f97316")),
+        ]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        time = np.asarray([0.0, 0.25, 0.5])
+        window.needle_brightness_results = {
+            "Pre-deployment": (time, np.asarray([20.0, 21.0, 26.0])),
+            "Post-deployment": (time, np.asarray([40.0, 39.0, 32.0])),
+        }
+        window.needle_brightness_baselines = {
+            "Pre-deployment": 20.5,
+            "Post-deployment": 39.5,
+        }
+
+        window.refresh_needle_brightness_plot()
+
+        reference_lines = [
+            item
+            for item in window.needle_brightness_plot.plotItem.items
+            if isinstance(item, main.pg.InfiniteLine)
+        ]
+        self.assertEqual(len(reference_lines), 2)
+        self.assertCountEqual([float(line.value()) for line in reference_lines], [20.5, 39.5])
 
     def test_comparison_drawer_plots_baseline_to_apex_curves(self) -> None:
         QApplication.instance() or QApplication([])
@@ -191,6 +228,13 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(len(curves), 2)
         for curve in curves:
             np.testing.assert_allclose(curve, [0.0, 1.0])
+        roi_baselines = [
+            item
+            for item in window.raw_plot.plotItem.items
+            if isinstance(item, main.pg.InfiniteLine)
+        ]
+        self.assertEqual(len(roi_baselines), 2)
+        self.assertCountEqual([float(line.value()) for line in roi_baselines], [100.0, 100.0])
 
     def test_manual_roi_selection_bypasses_auto_detection_and_has_a_distinct_cache_token(self) -> None:
         automatic = EnhancementParameters()
