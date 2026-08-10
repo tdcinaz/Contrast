@@ -2895,9 +2895,9 @@ class VideoPanel(QFrame):
                 self.enhanced_frames = encoded_frames
             self.roi_region_masks = roi_region_masks
             self._activate_cache_branch(sequence_key)
-            if self._sequence_has_roi_extraction(sequence_key):
+            if activate_result and self._sequence_has_roi_extraction(sequence_key):
                 self._activate_stage_roi_selection(roi_selection)
-            else:
+            elif activate_result:
                 self.stage_roi_selection = None
             return True
 
@@ -3393,6 +3393,26 @@ class VideoPanel(QFrame):
             self.enhanced_frames = self.encoded_frame_cache[frame_sequence_key]
         self.roi_region_masks = self._roi_region_masks_for_sequence(sequence_key)
         self._activate_cache_branch(sequence_key)
+        if activate_result and self._sequence_has_roi_extraction(sequence_key):
+            self._activate_stage_roi_selection(self._roi_selection_for_sequence(sequence_key))
+        elif activate_result:
+            self.stage_roi_selection = None
+        return True
+
+    def activate_prepared_sequence(
+        self,
+        backend_id: str,
+        noise_sigma: int,
+        stages: EnhancementStages,
+        parameters: EnhancementParameters,
+    ) -> bool:
+        sequence_key = self._sequence_key(stages, backend_id, noise_sigma, parameters)
+        encoded_frames = self.encoded_frame_cache.get(self._frame_sequence_key(sequence_key))
+        if encoded_frames is None:
+            return False
+        self.enhanced_frames = encoded_frames
+        self.roi_region_masks = self._roi_region_masks_for_sequence(sequence_key)
+        self._activate_cache_branch(sequence_key)
         if self._sequence_has_roi_extraction(sequence_key):
             self._activate_stage_roi_selection(self._roi_selection_for_sequence(sequence_key))
         else:
@@ -3514,10 +3534,16 @@ class VideoPanel(QFrame):
 
     def _activate_stage_roi_selection(self, roi_selection: ROISelection | None) -> None:
         self.stage_roi_selection = roi_selection
-        if roi_selection is None:
-            self.display.set_roi(None)
-            return
-        self.display.set_roi(roi_selection.rect, roi_selection.mask)
+        block_signals = getattr(self.display, "blockSignals", None)
+        previous = block_signals(True) if block_signals is not None else None
+        try:
+            if roi_selection is None:
+                self.display.set_roi(None)
+                return
+            self.display.set_roi(roi_selection.rect, roi_selection.mask)
+        finally:
+            if block_signals is not None:
+                block_signals(previous)
 
     def has_stage_roi_mask(self) -> bool:
         return self.stage_roi_selection is not None and self.stage_roi_selection.mask is not None
@@ -6849,6 +6875,8 @@ class ContrastWindow(QMainWindow):
         )
 
     def on_enhancement_settings_changed(self) -> None:
+        if self._loading_config:
+            return
         active_mode = str(self.enhancement_mode_combo.currentData())
         stages = self.enhancement_stages()
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
@@ -7237,6 +7265,8 @@ class ContrastWindow(QMainWindow):
         )
 
     def on_pipeline_stages_changed(self) -> None:
+        if self._loading_config:
+            return
         stages = self.enhancement_stages()
         active_mode = str(self.enhancement_mode_combo.currentData())
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
@@ -7693,6 +7723,16 @@ class ContrastWindow(QMainWindow):
             QMessageBox.critical(self, "Enhancement failed", str(error))
             return
         if prepared:
+            stages = self.enhancement_stages()
+            parameters = self.enhancement_parameters()
+            backend_id = self._current_backend_id(stages)
+            for panel_index, panel in enumerate(self.panels):
+                panel.activate_prepared_sequence(
+                    backend_id,
+                    self.denoise_strength_spin.value(),
+                    self._stages_for_roi_parameters(stages, self._roi_parameters_for_panel(panel_index)),
+                    parameters,
+                )
             self._set_playback_limit(self.source_max_frame)
             for panel in self.panels:
                 panel.seek(self.current_frame_index)

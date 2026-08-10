@@ -255,6 +255,22 @@ class SegmentationTests(unittest.TestCase):
         self.assertTrue(mask[expected_radius, expected_radius])
         self.assertFalse(mask[0, 0])
 
+    def test_automatic_roi_publication_does_not_emit_manual_change_signal(self) -> None:
+        QApplication.instance() or QApplication([])
+        display = main.VideoDisplay("Video", QColor("#ffffff"))
+        self.addCleanup(display.close)
+        changed = Mock()
+        display.roiChanged.connect(changed)
+        mask = np.ones((8, 10), dtype=bool)
+        selection = main.ROISelection(QRect(4, 6, 10, 8), mask)
+        panel = SimpleNamespace(display=display, stage_roi_selection=None)
+
+        VideoPanel._activate_stage_roi_selection(panel, selection)
+
+        changed.assert_not_called()
+        self.assertEqual(display.roi(), selection.rect)
+        np.testing.assert_array_equal(display.roi_mask(), mask)
+
     def test_play_restarts_file_playback_at_the_final_frame(self) -> None:
         QApplication.instance() or QApplication([])
         window = ContrastWindow()
@@ -756,6 +772,39 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(window.temporal_trim_offset_spin.value(), -0.25)
         self.assertEqual(window.temporal_end_trim_spin.value(), 1.50)
         self.assertEqual(window.comparison_sync_offset_spin.value(), 0.12)
+
+    def test_config_apply_starts_one_pipeline_after_all_controls_are_loaded(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        config = {
+            "version": 1,
+            "videos": {"mode": "single", "paths": ["video.avi"]},
+            "pipeline": [
+                {"key": "auto_crop", "enabled": True, "controls": {"autoCropSizeOffset": -60}},
+                {"key": "needle_segmentation", "enabled": True, "controls": {}},
+            ],
+            "view": {
+                "show_source": False,
+                "mask_overlay_enabled": True,
+                "playback_speed": 125,
+                "loop": False,
+                "frame_index": 0,
+                "roi_settings": [{"mode": "auto", "manual_circle": None}],
+            },
+            "analysis": {"clearance_threshold": 0.2},
+        }
+
+        with (
+            patch.object(window, "_set_video_panels"),
+            patch.object(window, "rebuild_enhancement_pipeline") as rebuild,
+            patch.object(window, "clear_plots_and_metrics"),
+        ):
+            window._apply_config(config, [Path("video.avi")])
+
+        rebuild.assert_called_once_with()
+        self.assertTrue(window._has_enabled_stage("needle_segmentation"))
+        self.assertTrue(window.overlay_mask_check.isChecked())
 
     def test_source_and_live_pipeline_defaults_are_separate(self) -> None:
         app = QApplication.instance() or QApplication([])
