@@ -8108,48 +8108,58 @@ class ContrastWindow(QMainWindow):
             labels_and_colors = [("Live camera", PANEL_COLORS[0].name())]
         else:
             labels_and_colors = [(panel.label, panel.color.name()) for panel in self.panels]
+        comparison_active = self.active_mode == MODE_COMPARISON and len(labels_and_colors) > 1
+        plot = None
         for label, color in labels_and_colors:
             result = self.frame_brightness_results.get(label)
             if result is None:
                 continue
             time, source_brightness, enhanced_brightness = result
-            plot = pg.PlotWidget(title=f"{label} Average Frame Brightness")
-            plot.setBackground("#111827")
-            plot.showGrid(x=True, y=True, alpha=0.25)
-            plot.getAxis("bottom").setPen("#8aa0b8")
-            plot.getAxis("left").setPen("#8aa0b8")
-            plot.getAxis("bottom").setTextPen("#cbd5e1")
-            plot.getAxis("left").setTextPen("#cbd5e1")
-            plot.setLabel("bottom", "Time", units="s")
-            plot.setLabel("left", "Mean pixel value")
-            plot.addLegend(offset=(12, 12))
+            if plot is None or not comparison_active:
+                plot = pg.PlotWidget(
+                    title=("Comparison Average Frame Brightness" if comparison_active else f"{label} Average Frame Brightness")
+                )
+                plot.setBackground("#111827")
+                plot.showGrid(x=True, y=True, alpha=0.25)
+                plot.getAxis("bottom").setPen("#8aa0b8")
+                plot.getAxis("left").setPen("#8aa0b8")
+                plot.getAxis("bottom").setTextPen("#cbd5e1")
+                plot.getAxis("left").setTextPen("#cbd5e1")
+                plot.setLabel("bottom", "Time", units="s")
+                plot.setLabel("left", "Mean pixel value")
+                plot.addLegend(offset=(12, 12))
             if np.array_equal(source_brightness, enhanced_brightness):
                 plot.plot(
                     time,
                     source_brightness,
                     pen=pg.mkPen(color, width=2.5),
-                    name="Frame brightness",
+                    name=f"{label} frame brightness" if comparison_active else "Frame brightness",
                 )
             else:
                 plot.plot(
                     time,
                     source_brightness,
                     pen=pg.mkPen(color, width=1.5, style=Qt.PenStyle.DashLine),
-                    name="Original",
+                    name=f"{label} original" if comparison_active else "Original",
                 )
                 plot.plot(
                     time,
                     enhanced_brightness,
                     pen=pg.mkPen(color, width=2.5),
-                    name="Enhanced",
+                    name=f"{label} enhanced" if comparison_active else "Enhanced",
                 )
             if len(time):
                 if self.active_mode == MODE_LIVE:
                     plot.setXRange(-60, 0, padding=0)
                 else:
-                    plot.setXRange(0, time[-1], padding=0)
+                    current_maximum = plot.viewRange()[0][1]
+                    plot.setXRange(0, max(current_maximum, time[-1]), padding=0)
+            if not comparison_active:
+                self.frame_brightness_layout.addWidget(plot)
+                self.frame_brightness_plots[label] = plot
+        if comparison_active and plot is not None:
             self.frame_brightness_layout.addWidget(plot)
-            self.frame_brightness_plots[label] = plot
+            self.frame_brightness_plots["Comparison"] = plot
 
     def refresh_needle_brightness_plot(self) -> None:
         self.needle_brightness_plot.clear()

@@ -701,11 +701,12 @@ class SegmentationTests(unittest.TestCase):
         self.assertTrue(window.compare_view_check.isChecked())
         self.assertFalse(window.temporal_change_view_check.isChecked())
 
-    def test_frame_brightness_analysis_uses_one_plot_per_comparison_video(self) -> None:
+    def test_frame_brightness_analysis_combines_comparison_videos_on_one_plot(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = ContrastWindow()
         self.addCleanup(window.close)
         self.addCleanup(lambda: setattr(window, "panels", []))
+        window.active_mode = MODE_COMPARISON
         window.panels = [
             SimpleNamespace(label="Pre-deployment", color=QColor("#38bdf8")),
             SimpleNamespace(label="Post-deployment", color=QColor("#f97316")),
@@ -717,8 +718,14 @@ class SegmentationTests(unittest.TestCase):
 
         window.refresh_frame_brightness_plot()
 
-        self.assertEqual(set(window.frame_brightness_plots), {"Pre-deployment", "Post-deployment"})
-        self.assertEqual(window.frame_brightness_layout.count(), 2)
+        self.assertEqual(set(window.frame_brightness_plots), {"Comparison"})
+        self.assertEqual(window.frame_brightness_layout.count(), 1)
+        plot = window.frame_brightness_plots["Comparison"]
+        self.assertEqual(len(plot.listDataItems()), 4)
+        self.assertEqual(
+            [item[1].text for item in plot.plotItem.legend.items],
+            ["Pre-deployment original", "Pre-deployment enhanced", "Post-deployment original", "Post-deployment enhanced"],
+        )
 
     def test_frame_brightness_analysis_without_enhancement_uses_a_single_curve(self) -> None:
         app = QApplication.instance() or QApplication([])
