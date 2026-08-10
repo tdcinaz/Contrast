@@ -1037,6 +1037,69 @@ def detect_stationary_metal_mask(gray_frames: list[np.ndarray]) -> np.ndarray | 
     return cv2.dilate(mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
 
 
+def segment_pre_injection_needle(gray_frames: list[np.ndarray], fps: float) -> np.ndarray | None:
+    """Segment the single darkest connected region using only pre-injection frames."""
+    if len(gray_frames) < 3:
+        return None
+    shape = gray_frames[0].shape
+    if any(frame.shape != shape for frame in gray_frames):
+        raise ValueError("Needle segmentation requires consistently sized frames.")
+
+    pre_injection_count = min(
+        len(gray_frames),
+        max(3, detect_pre_injection_trim_start(gray_frames, fps) + max(1, round(float(fps) * 0.5))),
+    )
+    temporal_median = np.median(
+        np.stack(gray_frames[:pre_injection_count], axis=0),
+        axis=0,
+    ).astype(np.uint8)
+    otsu_threshold, _ = cv2.threshold(
+        temporal_median,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
+    )
+    darkest_level = float(np.percentile(temporal_median, 0.5))
+    candidates = (temporal_median <= min(float(otsu_threshold), darkest_level)).astype(np.uint8)
+    candidates = cv2.morphologyEx(
+        candidates,
+        cv2.MORPH_CLOSE,
+        np.ones((3, 3), dtype=np.uint8),
+    )
+
+    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(candidates, connectivity=8)
+    minimum_area = max(8, round(temporal_median.size * 0.00002))
+    maximum_area = max(minimum_area, round(temporal_median.size * 0.25))
+    components: list[tuple[float, int, int]] = []
+    for label in range(1, component_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if not minimum_area <= area <= maximum_area:
+            continue
+        points_yx = np.column_stack(np.nonzero(labels == label))
+        oriented_width, oriented_height = cv2.minAreaRect(points_yx[:, ::-1].astype(np.float32))[1]
+        elongation = max(oriented_width, oriented_height) / max(1.0, min(oriented_width, oriented_height))
+        if elongation < 2.0:
+            continue
+        component_pixels = temporal_median[labels == label]
+        components.append((float(np.mean(component_pixels)), -area, label))
+    if not components:
+        return None
+
+    selected_label = min(components)[2]
+    mask = np.zeros(shape, dtype=np.uint8)
+    mask[labels == selected_label] = 255
+    return mask
+
+
+def masked_average_brightness(gray_frames: list[np.ndarray], mask: np.ndarray) -> np.ndarray:
+    selected = mask > 0
+    if not np.any(selected):
+        raise ValueError("Needle brightness requires a non-empty segmentation mask.")
+    if any(frame.shape != mask.shape for frame in gray_frames):
+        raise ValueError("Needle brightness requires frames matching the segmentation mask.")
+    return np.asarray([float(np.mean(frame[selected])) for frame in gray_frames], dtype=float)
+
+
 def compute_temporal_change_summary(
     gray_frames: list[np.ndarray],
     fps: float,
@@ -1425,6 +1488,27 @@ def overlay_roi_regions(
     result[selected] = np.clip(
         result[selected].astype(np.float32) * (1.0 - opacity)
         + overlay_colors[selected].astype(np.float32) * opacity,
+        0,
+        255,
+    ).astype(np.uint8)
+    return result
+
+
+def overlay_needle_mask(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    color: tuple[int, int, int] = (0, 220, 255),
+    opacity: float = 0.55,
+) -> np.ndarray:
+    if frame.shape[:2] != mask.shape:
+        raise ValueError("Needle overlay mask must match the video frame size.")
+    result = frame.copy()
+    selected = mask > 0
+    if not np.any(selected):
+        return result
+    result[selected] = np.clip(
+        result[selected].astype(np.float32) * (1.0 - opacity)
+        + np.asarray(color, dtype=np.float32) * opacity,
         0,
         255,
     ).astype(np.uint8)
@@ -2069,6 +2153,7 @@ class VideoPanel(QFrame):
         self.comparison_display = True
         self.temporal_change_display = False
         self.roi_region_overlay_display = True
+        self.needle_segmentation_mask: np.ndarray | None = None
         self.target_median = 128.0
         self.enhanced_frames: list[np.ndarray] | None = None
         self.report_encoded_frames: list[np.ndarray] | None = None
@@ -3349,6 +3434,8 @@ class VideoPanel(QFrame):
                             mask,
                             (self.color.blue(), self.color.green(), self.color.red()),
                         )
+                if self.roi_region_overlay_display and self.needle_segmentation_mask is not None:
+                    enhanced_frame = overlay_needle_mask(enhanced_frame, self.needle_segmentation_mask)
         left_frame = self.temporal_change_heatmap if self.temporal_change_display and self.temporal_change_heatmap is not None else source_frame
         left_label = "Contrast residence" if self.temporal_change_display and self.temporal_change_heatmap is not None else "Source"
         self.display.set_frames(left_frame, enhanced_frame, left_label)
@@ -3480,12 +3567,17 @@ class VideoPanel(QFrame):
         self.roi_region_overlay_display = enabled
         self.seek(frame_index)
 
+    def set_needle_segmentation_mask(self, mask: np.ndarray | None, frame_index: int) -> None:
+        self.needle_segmentation_mask = None if mask is None else mask.copy()
+        self.seek(frame_index)
+
     def clear_enhancement_cache(self) -> None:
         self.enhanced_frames = None
         self.report_encoded_frames = None
         self.temporal_change_heatmap = None
         self.temporal_change_display = False
         self.roi_region_masks = None
+        self.needle_segmentation_mask = None
         self.source_gray_frames = None
         self.stage_roi_selection = None
         self.stage_frame_cache.clear()
@@ -3987,6 +4079,7 @@ class ContrastWindow(QMainWindow):
         self.current_frame_index = 0
         self.results: dict[str, AnalysisResult] = {}
         self.frame_brightness_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self.needle_brightness_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.temporal_change_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.deep_denoisers: dict[str, FrameDenoiser] = {}
         self._enhancement_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="enhancement-coordinator")
@@ -4127,7 +4220,13 @@ class ContrastWindow(QMainWindow):
         self.live_phase_toggle.setEnabled(enabled and live_input)
         self.live_export_toggle.setEnabled(enabled and live_input)
         self.compare_view_check.setEnabled(enabled)
-        self.overlay_mask_check.setEnabled(enabled and self._has_enabled_stage("roi_extraction"))
+        self.overlay_mask_check.setEnabled(
+            enabled
+            and (
+                self._has_enabled_stage("roi_extraction")
+                or self._has_enabled_stage("needle_segmentation")
+            )
+        )
         self.open_pre_action.setEnabled(enabled and bool(self.pre_panel))
         self.open_post_action.setEnabled(enabled and bool(self.post_panel))
         if live_input:
@@ -4160,6 +4259,7 @@ class ContrastWindow(QMainWindow):
             "roi_extraction",
             "temporal_filter",
             "quantum_mottle_filter",
+            "needle_segmentation",
             "temporal_change_heatmap",
         ):
             for drawer in self._stage_drawers(stage_key):
@@ -4812,10 +4912,10 @@ class ContrastWindow(QMainWindow):
         self.temporal_change_view_check.setToolTip("Show the contrast residence heatmap beside enhanced output")
         self.temporal_change_view_check.toggled.connect(self.on_temporal_change_view_toggled)
 
-        self.overlay_mask_check = QCheckBox("ROI")
+        self.overlay_mask_check = QCheckBox("Masks")
         self.overlay_mask_check.setChecked(True)
         self.overlay_mask_check.setEnabled(False)
-        self.overlay_mask_check.setToolTip("Show automatic aneurysm and vessel regions over enhanced video")
+        self.overlay_mask_check.setToolTip("Show ROI and needle segmentation masks over enhanced video")
         self.overlay_mask_check.toggled.connect(self.on_roi_region_overlay_toggled)
 
         self.video_row = QWidget()
@@ -5094,10 +5194,15 @@ class ContrastWindow(QMainWindow):
             "Frame brightness analysis",
             15,
         )
+        self.needle_segmentation_stage_drawer = StageDrawer(
+            "needle_segmentation",
+            "Needle segmentation and brightness",
+            16,
+        )
         self.temporal_change_heatmap_stage_drawer = StageDrawer(
             "temporal_change_heatmap",
             "Contrast residence heatmap",
-            16,
+            17,
         )
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
         self.temporal_alignment_stage_check = self.temporal_alignment_stage_drawer.enable_button
@@ -5117,6 +5222,7 @@ class ContrastWindow(QMainWindow):
         self.smoothing_stage_check = self.smoothing_stage_drawer.enable_button
         self.analysis_stage_check = self.analysis_stage_drawer.enable_button
         self.frame_brightness_analysis_stage_check = self.frame_brightness_analysis_stage_drawer.enable_button
+        self.needle_segmentation_stage_check = self.needle_segmentation_stage_drawer.enable_button
         self.temporal_change_heatmap_stage_check = self.temporal_change_heatmap_stage_drawer.enable_button
         self.source_pipeline_stage_checks = [
             self.auto_crop_stage_check,
@@ -5143,6 +5249,7 @@ class ContrastWindow(QMainWindow):
             *self.frame_pipeline_stage_checks,
             self.analysis_stage_check,
             self.frame_brightness_analysis_stage_check,
+            self.needle_segmentation_stage_check,
             self.temporal_change_heatmap_stage_check,
         ]
         self.source_pipeline_stage_drawers = [
@@ -5169,6 +5276,7 @@ class ContrastWindow(QMainWindow):
             *self.frame_pipeline_stage_drawers,
             self.analysis_stage_drawer,
             self.frame_brightness_analysis_stage_drawer,
+            self.needle_segmentation_stage_drawer,
             self.temporal_change_heatmap_stage_drawer,
         ]
         self.pipeline_stage_drawers = [
@@ -5607,7 +5715,14 @@ class ContrastWindow(QMainWindow):
         self.frame_brightness_layout.setContentsMargins(0, 0, 0, 0)
         self.frame_brightness_layout.setSpacing(10)
         self.frame_brightness_plots: dict[str, pg.PlotWidget] = {}
-        for plot in [self.normalized_plot, self.raw_plot, self.derivative_plot, self.baseline_to_apex_plot]:
+        self.needle_brightness_plot = pg.PlotWidget(title="Needle Average Pixel Brightness")
+        for plot in [
+            self.normalized_plot,
+            self.raw_plot,
+            self.derivative_plot,
+            self.baseline_to_apex_plot,
+            self.needle_brightness_plot,
+        ]:
             plot.setBackground("#111827")
             plot.showGrid(x=True, y=True, alpha=0.25)
             plot.getAxis("bottom").setPen("#8aa0b8")
@@ -5623,6 +5738,8 @@ class ContrastWindow(QMainWindow):
         self.derivative_plot.setLabel("left", "Signal change", units="1/s")
         self.baseline_to_apex_plot.setLabel("bottom", "Time", units="s")
         self.baseline_to_apex_plot.setLabel("left", "Baseline to apex", units="normalized")
+        self.needle_brightness_plot.setLabel("bottom", "Time", units="s")
+        self.needle_brightness_plot.setLabel("left", "Mean pixel value")
 
         residence_layout.addWidget(self.normalized_plot, 0, 0)
         roi_brightness_layout.addWidget(self.raw_plot, 0, 0)
@@ -5634,6 +5751,11 @@ class ContrastWindow(QMainWindow):
         self.baseline_to_apex_tab_index = self.analysis_tabs.addTab(baseline_to_apex_panel, "Baseline to apex")
         self.analysis_tabs.setTabVisible(self.baseline_to_apex_tab_index, False)
         self.analysis_tabs.addTab(self.frame_brightness_panel, "Frame brightness")
+        needle_brightness_panel = QWidget()
+        needle_brightness_layout = QGridLayout(needle_brightness_panel)
+        needle_brightness_layout.setContentsMargins(0, 0, 0, 0)
+        needle_brightness_layout.addWidget(self.needle_brightness_plot, 0, 0)
+        self.analysis_tabs.addTab(needle_brightness_panel, "Needle brightness")
         plot_layout.addWidget(self.analysis_tabs, 0, 0)
         return plot_group
 
@@ -6470,9 +6592,11 @@ class ContrastWindow(QMainWindow):
         roi_drawers = self._stage_drawers("roi_extraction")
         analysis_drawers = self._stage_drawers("roi_residence_analysis")
         frame_brightness_drawers = self._stage_drawers("frame_brightness_analysis")
+        needle_drawers = self._stage_drawers("needle_segmentation")
         temporal_change_drawers = self._stage_drawers("temporal_change_heatmap")
         analysis_enabled = self._has_enabled_stage("roi_residence_analysis")
         frame_brightness_enabled = self._has_enabled_stage("frame_brightness_analysis")
+        needle_enabled = self._has_enabled_stage("needle_segmentation")
         temporal_change_enabled = self._has_enabled_stage("temporal_change_heatmap")
         if self.active_mode == MODE_LIVE and self._network_stream_display is not None:
             for drawer in roi_drawers:
@@ -6491,6 +6615,8 @@ class ContrastWindow(QMainWindow):
                     else None,
                     False,
                 )
+            for drawer in needle_drawers:
+                drawer.set_status("Unavailable for live input.", needle_enabled)
             for drawer in temporal_change_drawers:
                 drawer.set_status("Unavailable for live input.", temporal_change_enabled)
             return
@@ -6501,6 +6627,8 @@ class ContrastWindow(QMainWindow):
                 drawer.set_status("Load video files to run ROI residence analysis.", analysis_enabled)
             for drawer in frame_brightness_drawers:
                 drawer.set_status("Load video files to run frame brightness analysis.", frame_brightness_enabled)
+            for drawer in needle_drawers:
+                drawer.set_status("Load video files to segment the stationary needle.", needle_enabled)
             for drawer in temporal_change_drawers:
                 drawer.set_status("Load video files to build a contrast residence heatmap.", temporal_change_enabled)
             return
@@ -6545,6 +6673,22 @@ class ContrastWindow(QMainWindow):
         else:
             for drawer in frame_brightness_drawers:
                 drawer.set_status("Ready to compare original and enhanced frame brightness.", False)
+
+        if not needle_enabled:
+            for drawer in needle_drawers:
+                drawer.set_status(None)
+        elif self._enhancement_future is not None:
+            for drawer in needle_drawers:
+                drawer.set_status("Waiting for enhanced video frames.", False)
+        else:
+            missing_masks = [panel.label for panel in self.panels if panel.needle_segmentation_mask is None]
+            for drawer in needle_drawers:
+                drawer.set_status(
+                    f"No single darkest needle region found for {', '.join(missing_masks)}."
+                    if missing_masks
+                    else "Needle masks and full-duration brightness traces are ready.",
+                    bool(missing_masks),
+                )
 
         if not temporal_change_enabled:
             for drawer in temporal_change_drawers:
@@ -6700,7 +6844,10 @@ class ContrastWindow(QMainWindow):
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
         uses_accelerator = uses_ffdnet or (stages.denoise and active_mode == "tensor-nlm-ngc")
         uses_spatial_denoiser = stages.denoise
-        self.overlay_mask_check.setEnabled(bool(self.panels) and stages.roi_extraction)
+        self.overlay_mask_check.setEnabled(
+            bool(self.panels)
+            and (stages.roi_extraction or self._has_enabled_stage("needle_segmentation"))
+        )
         self.denoise_strength_label.setEnabled(uses_spatial_denoiser)
         self.denoise_strength_spin.setEnabled(uses_spatial_denoiser)
         self.inference_batch_spin.setEnabled(uses_accelerator)
@@ -6753,6 +6900,7 @@ class ContrastWindow(QMainWindow):
             self.enhancement_stages().any_enabled
             or self._has_enabled_stage("roi_residence_analysis")
             or self._has_enabled_stage("frame_brightness_analysis")
+            or self._has_enabled_stage("needle_segmentation")
             or self._has_enabled_stage("temporal_change_heatmap")
             or self._has_enabled_stage("auto_crop")
             or self._has_enabled_stage("temporal_alignment")
@@ -6788,7 +6936,13 @@ class ContrastWindow(QMainWindow):
         self.frame_pipeline_stage_drawers = [
             drawer
             for drawer in self.live_pipeline_stage_drawers
-            if drawer.stage_key not in {"roi_residence_analysis", "frame_brightness_analysis", "temporal_change_heatmap"}
+            if drawer.stage_key
+            not in {
+                "roi_residence_analysis",
+                "frame_brightness_analysis",
+                "needle_segmentation",
+                "temporal_change_heatmap",
+            }
         ]
         self.source_pipeline_stage_checks = [item.enable_button for item in self.source_pipeline_stage_drawers]
         self.frame_pipeline_stage_checks = [item.enable_button for item in self.frame_pipeline_stage_drawers]
@@ -7078,7 +7232,13 @@ class ContrastWindow(QMainWindow):
         uses_ffdnet = stages.denoise and active_mode.startswith("ffdnet")
         uses_accelerator = uses_ffdnet or (stages.denoise and active_mode == "tensor-nlm-ngc")
         uses_spatial_denoiser = stages.denoise
-        self.overlay_mask_check.setEnabled(bool(self.panels) and stages.roi_extraction)
+        needle_enabled = self._has_enabled_stage("needle_segmentation")
+        self.overlay_mask_check.setEnabled(bool(self.panels) and (stages.roi_extraction or needle_enabled))
+        if not needle_enabled:
+            self.needle_brightness_results.clear()
+            self.needle_brightness_plot.clear()
+            for panel in self.panels:
+                panel.set_needle_segmentation_mask(None, self.current_frame_index)
         self.denoise_strength_label.setEnabled(uses_spatial_denoiser)
         self.denoise_strength_spin.setEnabled(uses_spatial_denoiser)
         self.inference_batch_spin.setEnabled(uses_accelerator)
@@ -7432,6 +7592,12 @@ class ContrastWindow(QMainWindow):
                     if source_changed:
                         self.results.clear()
                         self.clear_plots_and_metrics()
+                        active_request = self._enhancement_active_request
+                        if active_request is not None and active_request.generation == generation:
+                            for panel in self.panels:
+                                panel.enhanced_frames = []
+                                panel.roi_region_masks = [] if active_request.stages.roi_extraction else None
+                                panel.enhance_display = True
             finally:
                 states_applied.set()
 
@@ -7523,10 +7689,13 @@ class ContrastWindow(QMainWindow):
             self._update_stage_statuses()
             roi_analysis_updated = self._has_enabled_stage("roi_residence_analysis") and self.run_analysis()
             frame_brightness_updated = self._has_enabled_stage("frame_brightness_analysis") and self.run_frame_brightness_analysis()
+            needle_updated = self._has_enabled_stage("needle_segmentation") and self.run_needle_segmentation()
             if self._has_enabled_stage("temporal_change_heatmap"):
                 self.run_temporal_change_heatmap()
                 return
             if frame_brightness_updated:
+                return
+            if needle_updated:
                 return
             if roi_analysis_updated:
                 return
@@ -7658,6 +7827,40 @@ class ContrastWindow(QMainWindow):
         self.statusBar().showMessage("Frame brightness analysis updated from the current enhanced pipeline output.")
         return True
 
+    def run_needle_segmentation(self) -> bool:
+        if not self.panels or self._enhancement_future is not None:
+            return False
+
+        stages = self.enhancement_stages()
+        parameters = self.enhancement_parameters()
+        backend_id = self._current_backend_id(stages)
+        results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for panel in self.panels:
+            enhanced_frames = panel.analysis_frames(
+                backend_id,
+                self.denoise_strength_spin.value(),
+                stages,
+                parameters,
+            )
+            if not enhanced_frames:
+                panel.set_needle_segmentation_mask(None, self.current_frame_index)
+                continue
+            mask = segment_pre_injection_needle(enhanced_frames, panel.info.fps)
+            panel.set_needle_segmentation_mask(mask, self.current_frame_index)
+            if mask is None:
+                continue
+            time = np.arange(len(enhanced_frames), dtype=float) / panel.info.fps
+            results[panel.label] = (time, masked_average_brightness(enhanced_frames, mask))
+
+        self.needle_brightness_results = results
+        self.refresh_needle_brightness_plot()
+        self._update_stage_statuses()
+        if results:
+            self.statusBar().showMessage("Needle segmentation and brightness analysis updated.")
+            return True
+        self.statusBar().showMessage("Needle segmentation did not find a single darkest connected region.")
+        return False
+
     def run_temporal_change_heatmap(self) -> bool:
         if not self.panels or self._enhancement_future is not None:
             return False
@@ -7697,6 +7900,10 @@ class ContrastWindow(QMainWindow):
         self.baseline_to_apex_plot.clear()
         self._clear_frame_brightness_plots()
         self.frame_brightness_results.clear()
+        self.needle_brightness_plot.clear()
+        self.needle_brightness_results.clear()
+        for panel in self.panels:
+            panel.needle_segmentation_mask = None
         self.temporal_change_results.clear()
         self._clear_temporal_change_views()
         self.pre_card.set_metric("--")
@@ -7800,6 +8007,27 @@ class ContrastWindow(QMainWindow):
                     plot.setXRange(0, time[-1], padding=0)
             self.frame_brightness_layout.addWidget(plot)
             self.frame_brightness_plots[label] = plot
+
+    def refresh_needle_brightness_plot(self) -> None:
+        self.needle_brightness_plot.clear()
+        for panel in self.panels:
+            result = self.needle_brightness_results.get(panel.label)
+            if result is None:
+                continue
+            time, brightness = result
+            self.needle_brightness_plot.plot(
+                time,
+                brightness,
+                pen=pg.mkPen(panel.color.name(), width=2.5),
+                name=panel.label,
+            )
+        if self.needle_brightness_results:
+            max_time = max(
+                time[-1]
+                for time, _brightness in self.needle_brightness_results.values()
+                if len(time)
+            )
+            self.needle_brightness_plot.setXRange(0, max_time, padding=0)
 
     def _clear_frame_brightness_plots(self) -> None:
         while self.frame_brightness_layout.count():

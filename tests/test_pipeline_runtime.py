@@ -62,6 +62,13 @@ class PipelineRuntimeTests(unittest.TestCase):
         self.assertFalse(definition.modifies_frame_data)
         self.assertFalse(definition.supports_live(EnhancementParameters()))
 
+    def test_needle_segmentation_is_a_file_only_analysis_stage(self) -> None:
+        definition = BUILTIN_STAGES.require("needle_segmentation")
+
+        self.assertEqual(definition.execution_shape, ExecutionShape.ANALYSIS)
+        self.assertFalse(definition.modifies_frame_data)
+        self.assertFalse(definition.supports_live(EnhancementParameters()))
+
     def test_dsa_mask_subtraction_shows_dark_contrast_on_light_background(self) -> None:
         background = np.array([[40, 75, 100, 200]], dtype=np.uint8)
         frame = np.array([[40, 75, 70, 230]], dtype=np.uint8)

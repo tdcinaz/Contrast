@@ -36,7 +36,9 @@ from main import (
     normalize_analysis_results,
     overlay_roi_regions,
     fit_circle_to_convex_hull,
+    masked_average_brightness,
     roi_selection_from_mask,
+    segment_pre_injection_needle,
     segment_temporal_change_map,
     segment_temporal_change_contrast,
     temporal_derivative,
@@ -45,6 +47,26 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_needle_mask_uses_only_pre_injection_frames_and_tracks_full_video_brightness(self) -> None:
+        frames: list[np.ndarray] = []
+        for frame_index in range(12):
+            frame = np.full((80, 100), 180, dtype=np.uint8)
+            cv2.rectangle(frame, (12, 18), (15, 62), 18 + frame_index, thickness=-1)
+            cv2.rectangle(frame, (88, 6), (92, 10), 2, thickness=-1)
+            if frame_index >= 6:
+                cv2.circle(frame, (70, 40), 15, 4, thickness=-1)
+            frames.append(frame)
+
+        mask = segment_pre_injection_needle(frames, fps=4.0)
+
+        self.assertIsNotNone(mask)
+        assert mask is not None
+        self.assertEqual(cv2.connectedComponents(mask)[0], 2)
+        self.assertEqual(mask[40, 13], 255)
+        self.assertEqual(mask[40, 70], 0)
+        self.assertEqual(mask[8, 90], 0)
+        np.testing.assert_allclose(masked_average_brightness(frames, mask), np.arange(18.0, 30.0))
+
     def test_temporal_derivative_uses_time_spacing(self) -> None:
         derivative = temporal_derivative(
             np.asarray([0.0, 0.5, 2.0]),
@@ -89,6 +111,41 @@ class SegmentationTests(unittest.TestCase):
         curve = window.derivative_plot.listDataItems()[0]
         _, derivative = curve.getData()
         np.testing.assert_allclose(derivative, temporal_derivative(window.results[label].time, window.results[label].normalized_signal))
+
+    def test_needle_stage_publishes_mask_and_full_duration_plot(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        frames: list[np.ndarray] = []
+        for frame_index in range(10):
+            frame = np.full((60, 80), 170, dtype=np.uint8)
+            cv2.rectangle(frame, (8, 12), (11, 48), 20 + frame_index, thickness=-1)
+            if frame_index >= 6:
+                cv2.circle(frame, (58, 30), 12, 5, thickness=-1)
+            frames.append(frame)
+        publish_mask = Mock()
+        panel = SimpleNamespace(
+            label="Video",
+            color=QColor("#38bdf8"),
+            info=SimpleNamespace(fps=4.0),
+            analysis_frames=Mock(return_value=frames),
+            set_needle_segmentation_mask=publish_mask,
+        )
+        window.panels = [panel]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+
+        with patch.object(window, "_update_stage_statuses"):
+            self.assertTrue(window.run_needle_segmentation())
+
+        self.assertEqual(window.analysis_tabs.tabText(window.analysis_tabs.count() - 1), "Needle brightness")
+        mask = publish_mask.call_args.args[0]
+        self.assertIsNotNone(mask)
+        assert mask is not None
+        self.assertEqual(mask[30, 9], 255)
+        self.assertEqual(mask[30, 58], 0)
+        time, brightness = window.needle_brightness_plot.listDataItems()[0].getData()
+        np.testing.assert_allclose(time, np.arange(10, dtype=float) / 4.0)
+        np.testing.assert_allclose(brightness, np.arange(20.0, 30.0))
 
     def test_comparison_drawer_plots_baseline_to_apex_curves(self) -> None:
         QApplication.instance() or QApplication([])
@@ -1256,6 +1313,64 @@ class SegmentationTests(unittest.TestCase):
         self.assertIs(panel.roi_region_masks[0], encoded_mask)
         self.assertEqual(seeks, [0])
         self.assertEqual(playback_limits, [0])
+
+    def test_poll_restores_stream_targets_after_source_pipeline_clears_cache(self) -> None:
+        encoded_frame = np.array([4, 5, 6], dtype=np.uint8)
+        encoded_mask = np.array([1, 2, 3], dtype=np.uint8)
+        panel = SimpleNamespace(
+            enhanced_frames=[],
+            roi_region_masks=[],
+            enhance_display=True,
+            seek=Mock(),
+        )
+        source_events: SimpleQueue[tuple[int, list[object], Event]] = SimpleQueue()
+        source_applied = Event()
+        source_events.put((7, [object()], source_applied))
+        frame_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
+        frame_events.put((7, 0, 0, encoded_frame))
+        mask_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
+        mask_events.put((7, 0, 0, encoded_mask))
+        pending_future: Future[bool] = Future()
+
+        def clear_panel_cache(_states):  # noqa: ANN001
+            panel.enhanced_frames = None
+            panel.roi_region_masks = None
+            return True
+
+        window = SimpleNamespace(
+            _source_pipeline_events=source_events,
+            _enhancement_frame_events=frame_events,
+            _roi_region_mask_events=mask_events,
+            _enhancement_generation=7,
+            _enhancement_active_request=SimpleNamespace(
+                generation=7,
+                stages=SimpleNamespace(roi_extraction=True),
+            ),
+            _enhancement_future=pending_future,
+            _enhancement_progress_lock=main.Lock(),
+            _enhancement_progress_values=[0.0],
+            _enhancement_progress_totals=[1.0],
+            _enhancement_stage_messages=["Encoding"],
+            _enhancement_message="Preparing",
+            enhancement_progress=SimpleNamespace(
+                message_label=SimpleNamespace(setText=Mock()),
+                set_progress=Mock(),
+                set_panel_progress=Mock(),
+            ),
+            _apply_source_pipeline_states=clear_panel_cache,
+            clear_plots_and_metrics=Mock(),
+            panels=[panel],
+            results={},
+            current_frame_index=0,
+            _set_playback_limit=Mock(),
+        )
+
+        ContrastWindow._poll_enhancement(window)
+
+        self.assertTrue(source_applied.is_set())
+        self.assertIs(panel.enhanced_frames[0], encoded_frame)
+        self.assertIs(panel.roi_region_masks[0], encoded_mask)
+        panel.seek.assert_called_once_with(0)
 
 
 if __name__ == "__main__":

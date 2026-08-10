@@ -249,6 +249,15 @@ BUILTIN_STAGES = StageRegistry(
             modifies_frame_data=False,
         ),
         StageDefinition(
+            "needle_segmentation",
+            "Needle segmentation and brightness",
+            ExecutionShape.ANALYSIS,
+            0.0,
+            0.0,
+            modifies_frame_data=False,
+            live_supported=False,
+        ),
+        StageDefinition(
             "temporal_change_heatmap",
             "Contrast residence heatmap",
             ExecutionShape.ANALYSIS,
