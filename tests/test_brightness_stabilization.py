@@ -66,15 +66,15 @@ class BrightnessStabilizationTests(unittest.TestCase):
         relative_trace_error = (measured_trace - measured_trace[0]) + contrast_drop
         self.assertLess(float(np.max(np.abs(relative_trace_error))), 0.75)
 
-    def test_roi_and_needle_anchors_recover_gain_and_offset(self) -> None:
-        gain, offset = intensity_alignment_parameters(150.0, 50.0, 130.0, 30.0)
-        frame = np.asarray([[50, 100, 150]], dtype=np.uint8)
+    def test_narrow_roi_and_needle_range_is_expanded_then_offset(self) -> None:
+        gain, offset = intensity_alignment_parameters(100.0, 50.0, 170.0, 70.0)
+        frame = np.asarray([[50, 75, 100]], dtype=np.uint8)
 
         aligned = align_frame_intensity(frame, gain, offset)
 
-        self.assertAlmostEqual(gain, 1.0)
-        self.assertAlmostEqual(offset, -20.0)
-        np.testing.assert_array_equal(aligned, np.asarray([[30, 80, 130]], dtype=np.uint8))
+        self.assertAlmostEqual(gain, 2.0)
+        self.assertAlmostEqual(offset, -30.0)
+        np.testing.assert_array_equal(aligned, np.asarray([[70, 120, 170]], dtype=np.uint8))
 
     def test_roi_and_needle_anchors_must_be_distinct(self) -> None:
         with self.assertRaisesRegex(ValueError, "distinct"):

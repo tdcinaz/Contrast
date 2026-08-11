@@ -819,17 +819,28 @@ class SegmentationTests(unittest.TestCase):
         panel.prepare_enhanced_frames.assert_called_once()
         app.quit()
 
-    def test_roi_needle_alignment_maps_second_video_to_first_video_anchors(self) -> None:
+    def test_roi_needle_alignment_expands_whichever_video_has_the_narrower_range(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = ContrastWindow()
         self.addCleanup(window.close)
         window.active_mode = MODE_COMPARISON
-        frame = np.full((20, 20), 100, dtype=np.uint8)
         roi = main.ROISelection(QRect(5, 5, 8, 8), np.ones((8, 8), dtype=bool))
+        needle_mask = np.zeros((20, 20), dtype=np.uint8)
+        needle_mask[2:18, 1:4] = 255
+        pre_frame = np.full((20, 20), 140, dtype=np.uint8)
+        pre_frame[5:13, 5:13] = 100
+        pre_frame[needle_mask > 0] = 50
+        post_frame = np.full((20, 20), 180, dtype=np.uint8)
+        post_frame[5:13, 5:13] = 170
+        post_frame[needle_mask > 0] = 70
         panels = []
-        for label in ("Pre-deployment", "Post-deployment"):
+        for label, color, frame in (
+            ("Pre-deployment", QColor("#38bdf8"), pre_frame),
+            ("Post-deployment", QColor("#f97316"), post_frame),
+        ):
             panel = Mock()
             panel.label = label
+            panel.color = color
             panel.info = SimpleNamespace(fps=10.0)
             panel.camera_view_mask = None
             panel.source_gray_frames = [frame]
@@ -865,16 +876,50 @@ class SegmentationTests(unittest.TestCase):
         with patch.object(
             main,
             "measure_roi_needle_baselines",
-            side_effect=((130.0, 30.0, np.ones_like(frame)), (150.0, 50.0, np.ones_like(frame))),
+            side_effect=((100.0, 50.0, needle_mask), (170.0, 70.0, needle_mask)),
+        ):
+            window._prepare_roi_needle_level_alignment(request, [None, None], "none", Event())
+
+        self.assertAlmostEqual(panels[0].roi_needle_alignment_gain, 2.0)
+        self.assertAlmostEqual(panels[0].roi_needle_alignment_offset, -30.0)
+        self.assertEqual(panels[1].roi_needle_alignment_gain, 1.0)
+        self.assertEqual(panels[1].roi_needle_alignment_offset, 0.0)
+        pre_result = window.roi_needle_alignment_results["Pre-deployment"]
+        self.assertAlmostEqual(pre_result.roi_baseline_before, 100.0)
+        self.assertAlmostEqual(pre_result.needle_baseline_before, 50.0)
+        self.assertAlmostEqual(pre_result.roi_baseline_after, 170.0)
+        self.assertAlmostEqual(pre_result.needle_baseline_after, 70.0)
+        window.refresh_roi_needle_alignment_plot()
+        self.assertTrue(window.analysis_tabs.isTabVisible(window.roi_needle_alignment_tab_index))
+        self.assertEqual(
+            [item.name() for item in window.roi_needle_alignment_plot.listDataItems()],
+            [
+                "Pre-deployment ROI before",
+                "Pre-deployment ROI after",
+                "Post-deployment ROI before",
+                "Post-deployment ROI after",
+            ],
+        )
+        reference_lines = [
+            item
+            for item in window.roi_needle_alignment_plot.plotItem.items
+            if isinstance(item, main.pg.InfiniteLine)
+        ]
+        self.assertEqual(len(reference_lines), 8)
+        prefix_stages = panels[0].prepare_enhanced_frames.call_args.args[3]
+        self.assertEqual(prefix_stages.enabled_stage_order, ("roi_extraction",))
+
+        with patch.object(
+            main,
+            "measure_roi_needle_baselines",
+            side_effect=((170.0, 70.0, needle_mask), (100.0, 50.0, needle_mask)),
         ):
             window._prepare_roi_needle_level_alignment(request, [None, None], "none", Event())
 
         self.assertEqual(panels[0].roi_needle_alignment_gain, 1.0)
         self.assertEqual(panels[0].roi_needle_alignment_offset, 0.0)
-        self.assertAlmostEqual(panels[1].roi_needle_alignment_gain, 1.0)
-        self.assertAlmostEqual(panels[1].roi_needle_alignment_offset, -20.0)
-        prefix_stages = panels[0].prepare_enhanced_frames.call_args.args[3]
-        self.assertEqual(prefix_stages.enabled_stage_order, ("roi_extraction",))
+        self.assertAlmostEqual(panels[1].roi_needle_alignment_gain, 2.0)
+        self.assertAlmostEqual(panels[1].roi_needle_alignment_offset, -30.0)
         app.quit()
 
     def test_current_source_pipeline_skips_source_preparation(self) -> None:

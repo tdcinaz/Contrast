@@ -512,6 +512,17 @@ class AnalysisResult:
     auc: float
 
 
+@dataclass(frozen=True, slots=True)
+class ROIAlignmentPlotResult:
+    time: np.ndarray
+    roi_brightness_before: np.ndarray
+    roi_brightness_after: np.ndarray
+    roi_baseline_before: float
+    needle_baseline_before: float
+    roi_baseline_after: float
+    needle_baseline_after: float
+
+
 def average_frame_brightness(
     frames: list[np.ndarray],
     camera_view_mask: np.ndarray | None = None,
@@ -1364,14 +1375,37 @@ def masked_average_brightness(gray_frames: list[np.ndarray], mask: np.ndarray) -
     return np.asarray([float(np.mean(frame[selected])) for frame in gray_frames], dtype=float)
 
 
-def needle_average_brightness(gray_frames: list[np.ndarray], mask: np.ndarray) -> np.ndarray:
-    """Measure the stable metal core without subpixel contamination at mask edges."""
+def masked_affine_average_brightness(
+    gray_frames: list[np.ndarray],
+    mask: np.ndarray,
+    gain: float,
+    offset: float,
+) -> np.ndarray:
+    selected = mask > 0
+    if not np.any(selected):
+        raise ValueError("Aligned brightness requires a non-empty mask.")
+    if any(frame.shape != mask.shape for frame in gray_frames):
+        raise ValueError("Aligned brightness requires frames matching the mask.")
+    return np.asarray(
+        [
+            float(np.mean(np.clip(frame[selected].astype(np.float32) * gain + offset, 0.0, 255.0)))
+            for frame in gray_frames
+        ],
+        dtype=float,
+    )
+
+
+def needle_core_mask(mask: np.ndarray) -> np.ndarray:
     selected = (mask > 0).astype(np.uint8)
     if not np.any(selected):
         raise ValueError("Needle brightness requires a non-empty segmentation mask.")
     distance = cv2.distanceTransform(selected, cv2.DIST_L2, 5)
-    core = (distance >= float(np.max(distance)) * 0.55).astype(np.uint8) * 255
-    return masked_average_brightness(gray_frames, core)
+    return (distance >= float(np.max(distance)) * 0.55).astype(np.uint8) * 255
+
+
+def needle_average_brightness(gray_frames: list[np.ndarray], mask: np.ndarray) -> np.ndarray:
+    """Measure the stable metal core without subpixel contamination at mask edges."""
+    return masked_average_brightness(gray_frames, needle_core_mask(mask))
 
 
 def intensity_alignment_parameters(
@@ -4627,6 +4661,7 @@ class ContrastWindow(QMainWindow):
         self.frame_brightness_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self.needle_brightness_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.needle_brightness_baselines: dict[str, float] = {}
+        self.roi_needle_alignment_results: dict[str, ROIAlignmentPlotResult] = {}
         self.temporal_change_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.deep_denoisers: dict[str, FrameDenoiser] = {}
         self._enhancement_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="enhancement-coordinator")
@@ -6317,6 +6352,7 @@ class ContrastWindow(QMainWindow):
         derivative_layout.setSpacing(10)
         self.normalized_plot = pg.PlotWidget(title="Normalized Contrast Residence")
         self.raw_plot = pg.PlotWidget(title="Denoised ROI Brightness")
+        self.roi_needle_alignment_plot = pg.PlotWidget(title="ROI Brightness Before and After Baseline Alignment")
         self.derivative_plot = pg.PlotWidget(title="Normalized Contrast Derivative")
         baseline_to_apex_panel = QWidget()
         baseline_to_apex_layout = QGridLayout(baseline_to_apex_panel)
@@ -6332,6 +6368,7 @@ class ContrastWindow(QMainWindow):
         for plot in [
             self.normalized_plot,
             self.raw_plot,
+            self.roi_needle_alignment_plot,
             self.derivative_plot,
             self.baseline_to_apex_plot,
             self.needle_brightness_plot,
@@ -6347,6 +6384,8 @@ class ContrastWindow(QMainWindow):
         self.normalized_plot.setLabel("left", "Normalized signal")
         self.raw_plot.setLabel("bottom", "Time", units="s")
         self.raw_plot.setLabel("left", "Mean pixel value")
+        self.roi_needle_alignment_plot.setLabel("bottom", "Time", units="s")
+        self.roi_needle_alignment_plot.setLabel("left", "Mean pixel value")
         self.derivative_plot.setLabel("bottom", "Time", units="s")
         self.derivative_plot.setLabel("left", "Signal change", units="1/s")
         self.baseline_to_apex_plot.setLabel("bottom", "Time", units="s")
@@ -6364,6 +6403,12 @@ class ContrastWindow(QMainWindow):
         self.baseline_to_apex_tab_index = self.analysis_tabs.addTab(baseline_to_apex_panel, "Baseline to apex")
         self.analysis_tabs.setTabVisible(self.baseline_to_apex_tab_index, False)
         self.analysis_tabs.addTab(self.frame_brightness_panel, "Frame brightness")
+        alignment_panel = QWidget()
+        alignment_layout = QGridLayout(alignment_panel)
+        alignment_layout.setContentsMargins(0, 0, 0, 0)
+        alignment_layout.addWidget(self.roi_needle_alignment_plot, 0, 0)
+        self.roi_needle_alignment_tab_index = self.analysis_tabs.addTab(alignment_panel, "ROI alignment")
+        self.analysis_tabs.setTabVisible(self.roi_needle_alignment_tab_index, False)
         needle_brightness_panel = QWidget()
         needle_brightness_layout = QGridLayout(needle_brightness_panel)
         needle_brightness_layout.setContentsMargins(0, 0, 0, 0)
@@ -7299,7 +7344,7 @@ class ContrastWindow(QMainWindow):
                 elif self._enhancement_future is not None:
                     drawer.set_status("Measuring pre-injection ROI and needle baseline levels...", False)
                 else:
-                    drawer.set_status("Post-deployment levels are aligned to pre-deployment anchors.", False)
+                    drawer.set_status("The narrower baseline range is aligned to the wider-range video.", False)
 
         if not analysis_enabled:
             for drawer in analysis_drawers:
@@ -7784,6 +7829,7 @@ class ContrastWindow(QMainWindow):
         backend_id: str,
         cancel_event: Event,
     ) -> None:
+        self.roi_needle_alignment_results = {}
         for panel in self.panels:
             panel.roi_needle_alignment_gain = 1.0
             panel.roi_needle_alignment_offset = 0.0
@@ -7844,6 +7890,9 @@ class ContrastWindow(QMainWindow):
             raise RuntimeError("Could not prepare the ROI / needle alignment prefix.")
 
         anchors: list[tuple[float, float]] = []
+        roi_curves: list[np.ndarray] = []
+        needle_masks: list[np.ndarray] = []
+        alignment_frames: list[list[np.ndarray]] = []
         for panel_index, panel in enumerate(self.panels):
             roi_parameters = (
                 request.roi_parameters_by_panel[panel_index]
@@ -7858,24 +7907,84 @@ class ContrastWindow(QMainWindow):
             if not frames or roi is None:
                 raise ValueError(f"ROI / needle level alignment could not obtain an ROI for {panel.label}.")
             roi_mask = roi_selection_mask(roi, frames[0].shape)
-            roi_level, needle_level, _ = measure_roi_needle_baselines(
+            roi_level, needle_level, needle_mask = measure_roi_needle_baselines(
                 frames,
                 panel.info.fps,
                 roi_mask,
                 getattr(panel, "camera_view_mask", None),
             )
             anchors.append((roi_level, needle_level))
+            roi_curves.append(masked_average_brightness(frames, roi_mask))
+            needle_masks.append(needle_mask)
+            alignment_frames.append(frames)
 
-        target_roi_level, target_needle_level = anchors[0]
-        for panel, (roi_level, needle_level) in zip(self.panels[1:], anchors[1:], strict=True):
-            gain, offset = intensity_alignment_parameters(
-                roi_level,
-                needle_level,
-                target_roi_level,
-                target_needle_level,
+        baseline_ranges = [abs(roi_level - needle_level) for roi_level, needle_level in anchors]
+        reference_index = int(np.argmax(baseline_ranges))
+        adjusted_index = 1 - reference_index
+        target_roi_level, target_needle_level = anchors[reference_index]
+        source_roi_level, source_needle_level = anchors[adjusted_index]
+        gain, offset = intensity_alignment_parameters(
+            source_roi_level,
+            source_needle_level,
+            target_roi_level,
+            target_needle_level,
+        )
+        if gain < 1.0:
+            raise RuntimeError("ROI / needle level alignment selected the wrong baseline range reference.")
+        self.panels[adjusted_index].roi_needle_alignment_gain = gain
+        self.panels[adjusted_index].roi_needle_alignment_offset = offset
+
+        results: dict[str, ROIAlignmentPlotResult] = {}
+        for panel_index, panel in enumerate(self.panels):
+            panel_gain = float(panel.roi_needle_alignment_gain)
+            panel_offset = float(panel.roi_needle_alignment_offset)
+            frames = alignment_frames[panel_index]
+            roi_before = roi_curves[panel_index]
+            roi_parameters = (
+                request.roi_parameters_by_panel[panel_index]
+                if panel_index < len(request.roi_parameters_by_panel)
+                else request.parameters
             )
-            panel.roi_needle_alignment_gain = gain
-            panel.roi_needle_alignment_offset = offset
+            panel_stages = self._stages_for_roi_parameters(prefix_stages, roi_parameters)
+            sequence_key = panel._sequence_key(panel_stages, backend_id, request.noise_sigma, request.parameters)
+            roi = panel._roi_selection_for_sequence(sequence_key)
+            assert roi is not None
+            roi_mask = roi_selection_mask(roi, frames[0].shape)
+            roi_after = masked_affine_average_brightness(
+                frames,
+                roi_mask,
+                panel_gain,
+                panel_offset,
+            )
+            needle_after = masked_affine_average_brightness(
+                frames,
+                needle_core_mask(needle_masks[panel_index]),
+                panel_gain,
+                panel_offset,
+            )
+            baseline_count = min(
+                len(frames),
+                max(
+                    1,
+                    detect_pre_injection_trim_start(
+                        frames,
+                        panel.info.fps,
+                        camera_view_mask=getattr(panel, "camera_view_mask", None),
+                    )
+                    + max(1, round(float(panel.info.fps) * 0.5)),
+                ),
+            )
+            roi_before_level, needle_before_level = anchors[panel_index]
+            results[panel.label] = ROIAlignmentPlotResult(
+                time=np.arange(len(frames), dtype=float) / panel.info.fps,
+                roi_brightness_before=roi_before,
+                roi_brightness_after=roi_after,
+                roi_baseline_before=roi_before_level,
+                needle_baseline_before=needle_before_level,
+                roi_baseline_after=float(np.mean(roi_after[:baseline_count])),
+                needle_baseline_after=float(np.mean(needle_after[:baseline_count])),
+            )
+        self.roi_needle_alignment_results = results
 
     def _on_manual_roi_drawn(self, panel_index: int, circle: object) -> None:
         if (
@@ -8105,6 +8214,9 @@ class ContrastWindow(QMainWindow):
             self._update_stage_statuses()
             self.statusBar().showMessage("Load a video before running pipeline stages.")
             return
+        self.roi_needle_alignment_results.clear()
+        self.roi_needle_alignment_plot.clear()
+        self.analysis_tabs.setTabVisible(self.roi_needle_alignment_tab_index, False)
         self._enhancement_pending_request = None
         self._enhancement_active_request = request
         self._enhancement_cancel = Event()
@@ -8484,6 +8596,7 @@ class ContrastWindow(QMainWindow):
             self._set_playback_limit(self.source_max_frame)
             for panel in self.panels:
                 panel.seek(self.current_frame_index)
+            self.refresh_roi_needle_alignment_plot()
             self._update_stage_statuses()
             roi_analysis_updated = self._has_enabled_stage("roi_residence_analysis") and self.run_analysis()
             frame_brightness_updated = self._has_enabled_stage("frame_brightness_analysis") and self.run_frame_brightness_analysis()
@@ -8727,6 +8840,9 @@ class ContrastWindow(QMainWindow):
         self.needle_brightness_plot.clear()
         self.needle_brightness_results.clear()
         self.needle_brightness_baselines.clear()
+        self.roi_needle_alignment_plot.clear()
+        self.roi_needle_alignment_results.clear()
+        self.analysis_tabs.setTabVisible(self.roi_needle_alignment_tab_index, False)
         for panel in self.panels:
             panel.needle_segmentation_mask = None
         self.temporal_change_results.clear()
@@ -8901,6 +9017,68 @@ class ContrastWindow(QMainWindow):
             center = (data_min + data_max) / 2.0
             lower = max(0.0, min(255.0 - display_span, center - display_span / 2.0))
             self.needle_brightness_plot.setYRange(lower, lower + display_span, padding=0)
+
+    def refresh_roi_needle_alignment_plot(self) -> None:
+        plot = self.roi_needle_alignment_plot
+        plot.clear()
+        self.analysis_tabs.setTabVisible(
+            self.roi_needle_alignment_tab_index,
+            bool(self.roi_needle_alignment_results),
+        )
+        plotted_values: list[np.ndarray] = []
+        maximum_time = 0.0
+        baseline_position = 0.08
+        for panel in self.panels:
+            result = self.roi_needle_alignment_results.get(panel.label)
+            if result is None:
+                continue
+            color = panel.color.name()
+            before_color = QColor(color)
+            before_color.setAlpha(150)
+            plot.plot(
+                result.time,
+                result.roi_brightness_before,
+                pen=pg.mkPen(before_color, width=1.8, style=Qt.PenStyle.DashLine),
+                name=f"{panel.label} ROI before",
+            )
+            plot.plot(
+                result.time,
+                result.roi_brightness_after,
+                pen=pg.mkPen(color, width=2.5),
+                name=f"{panel.label} ROI after",
+            )
+            plotted_values.extend((result.roi_brightness_before, result.roi_brightness_after))
+            if len(result.time):
+                maximum_time = max(maximum_time, float(result.time[-1]))
+            baseline_specs = (
+                ("ROI before", result.roi_baseline_before, Qt.PenStyle.DashDotLine, before_color),
+                ("Needle before", result.needle_baseline_before, Qt.PenStyle.DotLine, before_color),
+                ("ROI after", result.roi_baseline_after, Qt.PenStyle.DashDotLine, QColor(color)),
+                ("Needle after", result.needle_baseline_after, Qt.PenStyle.DotLine, QColor(color)),
+            )
+            for baseline_name, baseline, style, baseline_color in baseline_specs:
+                plot.addItem(
+                    pg.InfiniteLine(
+                        pos=baseline,
+                        angle=0,
+                        pen=pg.mkPen(baseline_color, width=1.3, style=style),
+                        label=f"{panel.label} {baseline_name}: {baseline:.1f}",
+                        labelOpts={"position": baseline_position, "color": baseline_color},
+                    )
+                )
+                baseline_position = min(0.92, baseline_position + 0.11)
+                plotted_values.append(np.asarray([baseline]))
+        if maximum_time > 0.0:
+            plot.setXRange(0.0, maximum_time, padding=0)
+        if plotted_values:
+            values = np.concatenate(plotted_values)
+            data_min = float(np.min(values))
+            data_max = float(np.max(values))
+            display_span = max(10.0, data_max - data_min)
+            padding = max(2.0, display_span * 0.08)
+            lower = max(0.0, data_min - padding)
+            upper = min(255.0, data_max + padding)
+            plot.setYRange(lower, max(lower + 10.0, upper), padding=0)
 
     def _clear_frame_brightness_plots(self) -> None:
         while self.frame_brightness_layout.count():
