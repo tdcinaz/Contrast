@@ -362,6 +362,45 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(display.roi(), selection.rect)
         np.testing.assert_array_equal(display.roi_mask(), mask)
 
+    def test_manual_roi_change_preserves_needle_and_roi_independent_analysis(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        needle_mask = np.zeros((20, 20), dtype=np.uint8)
+        needle_mask[2:18, 1:4] = 255
+        panel = SimpleNamespace(
+            label="Video",
+            needle_segmentation_mask=needle_mask,
+            roi=Mock(return_value=QRect(5, 5, 8, 8)),
+            roi_mask=Mock(return_value=np.ones((8, 8), dtype=bool)),
+        )
+        window.panels = [panel]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        time = np.asarray([0.0, 0.1])
+        window.results = {"Video": Mock()}
+        window.frame_brightness_results = {
+            "Video": (time, np.asarray([100.0, 101.0]), np.asarray([90.0, 91.0]))
+        }
+        window.needle_brightness_results = {"Video": (time, np.asarray([20.0, 21.0]))}
+        window.needle_brightness_baselines = {"Video": 20.5}
+        window.temporal_change_results = {
+            "Video": (np.ones((20, 20), dtype=np.float32), np.ones((20, 20), dtype=np.float32))
+        }
+
+        with patch.object(window, "_update_stage_statuses"), patch.object(
+            window,
+            "_has_enabled_stage",
+            return_value=False,
+        ):
+            window.on_roi_changed()
+
+        self.assertEqual(window.results, {})
+        self.assertIs(panel.needle_segmentation_mask, needle_mask)
+        self.assertIn("Video", window.needle_brightness_results)
+        self.assertEqual(window.needle_brightness_baselines, {"Video": 20.5})
+        self.assertIn("Video", window.frame_brightness_results)
+        self.assertIn("Video", window.temporal_change_results)
+
     def test_play_restarts_file_playback_at_the_final_frame(self) -> None:
         QApplication.instance() or QApplication([])
         window = ContrastWindow()

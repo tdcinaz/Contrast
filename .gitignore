@@ -35,3 +35,6 @@ test_configs/*.json
 
 # Reports
 *.pdf
+
+# Raw data
+*.DCM

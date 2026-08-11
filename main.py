@@ -7453,7 +7453,7 @@ class ContrastWindow(QMainWindow):
             self.statusBar().showMessage("Load a video to begin processing.")
             return
         self.results.clear()
-        self.clear_plots_and_metrics()
+        self.clear_roi_analysis()
         self._update_stage_statuses()
         ready = all(panel.roi() and panel.roi_mask() is not None for panel in self.panels)
         if ready:
@@ -9216,23 +9216,15 @@ class ContrastWindow(QMainWindow):
         self.results = normalize_analysis_results(self.results, threshold)
         self.refresh_plots_and_metrics()
 
-    def clear_plots_and_metrics(self) -> None:
+    def clear_roi_analysis(self) -> None:
         self.normalized_plot.clear()
         self.raw_plot.clear()
         self.derivative_plot.clear()
         self.baseline_to_apex_plot.clear()
-        self._clear_frame_brightness_plots()
-        self.frame_brightness_results.clear()
-        self.needle_brightness_plot.clear()
-        self.needle_brightness_results.clear()
-        self.needle_brightness_baselines.clear()
+        self.analysis_tabs.setTabVisible(self.baseline_to_apex_tab_index, False)
         self.roi_needle_alignment_plot.clear()
         self.roi_needle_alignment_results.clear()
         self.analysis_tabs.setTabVisible(self.roi_needle_alignment_tab_index, False)
-        for panel in self.panels:
-            panel.needle_segmentation_mask = None
-        self.temporal_change_results.clear()
-        self._clear_temporal_change_views()
         self.pre_card.set_metric("--")
         self.post_card.set_metric("--")
         self.delta_card.set_metric("--")
@@ -9240,6 +9232,18 @@ class ContrastWindow(QMainWindow):
         self.export_button.setEnabled(False)
         self.export_pdf_action.setEnabled(False)
         self.export_pdf_button.setEnabled(False)
+
+    def clear_plots_and_metrics(self) -> None:
+        self.clear_roi_analysis()
+        self._clear_frame_brightness_plots()
+        self.frame_brightness_results.clear()
+        self.needle_brightness_plot.clear()
+        self.needle_brightness_results.clear()
+        self.needle_brightness_baselines.clear()
+        for panel in self.panels:
+            panel.needle_segmentation_mask = None
+        self.temporal_change_results.clear()
+        self._clear_temporal_change_views()
 
     def refresh_plots_and_metrics(self) -> None:
         self.normalized_plot.clear()
