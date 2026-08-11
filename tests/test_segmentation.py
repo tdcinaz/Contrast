@@ -819,6 +819,64 @@ class SegmentationTests(unittest.TestCase):
         panel.prepare_enhanced_frames.assert_called_once()
         app.quit()
 
+    def test_roi_needle_alignment_maps_second_video_to_first_video_anchors(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window.active_mode = MODE_COMPARISON
+        frame = np.full((20, 20), 100, dtype=np.uint8)
+        roi = main.ROISelection(QRect(5, 5, 8, 8), np.ones((8, 8), dtype=bool))
+        panels = []
+        for label in ("Pre-deployment", "Post-deployment"):
+            panel = Mock()
+            panel.label = label
+            panel.info = SimpleNamespace(fps=10.0)
+            panel.camera_view_mask = None
+            panel.source_gray_frames = [frame]
+            panel.stage_frame_cache = {}
+            panel.prepare_enhanced_frames.return_value = True
+            panel._sequence_key.return_value = (("roi_extraction", ()),)
+            panel._frame_sequence_key.return_value = ()
+            panel._roi_selection_for_sequence.return_value = roi
+            panels.append(panel)
+        window.panels = panels
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        stages = EnhancementStages(
+            instances=(
+                main.PipelineStage("roi_extraction", True),
+                main.PipelineStage("roi_needle_level_alignment", True),
+            )
+        )
+        request = EnhancementRequest(
+            generation=1,
+            mode="ffdnet-native",
+            model_label="FFDNet",
+            stages=stages,
+            parameters=EnhancementParameters(),
+            noise_sigma=10,
+            batch_size=1,
+            precision="fp16",
+            auto_crop=False,
+            temporal_alignment=False,
+            source_pipeline_current=True,
+            roi_parameters_by_panel=(EnhancementParameters(), EnhancementParameters()),
+        )
+
+        with patch.object(
+            main,
+            "measure_roi_needle_baselines",
+            side_effect=((130.0, 30.0, np.ones_like(frame)), (150.0, 50.0, np.ones_like(frame))),
+        ):
+            window._prepare_roi_needle_level_alignment(request, [None, None], "none", Event())
+
+        self.assertEqual(panels[0].roi_needle_alignment_gain, 1.0)
+        self.assertEqual(panels[0].roi_needle_alignment_offset, 0.0)
+        self.assertAlmostEqual(panels[1].roi_needle_alignment_gain, 1.0)
+        self.assertAlmostEqual(panels[1].roi_needle_alignment_offset, -20.0)
+        prefix_stages = panels[0].prepare_enhanced_frames.call_args.args[3]
+        self.assertEqual(prefix_stages.enabled_stage_order, ("roi_extraction",))
+        app.quit()
+
     def test_current_source_pipeline_skips_source_preparation(self) -> None:
         request = EnhancementRequest(
             generation=1,

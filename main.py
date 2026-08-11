@@ -1374,6 +1374,66 @@ def needle_average_brightness(gray_frames: list[np.ndarray], mask: np.ndarray) -
     return masked_average_brightness(gray_frames, core)
 
 
+def intensity_alignment_parameters(
+    source_roi_level: float,
+    source_needle_level: float,
+    target_roi_level: float,
+    target_needle_level: float,
+) -> tuple[float, float]:
+    source_span = float(source_roi_level) - float(source_needle_level)
+    target_span = float(target_roi_level) - float(target_needle_level)
+    if abs(source_span) < 1.0 or abs(target_span) < 1.0 or source_span * target_span <= 0.0:
+        raise ValueError("ROI and needle baseline levels must define distinct, consistently ordered anchors.")
+    gain = target_span / source_span
+    offset = float(target_needle_level) - gain * float(source_needle_level)
+    return gain, offset
+
+
+def align_frame_intensity(frame: np.ndarray, gain: float, offset: float) -> np.ndarray:
+    return np.clip(frame.astype(np.float32) * float(gain) + float(offset), 0.0, 255.0).astype(np.uint8)
+
+
+def measure_roi_needle_baselines(
+    gray_frames: list[np.ndarray],
+    fps: float,
+    roi_mask: np.ndarray,
+    camera_view_mask: np.ndarray | None = None,
+) -> tuple[float, float, np.ndarray]:
+    if not gray_frames:
+        raise ValueError("ROI / needle level alignment requires video frames.")
+    if roi_mask.shape != gray_frames[0].shape or not np.any(roi_mask):
+        raise ValueError("ROI / needle level alignment requires a non-empty ROI mask matching the frames.")
+    needle_mask = segment_pre_injection_needle(gray_frames, fps, camera_view_mask)
+    if needle_mask is None:
+        raise ValueError("ROI / needle level alignment could not segment the stationary needle.")
+    baseline_count = min(
+        len(gray_frames),
+        max(
+            1,
+            detect_pre_injection_trim_start(
+                gray_frames,
+                fps,
+                camera_view_mask=camera_view_mask,
+            )
+            + max(1, round(float(fps) * 0.5)),
+        ),
+    )
+    baseline_frames = gray_frames[:baseline_count]
+    roi_level = float(np.mean(masked_average_brightness(baseline_frames, roi_mask)))
+    needle_level = float(np.mean(needle_average_brightness(baseline_frames, needle_mask)))
+    return roi_level, needle_level, needle_mask
+
+
+def roi_selection_mask(roi: ROISelection, frame_shape: tuple[int, int]) -> np.ndarray:
+    mask = np.zeros(frame_shape, dtype=np.uint8)
+    x, y, width, height = roi.rect.getRect()
+    if x < 0 or y < 0 or x + width > frame_shape[1] or y + height > frame_shape[0]:
+        raise ValueError("ROI / needle level alignment requires an ROI contained within the video frame.")
+    selected = np.ones((height, width), dtype=bool) if roi.mask is None else roi.mask
+    mask[y : y + height, x : x + width][selected] = 255
+    return mask
+
+
 def compute_temporal_change_summary(
     gray_frames: list[np.ndarray],
     fps: float,
@@ -2517,6 +2577,8 @@ class VideoPanel(QFrame):
         self.roi_region_overlay_display = True
         self.needle_segmentation_mask: np.ndarray | None = None
         self.target_median = 128.0
+        self.roi_needle_alignment_gain = 1.0
+        self.roi_needle_alignment_offset = 0.0
         self.enhanced_frames: list[np.ndarray] | None = None
         self.report_encoded_frames: list[np.ndarray] | None = None
         self.temporal_change_heatmap: np.ndarray | None = None
@@ -2995,6 +3057,14 @@ class VideoPanel(QFrame):
                     round(float(parameters.gain_max), 4),
                 ),
             )
+        if stage_key == "roi_needle_level_alignment":
+            return (
+                stage_key,
+                (
+                    round(float(self.roi_needle_alignment_gain), 6),
+                    round(float(self.roi_needle_alignment_offset), 4),
+                ),
+            )
         return BUILTIN_STAGES.require(stage_key).cache_token(parameters, backend_id, noise_sigma)
 
     def _sequence_key(
@@ -3252,6 +3322,12 @@ class VideoPanel(QFrame):
         frame: np.ndarray,
         parameters: EnhancementParameters,
     ) -> np.ndarray:
+        if stage_key == "roi_needle_level_alignment":
+            return align_frame_intensity(
+                frame,
+                self.roi_needle_alignment_gain,
+                self.roi_needle_alignment_offset,
+            )
         definition = BUILTIN_STAGES.require(stage_key)
         if definition.processor is None:
             return frame
@@ -5700,7 +5776,12 @@ class ContrastWindow(QMainWindow):
             3,
         )
         self.roi_stage_drawer = StageDrawer("roi_extraction", "Aneurysm ROI extraction", 4)
-        self.gain_stage_drawer = StageDrawer("gain_stabilization", "Median gain normalization", 5)
+        self.roi_needle_level_alignment_stage_drawer = StageDrawer(
+            "roi_needle_level_alignment",
+            "Align ROI / needle baseline levels",
+            5,
+        )
+        self.gain_stage_drawer = StageDrawer("gain_stabilization", "Median gain normalization", 6)
         self.scanline_stage_drawer = StageDrawer("scanline_correction", "Scanline correction", 6)
         self.denoise_stage_drawer = StageDrawer("denoise", "Spatial denoising", 7)
         self.temporal_stage_drawer = StageDrawer("temporal_filter", "Motion-aware temporal filtering", 8)
@@ -5738,6 +5819,7 @@ class ContrastWindow(QMainWindow):
         self.gain_stage_check = self.gain_stage_drawer.enable_button
         self.brightness_stage_check = self.brightness_stage_drawer.enable_button
         self.roi_stage_check = self.roi_stage_drawer.enable_button
+        self.roi_needle_level_alignment_stage_check = self.roi_needle_level_alignment_stage_drawer.enable_button
         self.scanline_stage_check = self.scanline_stage_drawer.enable_button
         self.denoise_stage_check = self.denoise_stage_drawer.enable_button
         self.temporal_stage_check = self.temporal_stage_drawer.enable_button
@@ -5761,6 +5843,7 @@ class ContrastWindow(QMainWindow):
         self.frame_pipeline_stage_checks = [
             self.brightness_stage_check,
             self.roi_stage_check,
+            self.roi_needle_level_alignment_stage_check,
             self.gain_stage_check,
             self.scanline_stage_check,
             self.denoise_stage_check,
@@ -5790,6 +5873,7 @@ class ContrastWindow(QMainWindow):
         self.frame_pipeline_stage_drawers = [
             self.brightness_stage_drawer,
             self.roi_stage_drawer,
+            self.roi_needle_level_alignment_stage_drawer,
             self.gain_stage_drawer,
             self.scanline_stage_drawer,
             self.denoise_stage_drawer,
@@ -7127,6 +7211,7 @@ class ContrastWindow(QMainWindow):
 
     def _update_stage_statuses(self) -> None:
         roi_drawers = self._stage_drawers("roi_extraction")
+        alignment_drawers = self._stage_drawers("roi_needle_level_alignment")
         analysis_drawers = self._stage_drawers("roi_residence_analysis")
         frame_brightness_drawers = self._stage_drawers("frame_brightness_analysis")
         needle_drawers = self._stage_drawers("needle_segmentation")
@@ -7134,10 +7219,13 @@ class ContrastWindow(QMainWindow):
         analysis_enabled = self._has_enabled_stage("roi_residence_analysis")
         frame_brightness_enabled = self._has_enabled_stage("frame_brightness_analysis")
         needle_enabled = self._has_enabled_stage("needle_segmentation")
+        alignment_enabled = self._has_enabled_stage("roi_needle_level_alignment")
         temporal_change_enabled = self._has_enabled_stage("temporal_change_heatmap")
         if self.active_mode == MODE_LIVE and self._network_stream_display is not None:
             for drawer in roi_drawers:
                 drawer.set_status("Unavailable for live input. Drag on the source image to select an ROI.", False)
+            for drawer in alignment_drawers:
+                drawer.set_status("Unavailable for live input.", alignment_enabled)
             for drawer in analysis_drawers:
                 drawer.set_status(
                     "Collecting the latest 60 seconds from the manually selected ROI."
@@ -7160,6 +7248,8 @@ class ContrastWindow(QMainWindow):
         if not self.panels:
             for drawer in roi_drawers:
                 drawer.set_status("Load video files to run ROI extraction.", analysis_enabled)
+            for drawer in alignment_drawers:
+                drawer.set_status("Load a two-video comparison to align baseline levels.", alignment_enabled)
             for drawer in analysis_drawers:
                 drawer.set_status("Load video files to run ROI residence analysis.", analysis_enabled)
             for drawer in frame_brightness_drawers:
@@ -7185,6 +7275,31 @@ class ContrastWindow(QMainWindow):
             else:
                 for drawer in roi_drawers:
                     drawer.set_status("ROI masks ready for downstream analysis.", False)
+
+        if not alignment_enabled:
+            for drawer in alignment_drawers:
+                drawer.set_status(None)
+        elif self.active_mode != MODE_COMPARISON or len(self.panels) != 2:
+            for drawer in alignment_drawers:
+                drawer.set_status("Requires a two-video comparison.", True)
+        else:
+            enabled_live_drawers = [
+                drawer for drawer in self.live_pipeline_stage_drawers if drawer.enable_button.isChecked()
+            ]
+            alignment_index = next(
+                (index for index, drawer in enumerate(enabled_live_drawers) if drawer.stage_key == "roi_needle_level_alignment"),
+                -1,
+            )
+            has_upstream_roi = any(
+                drawer.stage_key == "roi_extraction" for drawer in enabled_live_drawers[:alignment_index]
+            )
+            for drawer in alignment_drawers:
+                if not has_upstream_roi:
+                    drawer.set_status("Move this stage after enabled aneurysm ROI extraction.", True)
+                elif self._enhancement_future is not None:
+                    drawer.set_status("Measuring pre-injection ROI and needle baseline levels...", False)
+                else:
+                    drawer.set_status("Post-deployment levels are aligned to pre-deployment anchors.", False)
 
         if not analysis_enabled:
             for drawer in analysis_drawers:
@@ -7409,7 +7524,10 @@ class ContrastWindow(QMainWindow):
         instances = tuple(
             PipelineStage(
                 key=drawer.stage_key,
-                enabled=drawer.enable_button.isChecked(),
+                enabled=(
+                    drawer.enable_button.isChecked()
+                    and (drawer.stage_key != "roi_needle_level_alignment" or self.active_mode == MODE_COMPARISON)
+                ),
                 parameters=self._drawer_parameters(drawer),
                 noise_sigma=(
                     drawer.findChild(QSpinBox, "denoiseStrength").value()
@@ -7423,6 +7541,9 @@ class ContrastWindow(QMainWindow):
             gain_stabilization=self._has_enabled_stage("gain_stabilization"),
             brightness_stabilization=self._has_enabled_stage("brightness_stabilization"),
             roi_extraction=self._has_enabled_stage("roi_extraction"),
+            roi_needle_level_alignment=(
+                self.active_mode == MODE_COMPARISON and self._has_enabled_stage("roi_needle_level_alignment")
+            ),
             scanline_correction=self._has_enabled_stage("scanline_correction"),
             denoise=self._has_enabled_stage("denoise"),
             temporal_filter=self._has_enabled_stage("temporal_filter"),
@@ -7655,6 +7776,106 @@ class ContrastWindow(QMainWindow):
                 for stage in stages.instances
             ),
         )
+
+    def _prepare_roi_needle_level_alignment(
+        self,
+        request: EnhancementRequest,
+        panel_denoisers: list[FrameDenoiser | None],
+        backend_id: str,
+        cancel_event: Event,
+    ) -> None:
+        for panel in self.panels:
+            panel.roi_needle_alignment_gain = 1.0
+            panel.roi_needle_alignment_offset = 0.0
+
+        enabled_stages = request.stages.enabled_stage_instances(request.parameters)
+        alignment_indexes = [
+            index for index, stage in enumerate(enabled_stages) if stage.key == "roi_needle_level_alignment"
+        ]
+        if not alignment_indexes:
+            return
+        if len(alignment_indexes) != 1:
+            raise ValueError("ROI / needle level alignment can appear only once in the live pipeline.")
+        if self.active_mode != MODE_COMPARISON or len(self.panels) != 2:
+            raise ValueError("ROI / needle level alignment requires a two-video comparison.")
+
+        alignment_index = alignment_indexes[0]
+        prefix_instances = enabled_stages[:alignment_index]
+        if not any(stage.key == "roi_extraction" for stage in prefix_instances):
+            raise ValueError("ROI / needle level alignment requires upstream aneurysm ROI extraction.")
+        prefix_stages = EnhancementStages(
+            stage_order=tuple(stage.key for stage in prefix_instances),
+            instances=prefix_instances,
+        )
+        with self._enhancement_progress_lock:
+            self._enhancement_message = "Measuring ROI and needle baseline levels..."
+
+        def prepare_prefix(panel_index: int, frame_executor: AdaptiveFrameExecutor) -> bool:
+            roi_parameters = (
+                request.roi_parameters_by_panel[panel_index]
+                if panel_index < len(request.roi_parameters_by_panel)
+                else request.parameters
+            )
+            return self.panels[panel_index].prepare_enhanced_frames(
+                panel_denoisers[panel_index],
+                request.noise_sigma,
+                request.batch_size,
+                self._stages_for_roi_parameters(prefix_stages, roi_parameters),
+                request.parameters,
+                activate_result=False,
+                cancel_callback=cancel_event.is_set,
+                frame_executor=frame_executor,
+            )
+
+        prepared = [False] * len(self.panels)
+        with frame_parallel_opencv(), AdaptiveFrameExecutor() as frame_executor, ThreadPoolExecutor(
+            max_workers=len(self.panels),
+            thread_name_prefix="level-alignment",
+        ) as executor:
+            futures = {
+                executor.submit(prepare_prefix, panel_index, frame_executor): panel_index
+                for panel_index in range(len(self.panels))
+            }
+            for future in as_completed(futures):
+                prepared[futures[future]] = future.result()
+        if cancel_event.is_set():
+            return
+        if not all(prepared):
+            raise RuntimeError("Could not prepare the ROI / needle alignment prefix.")
+
+        anchors: list[tuple[float, float]] = []
+        for panel_index, panel in enumerate(self.panels):
+            roi_parameters = (
+                request.roi_parameters_by_panel[panel_index]
+                if panel_index < len(request.roi_parameters_by_panel)
+                else request.parameters
+            )
+            panel_stages = self._stages_for_roi_parameters(prefix_stages, roi_parameters)
+            sequence_key = panel._sequence_key(panel_stages, backend_id, request.noise_sigma, request.parameters)
+            frame_key = panel._frame_sequence_key(sequence_key)
+            frames = panel.stage_frame_cache.get(frame_key) if frame_key else panel.source_gray_frames
+            roi = panel._roi_selection_for_sequence(sequence_key)
+            if not frames or roi is None:
+                raise ValueError(f"ROI / needle level alignment could not obtain an ROI for {panel.label}.")
+            roi_mask = roi_selection_mask(roi, frames[0].shape)
+            roi_level, needle_level, _ = measure_roi_needle_baselines(
+                frames,
+                panel.info.fps,
+                roi_mask,
+                getattr(panel, "camera_view_mask", None),
+            )
+            anchors.append((roi_level, needle_level))
+
+        target_roi_level, target_needle_level = anchors[0]
+        for panel, (roi_level, needle_level) in zip(self.panels[1:], anchors[1:], strict=True):
+            gain, offset = intensity_alignment_parameters(
+                roi_level,
+                needle_level,
+                target_roi_level,
+                target_needle_level,
+            )
+            panel.roi_needle_alignment_gain = gain
+            panel.roi_needle_alignment_offset = offset
 
     def _on_manual_roi_drawn(self, panel_index: int, circle: object) -> None:
         if (
@@ -8052,6 +8273,22 @@ class ContrastWindow(QMainWindow):
         if cancel_event.is_set():
             return False
         backend_id = denoisers[0].backend_id if denoisers else "none"
+        if len(denoisers) == 1:
+            panel_denoisers: list[FrameDenoiser | None] = [SynchronizedFrameDenoiser(denoisers[0])] * len(self.panels)
+        elif denoisers:
+            panel_denoisers = list(denoisers)
+        else:
+            panel_denoisers = [None] * len(self.panels)
+
+        self._prepare_roi_needle_level_alignment(
+            request,
+            panel_denoisers,
+            backend_id,
+            cancel_event,
+        )
+        if cancel_event.is_set():
+            return False
+
         panel_work = [
             panel.estimate_prepare_work(
                 backend_id,
@@ -8070,13 +8307,6 @@ class ContrastWindow(QMainWindow):
                 )
             else:
                 self._enhancement_message = "Running video enhancement..."
-
-        if len(denoisers) == 1:
-            panel_denoisers: list[FrameDenoiser | None] = [SynchronizedFrameDenoiser(denoisers[0])] * len(self.panels)
-        elif denoisers:
-            panel_denoisers = list(denoisers)
-        else:
-            panel_denoisers = [None] * len(self.panels)
 
         def prepare_panel(panel_index: int, frame_executor: AdaptiveFrameExecutor) -> bool:
             panel = self.panels[panel_index]
@@ -8327,6 +8557,7 @@ class ContrastWindow(QMainWindow):
         threshold = self.threshold_spin.value()
         gain_corrected = (
             stages.brightness_stabilization
+            or stages.roi_needle_level_alignment
             or stages.gain_stabilization
             or self._has_enabled_stage("contrast_gain_alignment")
         )

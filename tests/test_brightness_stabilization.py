@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import unittest
 
+import cv2
 import numpy as np
 
 from main import (
+    align_frame_intensity,
     estimate_intensity_corrections,
+    intensity_alignment_parameters,
+    measure_roi_needle_baselines,
     stabilize_frame_intensity,
 )
 
@@ -61,6 +65,33 @@ class BrightnessStabilizationTests(unittest.TestCase):
         )
         relative_trace_error = (measured_trace - measured_trace[0]) + contrast_drop
         self.assertLess(float(np.max(np.abs(relative_trace_error))), 0.75)
+
+    def test_roi_and_needle_anchors_recover_gain_and_offset(self) -> None:
+        gain, offset = intensity_alignment_parameters(150.0, 50.0, 130.0, 30.0)
+        frame = np.asarray([[50, 100, 150]], dtype=np.uint8)
+
+        aligned = align_frame_intensity(frame, gain, offset)
+
+        self.assertAlmostEqual(gain, 1.0)
+        self.assertAlmostEqual(offset, -20.0)
+        np.testing.assert_array_equal(aligned, np.asarray([[30, 80, 130]], dtype=np.uint8))
+
+    def test_roi_and_needle_anchors_must_be_distinct(self) -> None:
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            intensity_alignment_parameters(100.0, 100.0, 120.0, 40.0)
+
+    def test_measures_pre_injection_roi_and_needle_baselines(self) -> None:
+        frames = [np.full((80, 120), 150, dtype=np.uint8) for _ in range(8)]
+        roi_mask = np.zeros((80, 120), dtype=np.uint8)
+        cv2.circle(roi_mask, (80, 40), 12, 255, thickness=-1)
+        for frame in frames:
+            frame[10:70, 8:13] = 40
+
+        roi_level, needle_level, needle_mask = measure_roi_needle_baselines(frames, 10.0, roi_mask)
+
+        self.assertAlmostEqual(roi_level, 150.0)
+        self.assertAlmostEqual(needle_level, 40.0)
+        self.assertGreater(int(np.count_nonzero(needle_mask)), 200)
 
 
 if __name__ == "__main__":

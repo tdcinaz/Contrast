@@ -43,6 +43,7 @@ class EnhancementStages:
     gain_stabilization: bool = False
     brightness_stabilization: bool = False
     roi_extraction: bool = False
+    roi_needle_level_alignment: bool = False
     scanline_correction: bool = False
     denoise: bool = False
     temporal_filter: bool = False
@@ -53,6 +54,7 @@ class EnhancementStages:
     stage_order: tuple[str, ...] = (
         "brightness_stabilization",
         "roi_extraction",
+        "roi_needle_level_alignment",
         "gain_stabilization",
         "scanline_correction",
         "denoise",

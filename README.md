@@ -66,11 +66,12 @@ To add a stateless filter, implement a frame processor in `contrast_pipeline/sta
 
 1. Enable live processing stages in order. The default stage order now places **Aneurysm ROI extraction** second, immediately after gain / brightness stabilization.
 2. Enable **Aneurysm ROI extraction** to build an ROI mask from the current upstream video state. Use **Refresh ROI extraction** to rerun it after adjusting upstream stages or extraction parameters.
-3. Review the detected mask during playback. Drag on a video only when a detected ROI needs correction.
-4. Enable **ROI residence analysis** only after the upstream extraction stage is enabled and has produced masks for both videos.
-5. Compare the normalized contrast curves, raw ROI brightness curves, and residence-time cards.
-6. Adjust the clearance threshold if needed. The metrics update from the already measured curves.
-7. Export a CSV for downstream analysis.
+3. For a two-video comparison, add **Align ROI / needle baseline levels** after ROI extraction. It maps post-deployment brightness onto the pre-deployment video using the two pre-injection reference levels.
+4. Review the detected mask during playback. Drag on a video only when a detected ROI needs correction.
+5. Enable **ROI residence analysis** only after the upstream extraction stage is enabled and has produced masks for both videos.
+6. Compare the normalized contrast curves, raw ROI brightness curves, and residence-time cards.
+7. Adjust the clearance threshold if needed. The metrics update from the already measured curves.
+8. Export a CSV for downstream analysis.
 
 Quality controls are available:
 
@@ -82,8 +83,9 @@ Quality controls are available:
 - **Native FFDNet (GPU)** uses the ARM CUDA 13 PyTorch packages locked in this project. The current PyTorch 2.11 wheel expects cuDNN 9.13, while NVIDIA's cu13 Python index currently provides cuDNN 9.12 for aarch64, so NGC is the validated GB10 path until a matching native cuDNN package is available.
 - **FFDNet noise sigma** represents the assumed noise standard deviation on the 0-255 intensity scale. `10` is a conservative default for the included videos; lower values preserve more texture, while higher values produce a smoother but increasingly plastic image. The available range is `0` to `50`.
 - **Batch frames** controls how many video frames are sent to the GPU together. The NGC default is `4`; on GB10 it sustained about 91 fps through the FFDNet shared-memory round trip at the auto-cropped `800x800` shape, while larger batches reduced throughput despite the available 128GB unified pool. Larger batches can still help other models or frame sizes. **Precision** defaults to `FP16`; measured BF16 was slightly slower and changed output by as much as seven 8-bit levels, while FP32/TF32 was substantially slower.
-- **Live processing pipeline** starts with all stages disabled. Its checkboxes are always applied top to bottom: gain / brightness stabilization, aneurysm ROI extraction, median gain normalization, scanline correction, spatial denoising, motion-aware temporal filtering, quantum mottle reduction, CLAHE local contrast, image adjustments, final Gaussian smoothing, and brightness-coded contrast segmentation. Enable stages one at a time to inspect their cumulative effect. Unchecking a stage removes only that operation while preserving enabled downstream stages.
+- **Live processing pipeline** starts with all stages disabled. Its checkboxes are always applied top to bottom: gain / brightness stabilization, aneurysm ROI extraction, ROI / needle baseline alignment, median gain normalization, scanline correction, spatial denoising, motion-aware temporal filtering, quantum mottle reduction, CLAHE local contrast, image adjustments, final Gaussian smoothing, and terminal analysis stages. Enable stages one at a time to inspect their cumulative effect. Unchecking a stage removes only that operation while preserving enabled downstream stages.
 - **Gain / brightness stabilization** is the first stage. It robustly aligns upper-histogram probes from each frame to the video's reference histogram, fitting both gain and offset while excluding the darker intensity population affected by contrast passage. This corrects multiplicative and additive exposure jitter in one operation without flattening the contrast trace or allocating a full-resolution temporal stack.
+- **ROI / needle baseline alignment** is a file-only comparison stage. It measures the pre-injection mean level inside each extracted aneurysm ROI and the stable core of each segmented needle, then applies the unique affine gain and offset that maps the post-deployment anchors onto the pre-deployment anchors. Place it after an enabled ROI extraction stage; downstream stages consume the aligned pixels.
 - **Image adjustments** is a general-purpose enhancement stage for common finishing tweaks. It exposes brightness offset, contrast gain, sharpen amount, and gamma so you can quickly tune visual emphasis without switching denoising backends.
 - **Brightness-coded contrast segmentation** now supports two segmentation bases:
 	- **Dark contrast (per frame)** keeps the original adaptive local threshold workflow and uses neighborhood + sensitivity controls.

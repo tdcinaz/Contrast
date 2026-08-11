@@ -73,6 +73,11 @@
       "key": "roi_extraction"
     },
     {
+      "controls": {},
+      "enabled": false,
+      "key": "roi_needle_level_alignment"
+    },
+    {
       "controls": {
         "analysisThreshold": 0.2
       },
