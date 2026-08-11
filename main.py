@@ -523,6 +523,43 @@ class ROIAlignmentPlotResult:
     needle_baseline_after: float
 
 
+@dataclass(frozen=True, slots=True)
+class AnalysisPanelSnapshot:
+    label: str
+    path: Path
+    fps: float
+    roi: QRect | None
+    roi_mask: np.ndarray | None
+    camera_view_mask: np.ndarray | None
+    encoded_frames: tuple[np.ndarray, ...] | None
+    source_frames: tuple[np.ndarray, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineAnalysisRequest:
+    generation: int
+    panels: tuple[AnalysisPanelSnapshot, ...]
+    threshold: float
+    gain_corrected: bool
+    roi_residence: bool
+    frame_brightness: bool
+    needle_segmentation: bool
+    temporal_change: bool
+    heatmap_colormap: str
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineAnalysisResult:
+    generation: int
+    roi_results: dict[str, AnalysisResult]
+    frame_brightness_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]
+    needle_brightness_results: dict[str, tuple[np.ndarray, np.ndarray]]
+    needle_brightness_baselines: dict[str, float]
+    needle_masks: dict[str, np.ndarray | None]
+    temporal_change_results: dict[str, tuple[np.ndarray, np.ndarray]]
+    temporal_change_heatmaps: dict[str, np.ndarray]
+
+
 def average_frame_brightness(
     frames: list[np.ndarray],
     camera_view_mask: np.ndarray | None = None,
@@ -4669,6 +4706,10 @@ class ContrastWindow(QMainWindow):
         self._enhancement_cancel: Event | None = None
         self._enhancement_active_request: EnhancementRequest | None = None
         self._enhancement_pending_request: EnhancementRequest | None = None
+        self._analysis_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="analysis-coordinator")
+        self._analysis_future: Future[PipelineAnalysisResult] | None = None
+        self._analysis_cancel: Event | None = None
+        self._analysis_active_request: PipelineAnalysisRequest | None = None
         self._enhancement_generation = 0
         self._enhancement_frame_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
         self._roi_region_mask_events: SimpleQueue[tuple[int, int, int, np.ndarray]] = SimpleQueue()
@@ -7163,7 +7204,7 @@ class ContrastWindow(QMainWindow):
             return
         live_input = self.active_mode == MODE_LIVE
         if not live_input and self.current_frame_index >= self.max_frame:
-            if self._enhancement_future is not None:
+            if self._background_pipeline_work_active():
                 return
             if self.loop_check.isChecked():
                 self.set_frame_index(0)
@@ -7240,6 +7281,9 @@ class ContrastWindow(QMainWindow):
     def _has_enabled_stage(self, stage_key: str) -> bool:
         return any(drawer.enable_button.isChecked() for drawer in self._stage_drawers(stage_key))
 
+    def _background_pipeline_work_active(self) -> bool:
+        return self._enhancement_future is not None or self._analysis_future is not None
+
     def _analysis_requirement_failure(self) -> str | None:
         roi_extraction_enabled = (
             self._has_enabled_stage("roi_extraction")
@@ -7308,7 +7352,7 @@ class ContrastWindow(QMainWindow):
             extraction_message = "Disabled. Enable this stage to extract aneurysm ROI masks from the current enhanced video."
             for drawer in roi_drawers:
                 drawer.set_status(extraction_message, analysis_enabled)
-        elif self._enhancement_future is not None:
+        elif self._background_pipeline_work_active():
             for drawer in roi_drawers:
                 drawer.set_status("Running ROI extraction on the current enhanced video...", False)
         else:
@@ -7341,7 +7385,7 @@ class ContrastWindow(QMainWindow):
             for drawer in alignment_drawers:
                 if not has_upstream_roi:
                     drawer.set_status("Move this stage after enabled aneurysm ROI extraction.", True)
-                elif self._enhancement_future is not None:
+                elif self._background_pipeline_work_active():
                     drawer.set_status("Measuring pre-injection ROI and needle baseline levels...", False)
                 else:
                     drawer.set_status("The narrower baseline range is aligned to the wider-range video.", False)
@@ -7354,7 +7398,7 @@ class ContrastWindow(QMainWindow):
             if failure is not None:
                 for drawer in analysis_drawers:
                     drawer.set_status(failure, True)
-            elif self._enhancement_future is not None:
+            elif self._background_pipeline_work_active():
                 for drawer in analysis_drawers:
                     drawer.set_status("Waiting for upstream ROI extraction to finish.", False)
             else:
@@ -7364,7 +7408,7 @@ class ContrastWindow(QMainWindow):
         if not frame_brightness_enabled:
             for drawer in frame_brightness_drawers:
                 drawer.set_status(None)
-        elif self._enhancement_future is not None:
+        elif self._background_pipeline_work_active():
             for drawer in frame_brightness_drawers:
                 drawer.set_status("Waiting for enhanced video frames.", False)
         else:
@@ -7374,7 +7418,7 @@ class ContrastWindow(QMainWindow):
         if not needle_enabled:
             for drawer in needle_drawers:
                 drawer.set_status(None)
-        elif self._enhancement_future is not None:
+        elif self._background_pipeline_work_active():
             for drawer in needle_drawers:
                 drawer.set_status("Waiting for enhanced video frames.", False)
         else:
@@ -7390,7 +7434,7 @@ class ContrastWindow(QMainWindow):
         if not temporal_change_enabled:
             for drawer in temporal_change_drawers:
                 drawer.set_status(None)
-        elif self._enhancement_future is not None:
+        elif self._background_pipeline_work_active():
             for drawer in temporal_change_drawers:
                 drawer.set_status("Waiting for enhanced video frames.", False)
         else:
@@ -7413,7 +7457,7 @@ class ContrastWindow(QMainWindow):
         self._update_stage_statuses()
         ready = all(panel.roi() and panel.roi_mask() is not None for panel in self.panels)
         if ready:
-            if self._has_enabled_stage("roi_residence_analysis") and self._enhancement_future is None:
+            if self._has_enabled_stage("roi_residence_analysis") and not self._background_pipeline_work_active():
                 if self.run_analysis():
                     return
             self.statusBar().showMessage(
@@ -8203,7 +8247,10 @@ class ContrastWindow(QMainWindow):
             roi_parameters_by_panel=tuple(self._roi_parameters_for_panel(index) for index in range(len(self.panels))),
         )
         self._enhancement_pending_request = request
-        if self._enhancement_cancel is not None:
+        if self._analysis_cancel is not None:
+            self._analysis_cancel.set()
+            self.enhancement_progress.begin("Updating enhancement settings...")
+        elif self._enhancement_cancel is not None:
             self._enhancement_cancel.set()
             self.enhancement_progress.begin("Updating enhancement settings...")
         else:
@@ -8479,7 +8526,480 @@ class ContrastWindow(QMainWindow):
                     cancel_event.set()
         return all(prepared)
 
+    def _analysis_heatmap_colormap(self) -> str:
+        active_drawer = next(
+            (
+                drawer
+                for drawer in self._stage_drawers("temporal_change_heatmap")
+                if drawer.enable_button.isChecked()
+            ),
+            None,
+        )
+        combo = active_drawer.findChild(QComboBox, "heatmapColormap") if active_drawer is not None else None
+        return str(combo.currentData()) if combo is not None else "hot"
+
+    def _build_pipeline_analysis_request(
+        self,
+        *,
+        roi_residence: bool,
+        frame_brightness: bool,
+        needle_segmentation: bool,
+        temporal_change: bool,
+    ) -> PipelineAnalysisRequest | None:
+        stages = self.enhancement_stages()
+        parameters = self.enhancement_parameters()
+        backend_id = self._current_backend_id(stages)
+        snapshots: list[AnalysisPanelSnapshot] = []
+        for panel_index, panel in enumerate(self.panels):
+            panel_stages = self._stages_for_roi_parameters(
+                stages,
+                self._roi_parameters_for_panel(panel_index),
+            )
+            encoded_frames = panel.encoded_analysis_frames(
+                backend_id,
+                self.denoise_strength_spin.value(),
+                panel_stages,
+                parameters,
+            )
+            sequence_key = panel._sequence_key(
+                panel_stages,
+                backend_id,
+                self.denoise_strength_spin.value(),
+                parameters,
+            )
+            if encoded_frames is None and panel._frame_sequence_key(sequence_key):
+                return None
+            source_frames = panel.source_gray_frames
+            if encoded_frames is None and source_frames is None:
+                return None
+            if frame_brightness and source_frames is None:
+                return None
+            roi = panel.roi()
+            roi_mask = panel.roi_mask()
+            snapshots.append(
+                AnalysisPanelSnapshot(
+                    label=panel.label,
+                    path=panel.path,
+                    fps=panel.info.fps,
+                    roi=None if roi is None else QRect(roi),
+                    roi_mask=None if roi_mask is None else roi_mask.copy(),
+                    camera_view_mask=(
+                        None
+                        if getattr(panel, "camera_view_mask", None) is None
+                        else panel.camera_view_mask.copy()
+                    ),
+                    encoded_frames=None if encoded_frames is None else tuple(encoded_frames),
+                    source_frames=None if source_frames is None else tuple(source_frames),
+                )
+            )
+
+        return PipelineAnalysisRequest(
+            generation=self._enhancement_generation,
+            panels=tuple(snapshots),
+            threshold=self.threshold_spin.value(),
+            gain_corrected=(
+                stages.brightness_stabilization
+                or stages.roi_needle_level_alignment
+                or stages.gain_stabilization
+                or self._has_enabled_stage("contrast_gain_alignment")
+            ),
+            roi_residence=roi_residence,
+            frame_brightness=frame_brightness,
+            needle_segmentation=needle_segmentation,
+            temporal_change=temporal_change,
+            heatmap_colormap=self._analysis_heatmap_colormap(),
+        )
+
+    def _start_pipeline_analysis(
+        self,
+        *,
+        roi_residence: bool,
+        frame_brightness: bool,
+        needle_segmentation: bool,
+        temporal_change: bool,
+    ) -> bool:
+        if not self.panels or self._enhancement_future is not None or self._analysis_future is not None:
+            return False
+        if roi_residence and self._analysis_requirement_failure() is not None:
+            roi_residence = False
+        if not any((roi_residence, frame_brightness, needle_segmentation, temporal_change)):
+            return False
+        request = self._build_pipeline_analysis_request(
+            roi_residence=roi_residence,
+            frame_brightness=frame_brightness,
+            needle_segmentation=needle_segmentation,
+            temporal_change=temporal_change,
+        )
+        if request is None:
+            return False
+
+        self.pause()
+        self._enhancement_pending_request = None
+        self._analysis_active_request = request
+        self._analysis_cancel = Event()
+        values: list[float] = []
+        totals: list[float] = []
+        for panel in request.panels:
+            frame_count = len(panel.encoded_frames or panel.source_frames or ())
+            decode_passes = int(panel.encoded_frames is not None)
+            analysis_passes = (
+                int(request.roi_residence)
+                + int(request.frame_brightness)
+                + int(request.needle_segmentation)
+                + int(request.temporal_change) * 2
+            )
+            values.append(0.0)
+            totals.append(float(max(1, frame_count * (decode_passes + analysis_passes))))
+        with self._enhancement_progress_lock:
+            self._enhancement_progress_values = values
+            self._enhancement_progress_totals = totals
+            self._enhancement_stage_messages = ["Preparing analysis"] * len(request.panels)
+            self._enhancement_message = "Running video analysis..."
+        self.open_pre_action.setEnabled(False)
+        self.open_post_action.setEnabled(False)
+        self.open_single_mode_action.setEnabled(False)
+        self.open_comparison_mode_action.setEnabled(False)
+        self.load_config_action.setEnabled(False)
+        self.enhancement_progress.begin("Running video analysis...")
+        self._analysis_future = self._analysis_executor.submit(
+            self._run_pipeline_analysis,
+            request,
+            self._analysis_cancel,
+        )
+        self.enhancement_poll_timer.start()
+        self._update_stage_statuses()
+        return True
+
+    def _run_pipeline_analysis(
+        self,
+        request: PipelineAnalysisRequest,
+        cancel_event: Event,
+    ) -> PipelineAnalysisResult:
+        panel_outputs: dict[
+            str,
+            tuple[
+                AnalysisResult | None,
+                tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+                tuple[np.ndarray, np.ndarray] | None,
+                float | None,
+                np.ndarray | None,
+                tuple[np.ndarray, np.ndarray] | None,
+            ],
+        ] = {}
+
+        def process_panel(
+            panel_index: int,
+            panel: AnalysisPanelSnapshot,
+        ) -> tuple[
+            AnalysisResult | None,
+            tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+            tuple[np.ndarray, np.ndarray] | None,
+            float | None,
+            np.ndarray | None,
+            tuple[np.ndarray, np.ndarray] | None,
+        ]:
+            done = 0.0
+            frame_count = len(panel.encoded_frames or panel.source_frames or ())
+
+            def publish(stage: str, completed: float) -> None:
+                with self._enhancement_progress_lock:
+                    self._enhancement_stage_messages[panel_index] = stage
+                    self._enhancement_progress_values[panel_index] = completed
+                    self._enhancement_message = "Running video analysis..."
+
+            if panel.encoded_frames is not None:
+                gray_frames: list[np.ndarray] = []
+                publish("Decoding enhanced frames", done)
+                for encoded in panel.encoded_frames:
+                    if cancel_event.is_set():
+                        raise RuntimeError("Analysis cancelled")
+                    frame = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+                    if frame is None:
+                        raise ValueError(f"Could not decode an enhanced frame for {panel.label}.")
+                    gray_frames.append(frame)
+                    done += 1.0
+                    publish("Decoding enhanced frames", done)
+            else:
+                gray_frames = list(panel.source_frames or ())
+
+            roi_result: AnalysisResult | None = None
+            brightness_result: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+            needle_result: tuple[np.ndarray, np.ndarray] | None = None
+            needle_baseline: float | None = None
+            needle_mask: np.ndarray | None = None
+            temporal_result: tuple[np.ndarray, np.ndarray] | None = None
+
+            if request.roi_residence:
+                if panel.roi is None or panel.roi_mask is None:
+                    raise ValueError(f"ROI masks need review for {panel.label}.")
+                publish("Analyzing ROI residence", done)
+                roi_result = analyze_gray_frames(
+                    panel.label,
+                    panel.path,
+                    panel.fps,
+                    panel.roi,
+                    panel.roi_mask,
+                    gray_frames,
+                    request.threshold,
+                    request.gain_corrected,
+                    panel.camera_view_mask,
+                )
+                done += frame_count
+                publish("Analyzing ROI residence", done)
+
+            if request.frame_brightness:
+                publish("Measuring frame brightness", done)
+                source_frames = list(panel.source_frames or ())
+                brightness_count = min(len(source_frames), len(gray_frames))
+                if brightness_count == 0:
+                    raise ValueError(f"No frames are available for brightness analysis of {panel.label}.")
+                brightness_result = (
+                    np.arange(brightness_count, dtype=float) / panel.fps,
+                    average_frame_brightness(source_frames[:brightness_count], panel.camera_view_mask),
+                    average_frame_brightness(gray_frames[:brightness_count], panel.camera_view_mask),
+                )
+                done += frame_count
+                publish("Measuring frame brightness", done)
+
+            if request.needle_segmentation:
+                publish("Segmenting needle", done)
+                needle_mask = segment_pre_injection_needle(
+                    gray_frames,
+                    panel.fps,
+                    panel.camera_view_mask,
+                )
+                if needle_mask is not None:
+                    brightness = needle_average_brightness(gray_frames, needle_mask)
+                    pre_injection_count = min(
+                        len(brightness),
+                        max(
+                            1,
+                            detect_pre_injection_trim_start(
+                                gray_frames,
+                                panel.fps,
+                                camera_view_mask=panel.camera_view_mask,
+                            )
+                            + max(1, round(float(panel.fps) * 0.5)),
+                        ),
+                    )
+                    needle_result = (
+                        np.arange(len(gray_frames), dtype=float) / panel.fps,
+                        brightness,
+                    )
+                    needle_baseline = float(np.mean(brightness[:pre_injection_count]))
+                done += frame_count
+                publish("Segmenting needle", done)
+
+            if request.temporal_change:
+                publish("Computing contrast residence heatmap", done)
+                temporal_result = compute_temporal_change_summary(
+                    gray_frames,
+                    panel.fps,
+                    panel.camera_view_mask,
+                )
+                done += frame_count
+                publish("Computing contrast residence heatmap", done)
+
+            return (
+                roi_result,
+                brightness_result,
+                needle_result,
+                needle_baseline,
+                needle_mask,
+                temporal_result,
+            )
+
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(request.panels)),
+            thread_name_prefix="analysis-panel",
+        ) as executor:
+            futures = {
+                executor.submit(process_panel, panel_index, panel): panel
+                for panel_index, panel in enumerate(request.panels)
+            }
+            for future in as_completed(futures):
+                panel = futures[future]
+                panel_outputs[panel.label] = future.result()
+
+        roi_results = {
+            label: output[0]
+            for label, output in panel_outputs.items()
+            if output[0] is not None
+        }
+        normalized_roi_results = normalize_analysis_results(
+            cast(dict[str, AnalysisResult], roi_results),
+            request.threshold,
+        )
+        frame_brightness_results = {
+            label: output[1]
+            for label, output in panel_outputs.items()
+            if output[1] is not None
+        }
+        needle_brightness_results = {
+            label: output[2]
+            for label, output in panel_outputs.items()
+            if output[2] is not None
+        }
+        needle_brightness_baselines = {
+            label: output[3]
+            for label, output in panel_outputs.items()
+            if output[3] is not None
+        }
+        needle_masks = {
+            label: output[4]
+            for label, output in panel_outputs.items()
+        } if request.needle_segmentation else {}
+        temporal_change_results = {
+            label: output[5]
+            for label, output in panel_outputs.items()
+            if output[5] is not None
+        }
+        typed_temporal_results = cast(dict[str, tuple[np.ndarray, np.ndarray]], temporal_change_results)
+        temporal_change_heatmaps: dict[str, np.ndarray] = {}
+        if typed_temporal_results:
+            shared_scale = len(typed_temporal_results) > 1
+            burden_peak, contrast_peak = (
+                temporal_change_heatmap_peaks(typed_temporal_results)
+                if shared_scale
+                else (None, None)
+            )
+            for panel_index, panel in enumerate(request.panels):
+                summary = typed_temporal_results.get(panel.label)
+                if summary is None:
+                    continue
+                with self._enhancement_progress_lock:
+                    self._enhancement_stage_messages[panel_index] = "Rendering contrast residence heatmap"
+                temporal_change_heatmaps[panel.label] = render_temporal_change_heatmap(
+                    summary[0],
+                    summary[1],
+                    burden_peak,
+                    contrast_peak,
+                    colormap=request.heatmap_colormap,
+                )
+                with self._enhancement_progress_lock:
+                    self._enhancement_progress_values[panel_index] += len(
+                        panel.encoded_frames or panel.source_frames or ()
+                    )
+
+        return PipelineAnalysisResult(
+            generation=request.generation,
+            roi_results=normalized_roi_results,
+            frame_brightness_results=cast(
+                dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
+                frame_brightness_results,
+            ),
+            needle_brightness_results=cast(
+                dict[str, tuple[np.ndarray, np.ndarray]],
+                needle_brightness_results,
+            ),
+            needle_brightness_baselines=cast(dict[str, float], needle_brightness_baselines),
+            needle_masks=needle_masks,
+            temporal_change_results=typed_temporal_results,
+            temporal_change_heatmaps=temporal_change_heatmaps,
+        )
+
+    def _finish_background_pipeline_work(self) -> None:
+        self._set_video_controls_enabled(bool(self.panels))
+        self.open_single_mode_action.setEnabled(True)
+        self.open_comparison_mode_action.setEnabled(True)
+        self.load_config_action.setEnabled(True)
+        if self._enhancement_future is None and self._analysis_future is None:
+            self.enhancement_progress.finish()
+            self.enhancement_poll_timer.stop()
+
+    def _poll_analysis(self) -> None:
+        request = self._analysis_active_request
+        if request is not None and request.generation == self._enhancement_generation:
+            with self._enhancement_progress_lock:
+                values = list(self._enhancement_progress_values)
+                totals = list(self._enhancement_progress_totals)
+                stages = list(self._enhancement_stage_messages)
+                message = self._enhancement_message
+            self.enhancement_progress.message_label.setText(message)
+            self.enhancement_progress.set_progress(sum(values), sum(totals))
+            for panel_index in range(min(len(self.panels), len(values))):
+                self.enhancement_progress.set_panel_progress(
+                    panel_index,
+                    stages[panel_index],
+                    values[panel_index],
+                    totals[panel_index],
+                )
+
+        future = self._analysis_future
+        if future is None or not future.done():
+            return
+        completed_request = self._analysis_active_request
+        self._analysis_future = None
+        self._analysis_active_request = None
+        self._analysis_cancel = None
+        try:
+            analysis_result = future.result()
+            error: Exception | None = None
+        except Exception as exc:
+            analysis_result = None
+            error = exc
+            if completed_request is not None and completed_request.generation == self._enhancement_generation:
+                LOGGER.exception("Analysis pipeline failed")
+
+        if self._enhancement_pending_request is not None:
+            self._start_enhancement_request(self._enhancement_pending_request)
+            return
+        self._finish_background_pipeline_work()
+        if (
+            completed_request is None
+            or completed_request.generation != self._enhancement_generation
+            or analysis_result is None
+            or analysis_result.generation != self._enhancement_generation
+        ):
+            if error is not None and completed_request is not None and completed_request.generation == self._enhancement_generation:
+                self._update_stage_statuses()
+                QMessageBox.critical(self, "Analysis failed", str(error))
+            return
+
+        if completed_request.roi_residence:
+            self.results = analysis_result.roi_results
+            for panel, snapshot in zip(self.panels, completed_request.panels, strict=True):
+                panel.report_encoded_frames = (
+                    None if snapshot.encoded_frames is None else list(snapshot.encoded_frames)
+                )
+            self.refresh_plots_and_metrics()
+            self.export_action.setEnabled(bool(self.results))
+            self.export_button.setEnabled(bool(self.results))
+            comparison_ready = self.active_mode == MODE_COMPARISON and len(self.panels) == 2 and bool(self.results)
+            self.export_pdf_action.setEnabled(comparison_ready)
+            self.export_pdf_button.setEnabled(comparison_ready)
+        if completed_request.frame_brightness:
+            self.frame_brightness_results = analysis_result.frame_brightness_results
+            self.refresh_frame_brightness_plot()
+        if completed_request.needle_segmentation:
+            self.needle_brightness_results = analysis_result.needle_brightness_results
+            self.needle_brightness_baselines = analysis_result.needle_brightness_baselines
+            for panel in self.panels:
+                panel.set_needle_segmentation_mask(
+                    analysis_result.needle_masks.get(panel.label),
+                    self.current_frame_index,
+                )
+            self.refresh_needle_brightness_plot()
+        if completed_request.temporal_change:
+            self.temporal_change_results = analysis_result.temporal_change_results
+            for panel in self.panels:
+                panel.set_temporal_change_heatmap(
+                    analysis_result.temporal_change_heatmaps.get(panel.label)
+                )
+            self.temporal_change_view_check.setEnabled(
+                bool(self.temporal_change_results) and self.active_mode != MODE_LIVE
+            )
+            if self.temporal_change_view_check.isChecked():
+                for panel in self.panels:
+                    panel.set_temporal_change_display(True, self.current_frame_index)
+        self._update_stage_statuses()
+        self.statusBar().showMessage("Video enhancement and analysis complete.")
+
     def _poll_enhancement(self) -> None:
+        if self._analysis_future is not None:
+            self._poll_analysis()
+            if self._enhancement_future is None:
+                return
         changed_panels: set[int] = set()
         while True:
             try:
@@ -8568,18 +9088,14 @@ class ContrastWindow(QMainWindow):
             self._start_enhancement_request(self._enhancement_pending_request)
             return
 
-        self._set_video_controls_enabled(bool(self.panels))
-        self.open_single_mode_action.setEnabled(True)
-        self.open_comparison_mode_action.setEnabled(True)
-        self.load_config_action.setEnabled(True)
-        self.enhancement_progress.finish()
-        self.enhancement_poll_timer.stop()
         if completed_request is None or completed_request.generation != self._enhancement_generation:
+            self._finish_background_pipeline_work()
             return
         if error is not None:
             self.set_display_enhancement(False)
             self._set_playback_limit(self.source_max_frame)
             self._update_stage_statuses()
+            self._finish_background_pipeline_work()
             QMessageBox.critical(self, "Enhancement failed", str(error))
             return
         if prepared:
@@ -8598,31 +9114,31 @@ class ContrastWindow(QMainWindow):
                 panel.seek(self.current_frame_index)
             self.refresh_roi_needle_alignment_plot()
             self._update_stage_statuses()
-            roi_analysis_updated = self._has_enabled_stage("roi_residence_analysis") and self.run_analysis()
-            frame_brightness_updated = self._has_enabled_stage("frame_brightness_analysis") and self.run_frame_brightness_analysis()
-            needle_updated = self._has_enabled_stage("needle_segmentation") and self.run_needle_segmentation()
-            if self._has_enabled_stage("temporal_change_heatmap"):
-                self.run_temporal_change_heatmap()
-                return
-            if frame_brightness_updated:
-                return
-            if needle_updated:
-                return
-            if roi_analysis_updated:
+            analysis_started = self._start_pipeline_analysis(
+                roi_residence=self._has_enabled_stage("roi_residence_analysis"),
+                frame_brightness=self._has_enabled_stage("frame_brightness_analysis"),
+                needle_segmentation=self._has_enabled_stage("needle_segmentation"),
+                temporal_change=self._has_enabled_stage("temporal_change_heatmap"),
+            )
+            if analysis_started:
                 return
             failure = self._analysis_requirement_failure()
+            self._finish_background_pipeline_work()
             self.statusBar().showMessage(failure if failure is not None else "Video enhancement complete.")
         else:
             self.set_display_enhancement(False)
             self._set_playback_limit(self.source_max_frame)
             self._update_stage_statuses()
+            self._finish_background_pipeline_work()
 
     def _stop_enhancement_preview(self) -> None:
         self._enhancement_generation += 1
         self._enhancement_pending_request = None
         if self._enhancement_cancel is not None:
             self._enhancement_cancel.set()
-        else:
+        if self._analysis_cancel is not None:
+            self._analysis_cancel.set()
+        if self._enhancement_cancel is None and self._analysis_cancel is None:
             self._set_video_controls_enabled(bool(self.panels))
             self.open_single_mode_action.setEnabled(True)
             self.open_comparison_mode_action.setEnabled(True)
@@ -8638,7 +9154,7 @@ class ContrastWindow(QMainWindow):
             return
         if self.results:
             self.refresh_analysis_from_existing()
-        elif self._has_enabled_stage("roi_residence_analysis") and self._enhancement_future is None:
+        elif self._has_enabled_stage("roi_residence_analysis") and not self._background_pipeline_work_active():
             self.run_analysis()
 
     def run_analysis(self) -> bool:
@@ -8660,168 +9176,38 @@ class ContrastWindow(QMainWindow):
             self.statusBar().showMessage("ROI masks need review before ROI residence analysis can run.")
             return False
 
-        if self._enhancement_future is not None:
+        if self._background_pipeline_work_active():
             return False
-
-        self.pause()
-        stages = self.enhancement_stages()
-        parameters = self.enhancement_parameters()
-        backend_id = self._current_backend_id(stages)
-        threshold = self.threshold_spin.value()
-        gain_corrected = (
-            stages.brightness_stabilization
-            or stages.roi_needle_level_alignment
-            or stages.gain_stabilization
-            or self._has_enabled_stage("contrast_gain_alignment")
+        return self._start_pipeline_analysis(
+            roi_residence=True,
+            frame_brightness=False,
+            needle_segmentation=False,
+            temporal_change=False,
         )
 
-        results: dict[str, AnalysisResult] = {}
-        for panel in self.panels:
-            assert panel.roi() is not None
-            encoded_frames = panel.encoded_analysis_frames(backend_id, self.denoise_strength_spin.value(), stages, parameters)
-            gray_frames = panel.analysis_frames(backend_id, self.denoise_strength_spin.value(), stages, parameters)
-            if gray_frames is None:
-                return False
-            panel.report_encoded_frames = encoded_frames
-            results[panel.label] = analyze_gray_frames(
-                panel.label,
-                panel.path,
-                panel.info.fps,
-                panel.roi(),
-                panel.roi_mask(),
-                gray_frames,
-                threshold,
-                gain_corrected,
-                getattr(panel, "camera_view_mask", None),
-            )
-
-        self.results = normalize_analysis_results(results, threshold)
-        self.refresh_plots_and_metrics()
-        self.export_action.setEnabled(True)
-        self.export_button.setEnabled(True)
-        comparison_ready = self.active_mode == MODE_COMPARISON and len(self.panels) == 2
-        self.export_pdf_action.setEnabled(comparison_ready)
-        self.export_pdf_button.setEnabled(comparison_ready)
-        self._update_stage_statuses()
-        self.statusBar().showMessage("ROI residence analysis updated from the current enhanced pipeline output.")
-        return True
-
     def run_frame_brightness_analysis(self) -> bool:
-        if not self.panels or self._enhancement_future is not None:
-            return False
-
-        stages = self.enhancement_stages()
-        parameters = self.enhancement_parameters()
-        backend_id = self._current_backend_id(stages)
-        results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-        for panel in self.panels:
-            source_frames = panel.source_gray_frames
-            enhanced_frames = panel.analysis_frames(
-                backend_id,
-                self.denoise_strength_spin.value(),
-                stages,
-                parameters,
-            )
-            if source_frames is None or enhanced_frames is None:
-                return False
-            frame_count = min(len(source_frames), len(enhanced_frames))
-            if frame_count == 0:
-                return False
-            time = np.arange(frame_count, dtype=float) / panel.info.fps
-            results[panel.label] = (
-                time,
-                average_frame_brightness(source_frames[:frame_count], getattr(panel, "camera_view_mask", None)),
-                average_frame_brightness(enhanced_frames[:frame_count], getattr(panel, "camera_view_mask", None)),
-            )
-
-        self.frame_brightness_results = results
-        self.refresh_frame_brightness_plot()
-        self._update_stage_statuses()
-        self.statusBar().showMessage("Frame brightness analysis updated from the current enhanced pipeline output.")
-        return True
+        return self._start_pipeline_analysis(
+            roi_residence=False,
+            frame_brightness=True,
+            needle_segmentation=False,
+            temporal_change=False,
+        )
 
     def run_needle_segmentation(self) -> bool:
-        if not self.panels or self._enhancement_future is not None:
-            return False
-
-        stages = self.enhancement_stages()
-        parameters = self.enhancement_parameters()
-        backend_id = self._current_backend_id(stages)
-        results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        baselines: dict[str, float] = {}
-        for panel in self.panels:
-            enhanced_frames = panel.analysis_frames(
-                backend_id,
-                self.denoise_strength_spin.value(),
-                stages,
-                parameters,
-            )
-            if not enhanced_frames:
-                panel.set_needle_segmentation_mask(None, self.current_frame_index)
-                continue
-            mask = segment_pre_injection_needle(
-                enhanced_frames,
-                panel.info.fps,
-                getattr(panel, "camera_view_mask", None),
-            )
-            panel.set_needle_segmentation_mask(mask, self.current_frame_index)
-            if mask is None:
-                continue
-            time = np.arange(len(enhanced_frames), dtype=float) / panel.info.fps
-            brightness = needle_average_brightness(enhanced_frames, mask)
-            pre_injection_count = min(
-                len(brightness),
-                max(
-                    1,
-                    detect_pre_injection_trim_start(
-                        enhanced_frames,
-                        panel.info.fps,
-                        camera_view_mask=getattr(panel, "camera_view_mask", None),
-                    )
-                    + max(1, round(float(panel.info.fps) * 0.5)),
-                ),
-            )
-            results[panel.label] = (time, brightness)
-            baselines[panel.label] = float(np.mean(brightness[:pre_injection_count]))
-
-        self.needle_brightness_results = results
-        self.needle_brightness_baselines = baselines
-        self.refresh_needle_brightness_plot()
-        self._update_stage_statuses()
-        if results:
-            self.statusBar().showMessage("Needle segmentation and brightness analysis updated.")
-            return True
-        self.statusBar().showMessage("Needle segmentation did not find a single darkest connected region.")
-        return False
+        return self._start_pipeline_analysis(
+            roi_residence=False,
+            frame_brightness=False,
+            needle_segmentation=True,
+            temporal_change=False,
+        )
 
     def run_temporal_change_heatmap(self) -> bool:
-        if not self.panels or self._enhancement_future is not None:
-            return False
-
-        stages = self.enhancement_stages()
-        parameters = self.enhancement_parameters()
-        backend_id = self._current_backend_id(stages)
-        results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for panel in self.panels:
-            enhanced_frames = panel.analysis_frames(
-                backend_id,
-                self.denoise_strength_spin.value(),
-                stages,
-                parameters,
-            )
-            if enhanced_frames is None:
-                return False
-            results[panel.label] = compute_temporal_change_summary(
-                enhanced_frames,
-                panel.info.fps,
-                getattr(panel, "camera_view_mask", None),
-            )
-
-        self.temporal_change_results = results
-        self.refresh_temporal_change_views()
-        self._update_stage_statuses()
-        self.statusBar().showMessage("Contrast residence heatmap updated from the current enhanced pipeline output.")
-        return True
+        return self._start_pipeline_analysis(
+            roi_residence=False,
+            frame_brightness=False,
+            needle_segmentation=False,
+            temporal_change=True,
+        )
 
     def refresh_analysis_from_existing(self) -> None:
         if not self.results:
@@ -9176,8 +9562,11 @@ class ContrastWindow(QMainWindow):
     def export_pdf_report(self) -> None:
         if self.active_mode != MODE_COMPARISON or len(self.panels) != 2 or not self.results:
             return
-        if any(panel.temporal_change_heatmap is None for panel in self.panels) and not self.run_temporal_change_heatmap():
-            self.statusBar().showMessage("Comparison report export needs enhanced frames, heatmaps, and ROI residence results.")
+        if any(panel.temporal_change_heatmap is None for panel in self.panels):
+            if self.run_temporal_change_heatmap():
+                self.statusBar().showMessage("Building comparison heatmaps in the background. Export again when analysis completes.")
+            else:
+                self.statusBar().showMessage("Comparison report export needs enhanced frames, heatmaps, and ROI residence results.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Export comparison report PDF", str(ROOT / "contrast_comparison_report.pdf"), "PDF files (*.pdf)")
         if not path:
@@ -9501,7 +9890,10 @@ class ContrastWindow(QMainWindow):
         self.network_stream_poll_timer.stop()
         if self._enhancement_cancel is not None:
             self._enhancement_cancel.set()
+        if self._analysis_cancel is not None:
+            self._analysis_cancel.set()
         self._enhancement_executor.shutdown(wait=True, cancel_futures=True)
+        self._analysis_executor.shutdown(wait=True, cancel_futures=True)
         for panel in list(self.panels):
             panel.close()
         for denoiser in self.deep_denoisers.values():

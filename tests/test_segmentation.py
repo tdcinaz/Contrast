@@ -5,7 +5,7 @@ import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from queue import SimpleQueue
-from threading import Event
+from threading import Event, current_thread
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -162,16 +162,44 @@ class SegmentationTests(unittest.TestCase):
         panel = SimpleNamespace(
             label="Video",
             color=QColor("#38bdf8"),
+            path=Path("video.avi"),
             info=SimpleNamespace(fps=4.0),
-            analysis_frames=Mock(return_value=frames),
+            source_gray_frames=frames,
+            camera_view_mask=None,
+            enhance_display=False,
+            roi=Mock(return_value=None),
+            roi_mask=Mock(return_value=None),
+            encoded_analysis_frames=Mock(return_value=None),
+            _sequence_key=Mock(return_value=()),
+            _frame_sequence_key=Mock(return_value=()),
             set_needle_segmentation_mask=publish_mask,
         )
         window.panels = [panel]
         self.addCleanup(lambda: setattr(window, "panels", []))
+        worker_threads: list[str] = []
 
-        with patch.object(window, "_update_stage_statuses"):
+        def record_worker(*args, **kwargs):  # noqa: ANN002, ANN003
+            worker_threads.append(current_thread().name)
+            return segment_pre_injection_needle(*args, **kwargs)
+
+        with patch.object(window, "_update_stage_statuses"), patch.object(
+            main,
+            "segment_pre_injection_needle",
+            side_effect=record_worker,
+        ):
             self.assertTrue(window.run_needle_segmentation())
+            self.assertFalse(window.enhancement_progress.isHidden())
+            self.assertEqual(window._enhancement_progress_totals, [float(len(frames))])
+            future = window._analysis_future
+            self.assertIsNotNone(future)
+            assert future is not None
+            future.result(timeout=5.0)
+            publish_mask.assert_not_called()
+            self.assertEqual(window._enhancement_stage_messages, ["Segmenting needle"])
+            window._poll_analysis()
 
+        self.assertTrue(all(name.startswith("analysis-panel") for name in worker_threads))
+        self.assertTrue(window.enhancement_progress.isHidden())
         self.assertEqual(window.analysis_tabs.tabText(window.analysis_tabs.count() - 1), "Needle brightness")
         mask = publish_mask.call_args.args[0]
         self.assertIsNotNone(mask)
@@ -510,11 +538,10 @@ class SegmentationTests(unittest.TestCase):
             ContrastWindow.export_pdf_report(window)
 
         window.run_temporal_change_heatmap.assert_called_once_with()
-        self.assertEqual(render_report.call_count, 2)
-        self.assertEqual(render_report.call_args_list[0].args, (Path("comparison_screen.pdf"), panels, window.results, 1))
-        self.assertEqual(render_report.call_args_list[0].kwargs, {"print_optimized": False})
-        self.assertEqual(render_report.call_args_list[1].args, (Path("comparison_print.pdf"), panels, window.results, 1))
-        self.assertEqual(render_report.call_args_list[1].kwargs, {"print_optimized": True})
+        render_report.assert_not_called()
+        status_bar.showMessage.assert_called_once_with(
+            "Building comparison heatmaps in the background. Export again when analysis completes."
+        )
 
     def test_maximum_contrast_frame_uses_the_shared_signal_peak(self) -> None:
         results = {
@@ -1640,6 +1667,7 @@ class SegmentationTests(unittest.TestCase):
             _enhancement_generation=7,
             _enhancement_active_request=None,
             _enhancement_future=pending_future,
+            _analysis_future=None,
             panels=[panel],
             current_frame_index=0,
             _set_playback_limit=playback_limits.append,
@@ -1685,6 +1713,7 @@ class SegmentationTests(unittest.TestCase):
                 stages=SimpleNamespace(roi_extraction=True),
             ),
             _enhancement_future=pending_future,
+            _analysis_future=None,
             _enhancement_progress_lock=main.Lock(),
             _enhancement_progress_values=[0.0],
             _enhancement_progress_totals=[1.0],

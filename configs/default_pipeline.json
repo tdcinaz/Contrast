@@ -74,7 +74,12 @@
     },
     {
       "controls": {},
-      "enabled": false,
+      "enabled": true,
+      "key": "needle_segmentation"
+    },
+    {
+      "controls": {},
+      "enabled": true,
       "key": "roi_needle_level_alignment"
     },
     {
@@ -83,11 +88,6 @@
       },
       "enabled": true,
       "key": "roi_residence_analysis"
-    },
-    {
-      "controls": {},
-      "enabled": true,
-      "key": "needle_segmentation"
     }
   ],
   "version": 1
