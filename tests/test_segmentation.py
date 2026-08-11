@@ -48,6 +48,25 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_needle_mask_rejects_darker_compact_edge_artifact(self) -> None:
+        camera_view_mask = np.zeros((100, 120), dtype=np.uint8)
+        cv2.ellipse(camera_view_mask, (60, 50), (50, 42), 0, 0, 360, 1, thickness=-1)
+        camera_view_mask = cv2.erode(camera_view_mask, np.ones((5, 5), dtype=np.uint8)) > 0
+        frames: list[np.ndarray] = []
+        for frame_index in range(8):
+            frame = np.full(camera_view_mask.shape, 170, dtype=np.uint8)
+            cv2.rectangle(frame, (92, 35), (96, 72), 16 + frame_index, thickness=-1)
+            cv2.rectangle(frame, (116, 32), (119, 68), 1, thickness=-1)
+            frames.append(frame)
+
+        mask = segment_pre_injection_needle(frames, fps=4.0, camera_view_mask=camera_view_mask)
+
+        self.assertIsNotNone(mask)
+        assert mask is not None
+        self.assertEqual(mask[50, 94], 255)
+        self.assertEqual(mask[50, 118], 0)
+        self.assertFalse(np.any(mask[~camera_view_mask]))
+
     def test_needle_mask_uses_only_pre_injection_frames_and_tracks_full_video_brightness(self) -> None:
         frames: list[np.ndarray] = []
         for frame_index in range(12):
@@ -555,6 +574,33 @@ class SegmentationTests(unittest.TestCase):
         ]
 
         np.testing.assert_array_equal(average_frame_brightness(frames), np.asarray([3.0, 13.0]))
+
+    def test_camera_view_mask_excludes_border_from_brightness_and_temporal_analysis(self) -> None:
+        camera_view_mask = np.zeros((20, 20), dtype=bool)
+        camera_view_mask[3:17, 3:17] = True
+        frames = [np.full((20, 20), 180, dtype=np.uint8) for _ in range(6)]
+        frames[3][~camera_view_mask] = 0
+        frames[4][~camera_view_mask] = 0
+        frames[5][~camera_view_mask] = 0
+
+        brightness = average_frame_brightness(frames, camera_view_mask)
+        burden, peak = compute_temporal_change_summary(frames, fps=2.0, camera_view_mask=camera_view_mask)
+
+        np.testing.assert_array_equal(brightness, np.full(6, 180.0))
+        self.assertFalse(np.any(burden[~camera_view_mask]))
+        self.assertFalse(np.any(peak[~camera_view_mask]))
+        self.assertFalse(np.any(burden[camera_view_mask]))
+
+    def test_camera_view_mask_excludes_border_from_roi_reference(self) -> None:
+        gray = np.full((80, 80), 150, dtype=np.uint8)
+        gray[:8] = 0
+        camera_view_mask = np.ones(gray.shape, dtype=bool)
+        camera_view_mask[:8] = False
+        roi = QRect(25, 10, 20, 20)
+
+        reference = main.reference_mean(gray, roi, camera_view_mask=camera_view_mask)
+
+        self.assertEqual(reference, 150.0)
 
     def test_temporal_change_summary_emphasizes_persistent_dark_contrast(self) -> None:
         baseline = np.full((4, 4), 180, dtype=np.uint8)
@@ -1139,6 +1185,31 @@ class SegmentationTests(unittest.TestCase):
         assert raw_roi is not None
         assert roi is not None
         self.assertGreater(int(np.count_nonzero(roi.mask)), int(np.count_nonzero(raw_roi.mask)))
+
+    def test_softened_roi_remains_inside_camera_view(self) -> None:
+        frames: list[np.ndarray] = []
+        for index in range(8):
+            frame = np.full((96, 96), 180, dtype=np.uint8)
+            cv2.circle(frame, (18, 48), 14, 178 if index < 3 else 60, thickness=-1)
+            frames.append(frame)
+        camera_view_mask = np.ones((96, 96), dtype=bool)
+        camera_view_mask[:, :10] = False
+
+        roi = detect_aneurysm_roi(
+            frames,
+            fps=10.0,
+            camera_view_mask=camera_view_mask,
+            soften_mask=True,
+            soften_radius_ratio=0.25,
+            soften_threshold=0.10,
+        )
+
+        self.assertIsNotNone(roi)
+        assert roi is not None
+        full_mask = np.zeros(camera_view_mask.shape, dtype=bool)
+        x, y, width, height = roi.rect.getRect()
+        full_mask[y : y + height, x : x + width] = roi.mask
+        self.assertFalse(np.any(full_mask[~camera_view_mask]))
 
     def test_analysis_requirement_fails_without_upstream_roi_stage(self) -> None:
         window = SimpleNamespace(

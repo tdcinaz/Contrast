@@ -37,6 +37,7 @@ class FramePipelineExecutor:
                 target_median=context.target_median,
                 noise_sigma=stage.noise_sigma if stage.noise_sigma is not None else context.noise_sigma,
                 denoise_batch=context.denoise_batch,
+                camera_view_mask=context.camera_view_mask,
             )
             try:
                 output = definition.process_frame(output, parameters, stage_context)

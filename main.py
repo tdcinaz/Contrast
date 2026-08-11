@@ -426,6 +426,8 @@ class SourcePipelineState:
     detected_trim_start: int | None
     background_reference: np.ndarray | None
     configuration: tuple[object, ...]
+    camera_view_mask: np.ndarray | None = None
+    camera_field_mask: np.ndarray | None = None
     frame_brightness_onset: int | None = None
     comparison_sync_offset_frames: int = 0
     trim_end: int = 0
@@ -510,15 +512,27 @@ class AnalysisResult:
     auc: float
 
 
-def average_frame_brightness(frames: list[np.ndarray]) -> np.ndarray:
-    return np.asarray([float(np.mean(frame)) for frame in frames], dtype=float)
+def average_frame_brightness(
+    frames: list[np.ndarray],
+    camera_view_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    if camera_view_mask is None:
+        return np.asarray([float(np.mean(frame)) for frame in frames], dtype=float)
+    selected = camera_view_mask.astype(bool)
+    if not np.any(selected) or any(frame.shape != selected.shape for frame in frames):
+        raise ValueError("Frame brightness requires a non-empty camera-view mask matching the frames.")
+    return np.asarray([float(np.mean(frame[selected])) for frame in frames], dtype=float)
 
 
-def detect_fluoroscope_stabilization_frame(gray_frames: list[np.ndarray], fps: float) -> int:
+def detect_fluoroscope_stabilization_frame(
+    gray_frames: list[np.ndarray],
+    fps: float,
+    camera_view_mask: np.ndarray | None = None,
+) -> int:
     """Return the first frame after initial fluoroscope gain/offset settling."""
     if len(gray_frames) < 3:
         return 0
-    levels = np.asarray([float(np.mean(frame)) for frame in gray_frames], dtype=float)
+    levels = average_frame_brightness(gray_frames, camera_view_mask)
     scan_count = min(len(levels), max(3, round(max(fps, 1.0) * 8.0)))
     startup_levels = levels[:scan_count]
     reference_window = max(3, round(max(fps, 1.0)))
@@ -631,16 +645,26 @@ def detect_pre_injection_trim_start(
     gray_frames: list[np.ndarray],
     fps: float,
     gain_normalization_enabled: bool = True,
+    camera_view_mask: np.ndarray | None = None,
 ) -> int:
     if len(gray_frames) < 3:
         return 0
 
     if gain_normalization_enabled:
-        target_median = float(np.median([np.median(gray) for gray in gray_frames]))
-        source_frames = [stabilize_frame_gain(gray, target_median, 0.70, 1.45) for gray in gray_frames]
+        selected = None if camera_view_mask is None else camera_view_mask.astype(bool)
+        target_median = float(
+            np.median([
+                np.median(gray) if selected is None else np.median(gray[selected])
+                for gray in gray_frames
+            ])
+        )
+        source_frames = [
+            stabilize_frame_gain(gray, target_median, 0.70, 1.45, camera_view_mask)
+            for gray in gray_frames
+        ]
     else:
         source_frames = gray_frames
-    signals = average_frame_brightness(source_frames)
+    signals = average_frame_brightness(source_frames, camera_view_mask)
     smoothed = smooth_temporal_signal(signals, fps)
     baseline_window = min(len(smoothed), max(3, round(fps * 1.5)))
     baseline = float(np.median(smoothed[:baseline_window]))
@@ -666,10 +690,14 @@ def detect_pre_injection_trim_start(
     return max(0, onset_index - round(fps * 0.5))
 
 
-def detect_frame_brightness_onset(gray_frames: list[np.ndarray], fps: float) -> int | None:
+def detect_frame_brightness_onset(
+    gray_frames: list[np.ndarray],
+    fps: float,
+    camera_view_mask: np.ndarray | None = None,
+) -> int | None:
     if len(gray_frames) < 3:
         return None
-    brightness = smooth_temporal_signal(average_frame_brightness(gray_frames), fps)
+    brightness = smooth_temporal_signal(average_frame_brightness(gray_frames, camera_view_mask), fps)
     baseline_window = min(len(brightness), max(3, round(fps * 1.5)))
     baseline = float(np.median(brightness[:baseline_window]))
     baseline_noise = float(np.median(np.abs(brightness[:baseline_window] - baseline)))
@@ -681,8 +709,12 @@ def detect_frame_brightness_onset(gray_frames: list[np.ndarray], fps: float) -> 
     return None
 
 
-def _detect_aligned_field_crop(gray_frames: list[np.ndarray]) -> QRect | None:
+def _detect_fluoroscope_field_mask(gray_frames: list[np.ndarray]) -> np.ndarray | None:
+    if not gray_frames:
+        return None
     height, width = gray_frames[0].shape
+    if any(frame.shape != (height, width) for frame in gray_frames):
+        return None
     temporal_level = np.percentile(np.stack(gray_frames, axis=0), 75, axis=0).astype(np.uint8)
     center = temporal_level[height // 3 : height * 2 // 3, width // 3 : width * 2 // 3]
     edge_depth = max(4, min(height, width) // 32)
@@ -724,9 +756,56 @@ def _detect_aligned_field_crop(gray_frames: list[np.ndarray]) -> QRect | None:
     if field_area < width * height * 0.2 or not 0.55 <= fill_fraction <= 0.90:
         return None
 
-    component_mask = (labels == component).astype(np.uint8)
+    return (labels == component).astype(np.uint8)
+
+
+def camera_view_mask_for_crop(
+    field_mask: np.ndarray | None,
+    crop_rect: QRect,
+    edge_margin_ratio: float = 0.01,
+) -> np.ndarray:
+    shape = (max(1, crop_rect.height()), max(1, crop_rect.width()))
+    if field_mask is None:
+        fallback = np.zeros(shape, dtype=np.uint8)
+        cv2.ellipse(
+            fallback,
+            (shape[1] // 2, shape[0] // 2),
+            (max(1, shape[1] // 2 - 2), max(1, shape[0] // 2 - 2)),
+            0,
+            0,
+            360,
+            1,
+            thickness=-1,
+        )
+        return fallback.astype(bool)
+    padded = np.pad((field_mask > 0).astype(np.uint8), 1, mode="constant")
+    field_distance = cv2.distanceTransform(padded, cv2.DIST_L2, 5)[1:-1, 1:-1]
+    cropped_distance = crop_frame(field_distance, crop_rect)
+    if cropped_distance.shape != shape:
+        return np.ones(shape, dtype=bool)
+    edge_margin = max(2.0, min(shape) * max(0.0, float(edge_margin_ratio)))
+    interior = cropped_distance > edge_margin
+    if np.any(interior):
+        return interior
+    return crop_frame(field_mask, crop_rect).astype(bool)
+
+
+def _detect_aligned_field_crop(gray_frames: list[np.ndarray]) -> QRect | None:
+    component_mask = _detect_fluoroscope_field_mask(gray_frames)
+    if component_mask is None:
+        return None
+    return _aligned_field_crop_from_mask(component_mask)
+
+
+def _aligned_field_crop_from_mask(component_mask: np.ndarray) -> QRect | None:
+    height, width = component_mask.shape
+
     distance = cv2.distanceTransform(component_mask, cv2.DIST_L2, 5)
     center_y, center_x = np.unravel_index(int(np.argmax(distance)), distance.shape)
+    points = cv2.findNonZero(component_mask)
+    if points is None:
+        return None
+    _field_x, _field_y, field_width, field_height = cv2.boundingRect(points)
     alignment = 32
     maximum_size = min(field_width, field_height) // alignment * alignment
     minimum_size = max(alignment, int(min(width, height) * 0.45) // alignment * alignment)
@@ -789,9 +868,33 @@ def detect_fluoroscope_crop_from_frames(
     width: int,
     height: int,
 ) -> QRect:
-    if len(gray_frames) < 3:
-        return QRect(0, 0, width, height)
-    return _detect_aligned_field_crop(gray_frames) or _detect_pillarbox_crop(gray_frames, width, height)
+    return detect_fluoroscope_geometry_from_frames(gray_frames, width, height)[0]
+
+
+def detect_fluoroscope_geometry_from_frames(
+    gray_frames: list[np.ndarray],
+    width: int,
+    height: int,
+) -> tuple[QRect, np.ndarray]:
+    full_frame = QRect(0, 0, width, height)
+    field_mask = _detect_fluoroscope_field_mask(gray_frames) if gray_frames else None
+    field_crop = _aligned_field_crop_from_mask(field_mask) if field_mask is not None else None
+    if field_crop is not None:
+        return field_crop, field_mask.astype(bool)
+    pillarbox_crop = _detect_pillarbox_crop(gray_frames, width, height) if gray_frames else full_frame
+    fallback_mask = np.zeros((height, width), dtype=np.uint8)
+    x, y, crop_width, crop_height = pillarbox_crop.getRect()
+    cv2.ellipse(
+        fallback_mask,
+        (x + crop_width // 2, y + crop_height // 2),
+        (max(1, crop_width // 2 - 2), max(1, crop_height // 2 - 2)),
+        0,
+        0,
+        360,
+        1,
+        thickness=-1,
+    )
+    return pillarbox_crop, fallback_mask.astype(bool)
 
 
 def detect_fluoroscope_crop(
@@ -799,13 +902,21 @@ def detect_fluoroscope_crop(
     info: VideoInfo,
     progress_callback: Callable[[int, int], bool] | None = None,
 ) -> QRect:
+    return detect_fluoroscope_geometry(path, info, progress_callback)[0]
+
+
+def detect_fluoroscope_geometry(
+    path: Path,
+    info: VideoInfo,
+    progress_callback: Callable[[int, int], bool] | None = None,
+) -> tuple[QRect, np.ndarray]:
     full_frame = QRect(0, 0, info.width, info.height)
     if info.width <= 0 or info.height <= 0:
-        return full_frame
+        return full_frame, np.ones((max(1, info.height), max(1, info.width)), dtype=bool)
 
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
-        return full_frame
+        return full_frame, np.ones((info.height, info.width), dtype=bool)
 
     try:
         sample_count = min(24, max(6, info.frame_count if info.frame_count > 0 else 6))
@@ -818,9 +929,9 @@ def detect_fluoroscope_crop(
                 continue
             gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
             if progress_callback is not None and not progress_callback(sample_index + 1, len(frame_indexes)):
-                return full_frame
+                return full_frame, np.ones((info.height, info.width), dtype=bool)
 
-        return detect_fluoroscope_crop_from_frames(gray_frames, info.width, info.height)
+        return detect_fluoroscope_geometry_from_frames(gray_frames, info.width, info.height)
     finally:
         capture.release()
 
@@ -838,7 +949,26 @@ def crop_frame(frame: np.ndarray, crop_rect: QRect) -> np.ndarray:
     return frame[y:y2, x:x2]
 
 
-def estimate_video_median(path: Path, crop_rect: QRect, start_frame: int, frame_count: int) -> float:
+def sanitize_camera_view(frame: np.ndarray, camera_view_mask: np.ndarray | None) -> np.ndarray:
+    if camera_view_mask is None:
+        return frame
+    selected = camera_view_mask.astype(bool)
+    if selected.shape != frame.shape or not np.any(selected):
+        raise ValueError("Camera-view sanitization requires a non-empty mask matching the frame.")
+    if np.all(selected):
+        return frame
+    sanitized = frame.copy()
+    sanitized[~selected] = np.median(frame[selected])
+    return sanitized
+
+
+def estimate_video_median(
+    path: Path,
+    crop_rect: QRect,
+    start_frame: int,
+    frame_count: int,
+    camera_view_mask: np.ndarray | None = None,
+) -> float:
     capture = cv2.VideoCapture(str(path))
     try:
         medians: list[float] = []
@@ -850,7 +980,8 @@ def estimate_video_median(path: Path, crop_rect: QRect, start_frame: int, frame_
             ok, frame = capture.read()
             if ok:
                 gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
-                medians.append(float(np.median(gray)))
+                pixels = gray.ravel() if camera_view_mask is None else gray[camera_view_mask.astype(bool)]
+                medians.append(float(np.median(pixels)))
         return float(np.median(medians)) if medians else 128.0
     finally:
         capture.release()
@@ -862,6 +993,7 @@ def estimate_video_contrast_response(
     start_frame: int,
     frame_count: int,
     fps: float,
+    camera_view_mask: np.ndarray | None = None,
 ) -> tuple[float, float]:
     capture = cv2.VideoCapture(str(path))
     try:
@@ -871,6 +1003,7 @@ def estimate_video_contrast_response(
             ok, frame = capture.read()
             if ok:
                 gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
+                gray = sanitize_camera_view(gray, camera_view_mask)
                 signals.append(_contrast_frame_signal(gray))
             else:
                 break
@@ -884,7 +1017,13 @@ def estimate_video_contrast_response(
         capture.release()
 
 
-def estimate_video_histogram(path: Path, crop_rect: QRect, start_frame: int, frame_count: int) -> np.ndarray:
+def estimate_video_histogram(
+    path: Path,
+    crop_rect: QRect,
+    start_frame: int,
+    frame_count: int,
+    camera_view_mask: np.ndarray | None = None,
+) -> np.ndarray:
     capture = cv2.VideoCapture(str(path))
     try:
         histogram = np.zeros(256, dtype=np.int64)
@@ -894,14 +1033,22 @@ def estimate_video_histogram(path: Path, crop_rect: QRect, start_frame: int, fra
             ok, frame = capture.read()
             if ok:
                 gray = cv2.cvtColor(crop_frame(frame, crop_rect), cv2.COLOR_BGR2GRAY)
-                histogram += np.bincount(gray.ravel(), minlength=256)
+                pixels = gray.ravel() if camera_view_mask is None else gray[camera_view_mask.astype(bool)]
+                histogram += np.bincount(pixels, minlength=256)
         return histogram
     finally:
         capture.release()
 
 
-def stabilize_frame_gain(gray: np.ndarray, target_median: float, min_gain: float, max_gain: float) -> np.ndarray:
-    current_median = max(1.0, float(np.median(gray)))
+def stabilize_frame_gain(
+    gray: np.ndarray,
+    target_median: float,
+    min_gain: float,
+    max_gain: float,
+    camera_view_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    pixels = gray.ravel() if camera_view_mask is None else gray[camera_view_mask.astype(bool)]
+    current_median = max(1.0, float(np.median(pixels)))
     gain = float(np.clip(target_median / current_median, min_gain, max_gain))
     return np.clip(gray.astype(np.float32) * gain, 0, 255)
 
@@ -946,6 +1093,7 @@ def estimate_intensity_corrections(
     gray_frames: list[np.ndarray],
     analysis_size: int = 192,
     quantile_count: int = 48,
+    camera_view_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not gray_frames:
         return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
@@ -954,11 +1102,21 @@ def estimate_intensity_corrections(
     scale = min(1.0, float(analysis_size) / max(frame_height, frame_width))
     analysis_width = max(16, int(round(frame_width * scale)))
     analysis_height = max(16, int(round(frame_height * scale)))
+    analysis_mask = None
+    if camera_view_mask is not None:
+        if camera_view_mask.shape != (frame_height, frame_width) or not np.any(camera_view_mask):
+            raise ValueError("Brightness stabilization requires a non-empty camera-view mask matching the frames.")
+        analysis_mask = cv2.resize(
+            camera_view_mask.astype(np.uint8),
+            (analysis_width, analysis_height),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
     percentiles = np.linspace(70.0, 98.0, num=max(24, quantile_count), dtype=np.float32)
     frame_quantiles = np.empty((len(gray_frames), percentiles.size), dtype=np.float32)
     for index, frame in enumerate(gray_frames):
         analysis_frame = cv2.resize(frame, (analysis_width, analysis_height), interpolation=cv2.INTER_AREA)
-        frame_quantiles[index] = np.percentile(analysis_frame, percentiles)
+        pixels = analysis_frame.ravel() if analysis_mask is None else analysis_frame[analysis_mask]
+        frame_quantiles[index] = np.percentile(pixels, percentiles)
 
     reference_quantiles = np.median(frame_quantiles, axis=0)
     gains = np.empty(len(gray_frames), dtype=np.float32)
@@ -1060,7 +1218,10 @@ ROI_VESSEL_LABEL = 96
 ROI_ANEURYSM_LABEL = 224
 
 
-def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
+def compute_temporal_change_map(
+    gray_frames: list[np.ndarray],
+    camera_view_mask: np.ndarray | None = None,
+) -> np.ndarray:
     if not gray_frames:
         return np.zeros((1, 1), dtype=np.float32)
 
@@ -1072,21 +1233,33 @@ def compute_temporal_change_map(gray_frames: list[np.ndarray]) -> np.ndarray:
     baseline_count = min(len(source_frames) - 1, max(3, min(24, len(source_frames) // 8)))
     baseline = np.percentile(stack[:baseline_count], 75.0, axis=0)
     darkest = np.percentile(stack, 10.0, axis=0)
-    return np.clip(baseline - darkest, 0.0, None)
+    temporal_change = np.clip(baseline - darkest, 0.0, None)
+    if camera_view_mask is not None:
+        if camera_view_mask.shape != temporal_change.shape:
+            raise ValueError("Temporal segmentation requires a camera-view mask matching the frames.")
+        temporal_change[~camera_view_mask.astype(bool)] = 0.0
+    return temporal_change
 
 
-def detect_stationary_metal_mask(gray_frames: list[np.ndarray]) -> np.ndarray | None:
+def detect_stationary_metal_mask(
+    gray_frames: list[np.ndarray],
+    camera_view_mask: np.ndarray | None = None,
+) -> np.ndarray | None:
     """Find persistent dark metal objects while rejecting moving dark contrast."""
     if len(gray_frames) < 3:
         return None
     shape = gray_frames[0].shape
     if any(frame.shape != shape for frame in gray_frames):
         raise ValueError("Metal needle detection requires consistently sized frames.")
+    if camera_view_mask is not None and camera_view_mask.shape != shape:
+        raise ValueError("Metal needle detection requires a camera-view mask matching the frames.")
 
     stack = np.stack(gray_frames, axis=0).astype(np.float32)
     median_intensity = np.median(stack, axis=0)
     mean_frame_change = np.mean(np.abs(np.diff(stack, axis=0)), axis=0)
     candidates = ((median_intensity <= 40.0) & (mean_frame_change <= 5.0)).astype(np.uint8)
+    if camera_view_mask is not None:
+        candidates &= camera_view_mask.astype(np.uint8)
     component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(candidates, connectivity=8)
     mask = np.zeros(shape, dtype=np.uint8)
     for label in range(1, component_count):
@@ -1097,38 +1270,66 @@ def detect_stationary_metal_mask(gray_frames: list[np.ndarray]) -> np.ndarray | 
             mask[labels == label] = 255
     if not np.any(mask):
         return None
-    return cv2.dilate(mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
+    mask = cv2.dilate(mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
+    if camera_view_mask is not None:
+        mask[~camera_view_mask.astype(bool)] = 0
+    return mask if np.any(mask) else None
 
 
-def segment_pre_injection_needle(gray_frames: list[np.ndarray], fps: float) -> np.ndarray | None:
+def segment_pre_injection_needle(
+    gray_frames: list[np.ndarray],
+    fps: float,
+    camera_view_mask: np.ndarray | None = None,
+) -> np.ndarray | None:
     """Segment the single darkest connected region using only pre-injection frames."""
     if len(gray_frames) < 3:
         return None
     shape = gray_frames[0].shape
     if any(frame.shape != shape for frame in gray_frames):
         raise ValueError("Needle segmentation requires consistently sized frames.")
+    if camera_view_mask is not None and camera_view_mask.shape != shape:
+        raise ValueError("Needle segmentation requires a camera-view mask matching the frames.")
 
     pre_injection_count = min(
         len(gray_frames),
-        max(3, detect_pre_injection_trim_start(gray_frames, fps) + max(1, round(float(fps) * 0.5))),
+        max(
+            3,
+            detect_pre_injection_trim_start(
+                gray_frames,
+                fps,
+                camera_view_mask=camera_view_mask,
+            )
+            + max(1, round(float(fps) * 0.5)),
+        ),
     )
     temporal_median = np.median(
         np.stack(gray_frames[:pre_injection_count], axis=0),
         axis=0,
     ).astype(np.uint8)
+    valid_pixels = (
+        temporal_median[camera_view_mask.astype(bool)]
+        if camera_view_mask is not None
+        else temporal_median.ravel()
+    )
+    if valid_pixels.size == 0:
+        return None
     otsu_threshold, _ = cv2.threshold(
-        temporal_median,
+        valid_pixels,
         0,
         255,
         cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
     )
-    darkest_level = float(np.percentile(temporal_median, 0.5))
+    darkest_level = float(np.percentile(valid_pixels, 0.5))
     candidates = (temporal_median <= min(float(otsu_threshold), darkest_level)).astype(np.uint8)
+    if camera_view_mask is not None:
+        candidates &= camera_view_mask.astype(np.uint8)
     candidates = cv2.morphologyEx(
         candidates,
         cv2.MORPH_CLOSE,
         np.ones((3, 3), dtype=np.uint8),
     )
+    if camera_view_mask is not None:
+        candidates &= camera_view_mask.astype(np.uint8)
 
     component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(candidates, connectivity=8)
     minimum_area = max(8, round(temporal_median.size * 0.00002))
@@ -1176,6 +1377,7 @@ def needle_average_brightness(gray_frames: list[np.ndarray], mask: np.ndarray) -
 def compute_temporal_change_summary(
     gray_frames: list[np.ndarray],
     fps: float,
+    camera_view_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return time-integrated dark contrast and peak darkening for every pixel."""
     if not gray_frames:
@@ -1188,12 +1390,15 @@ def compute_temporal_change_summary(
     if len(gray_frames) == 1:
         empty = np.zeros(shape, dtype=np.float32)
         return empty, empty
+    selected = np.ones(shape, dtype=bool) if camera_view_mask is None else camera_view_mask.astype(bool)
+    if selected.shape != shape or not np.any(selected):
+        raise ValueError("Contrast residence analysis requires a non-empty camera-view mask matching the frames.")
 
     baseline_count = min(len(gray_frames) - 1, max(3, round(max(float(fps), 1.0) * 0.75)))
 
     # Remove frame-wide fluoroscope gain changes before measuring local darkening.
     baseline_source = [np.clip(frame, 0, 255).astype(np.float32) for frame in gray_frames[:baseline_count]]
-    baseline_levels = np.asarray([np.median(frame) for frame in baseline_source], dtype=np.float32)
+    baseline_levels = np.asarray([np.median(frame[selected]) for frame in baseline_source], dtype=np.float32)
     baseline_level = float(np.median(baseline_levels))
     baseline_frames = np.stack(
         [
@@ -1210,8 +1415,9 @@ def compute_temporal_change_summary(
     peak_contrast = np.zeros(shape, dtype=np.float32)
     for frame in gray_frames[baseline_count:]:
         source = np.clip(frame, 0, 255).astype(np.float32)
-        corrected = np.clip(source + (baseline_level - float(np.median(source))), 0.0, 255.0)
+        corrected = np.clip(source + (baseline_level - float(np.median(source[selected]))), 0.0, 255.0)
         dark_contrast = np.clip(baseline - corrected - noise_floor, 0.0, None).astype(np.float32)
+        dark_contrast[~selected] = 0.0
         contrast_burden += dark_contrast
         np.maximum(peak_contrast, dark_contrast, out=peak_contrast)
     contrast_burden /= max(float(fps), 1e-6)
@@ -1285,6 +1491,7 @@ def detect_aneurysm_roi(
     gray_frames: list[np.ndarray],
     fps: float,
     *,
+    camera_view_mask: np.ndarray | None = None,
     soften_mask: bool = False,
     soften_radius_ratio: float = 0.12,
     soften_threshold: float = 0.10,
@@ -1298,6 +1505,9 @@ def detect_aneurysm_roi(
     height, width = gray_frames[0].shape
     if height < 16 or width < 16 or any(frame.shape != (height, width) for frame in gray_frames):
         return None
+    valid_camera_pixels = np.ones((height, width), dtype=bool) if camera_view_mask is None else camera_view_mask.astype(bool)
+    if valid_camera_pixels.shape != (height, width) or not np.any(valid_camera_pixels):
+        return None
 
     baseline_count = min(len(gray_frames) - 1, max(3, round(max(1.0, fps) * 0.6)))
     temporal_indexes = np.linspace(
@@ -1307,7 +1517,7 @@ def detect_aneurysm_roi(
         dtype=int,
     )
     sample_indexes = np.unique(np.concatenate((np.arange(baseline_count), temporal_indexes)))
-    target_median = float(np.median([np.median(gray_frames[index]) for index in sample_indexes]))
+    target_median = float(np.median([np.median(gray_frames[index][valid_camera_pixels]) for index in sample_indexes]))
     stabilized = np.empty((len(sample_indexes), height, width), dtype=np.uint8)
     for output_index, frame_index in enumerate(sample_indexes):
         stabilized[output_index] = stabilize_frame_gain(
@@ -1315,13 +1525,14 @@ def detect_aneurysm_roi(
             target_median,
             0.75,
             1.33,
+            valid_camera_pixels,
         )
     sampled_baseline_count = int(np.searchsorted(sample_indexes, baseline_count))
     baseline = np.percentile(stabilized[:sampled_baseline_count], 75.0, axis=0)
     darkest = np.percentile(stabilized, 10.0, axis=0)
     darkening = cv2.GaussianBlur(np.clip(baseline - darkest, 0, None), (5, 5), sigmaX=0)
 
-    active_values = darkening[darkening >= 3.0]
+    active_values = darkening[(darkening >= 3.0) & valid_camera_pixels]
     if active_values.size < max(20, round(height * width * 0.0005)):
         return None
 
@@ -1338,7 +1549,7 @@ def detect_aneurysm_roi(
     close_kernel = np.ones((5, 5), dtype=np.uint8)
 
     for threshold in thresholds:
-        mask = (darkening >= threshold).astype(np.uint8)
+        mask = ((darkening >= threshold) & valid_camera_pixels).astype(np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1357,8 +1568,8 @@ def detect_aneurysm_roi(
 
             component_mask = np.zeros((height, width), dtype=np.uint8)
             cv2.drawContours(component_mask, [contour], -1, 1, thickness=-1)
-            selected = component_mask.astype(bool)
-            response = float(np.median(darkening[selected]))
+            component_pixels = component_mask.astype(bool)
+            response = float(np.median(darkening[component_pixels]))
             fill_fraction = area / max(1, component_width * component_height)
             edge_margin = min(x, y, width - (x + component_width), height - (y + component_height))
             edge_factor = 0.65 if edge_margin <= 1 else 1.0
@@ -1385,6 +1596,22 @@ def detect_aneurysm_roi(
         roi_mask = cv2.GaussianBlur(roi_mask.astype(np.float32), (soften_kernel_size, soften_kernel_size), sigmaX=0)
         roi_mask = (roi_mask >= float(np.clip(soften_threshold, 0.0, 1.0))).astype(np.uint8)
 
+    mask_origin_x = roi_x - soften_radius
+    mask_origin_y = roi_y - soften_radius
+    valid_local = np.zeros(roi_mask.shape, dtype=bool)
+    source_left = max(0, mask_origin_x)
+    source_top = max(0, mask_origin_y)
+    source_right = min(width, mask_origin_x + roi_mask.shape[1])
+    source_bottom = min(height, mask_origin_y + roi_mask.shape[0])
+    if source_left < source_right and source_top < source_bottom:
+        target_left = source_left - mask_origin_x
+        target_top = source_top - mask_origin_y
+        valid_local[
+            target_top : target_top + source_bottom - source_top,
+            target_left : target_left + source_right - source_left,
+        ] = valid_camera_pixels[source_top:source_bottom, source_left:source_right]
+    roi_mask &= valid_local.astype(np.uint8)
+
     mask_points = cv2.findNonZero(roi_mask)
     if mask_points is None:
         return None
@@ -1394,7 +1621,12 @@ def detect_aneurysm_roi(
     return ROISelection(roi, cropped_mask.astype(bool))
 
 
-def extract_aneurysm_roi(gray_frames: list[np.ndarray], fps: float, parameters: EnhancementParameters) -> ROISelection | None:
+def extract_aneurysm_roi(
+    gray_frames: list[np.ndarray],
+    fps: float,
+    parameters: EnhancementParameters,
+    camera_view_mask: np.ndarray | None = None,
+) -> ROISelection | None:
     if parameters.roi_mode == "manual":
         circle_values = parameters.roi_manual_circle
         if circle_values is None:
@@ -1405,10 +1637,27 @@ def extract_aneurysm_roi(gray_frames: list[np.ndarray], fps: float, parameters: 
         rect = QRect(center_x - radius, center_y - radius, 2 * radius + 1, 2 * radius + 1)
         mask = np.zeros((rect.height(), rect.width()), dtype=np.uint8)
         cv2.circle(mask, (radius, radius), radius, 1, thickness=-1)
+        if camera_view_mask is not None:
+            valid_local = np.zeros(mask.shape, dtype=bool)
+            source_left = max(0, rect.x())
+            source_top = max(0, rect.y())
+            source_right = min(camera_view_mask.shape[1], rect.x() + rect.width())
+            source_bottom = min(camera_view_mask.shape[0], rect.y() + rect.height())
+            if source_left < source_right and source_top < source_bottom:
+                target_left = source_left - rect.x()
+                target_top = source_top - rect.y()
+                valid_local[
+                    target_top : target_top + source_bottom - source_top,
+                    target_left : target_left + source_right - source_left,
+                ] = camera_view_mask[source_top:source_bottom, source_left:source_right]
+            mask &= valid_local.astype(np.uint8)
+        if not np.any(mask):
+            return None
         return ROISelection(rect, mask.astype(bool))
     return detect_aneurysm_roi(
         gray_frames,
         fps,
+        camera_view_mask=camera_view_mask,
         soften_mask=bool(parameters.roi_softening_enabled),
         soften_radius_ratio=float(parameters.roi_softening_radius_ratio),
         soften_threshold=float(parameters.roi_softening_threshold),
@@ -1446,13 +1695,14 @@ def extract_aneurysm_regions(
     gray_frames: list[np.ndarray],
     fps: float,
     parameters: EnhancementParameters,
+    camera_view_mask: np.ndarray | None = None,
 ) -> tuple[ROISelection | None, np.ndarray]:
-    roi = extract_aneurysm_roi(gray_frames, fps, parameters)
+    roi = extract_aneurysm_roi(gray_frames, fps, parameters, camera_view_mask)
     if roi is None or parameters.roi_mode == "manual":
         shape = gray_frames[0].shape if gray_frames else (1, 1)
         return roi, np.zeros(shape, dtype=np.uint8)
 
-    temporal_change = compute_temporal_change_map(gray_frames)
+    temporal_change = compute_temporal_change_map(gray_frames, camera_view_mask)
     aneurysm_mask = np.zeros(temporal_change.shape, dtype=bool)
     x, y, width, height = roi.rect.getRect()
     aneurysm_mask[y : y + height, x : x + width] = roi.mask
@@ -1464,16 +1714,23 @@ def extract_aneurysm_regions(
         smoothing_window=51,
         aneurysm_mask=aneurysm_mask,
         fill_aneurysm_hull=parameters.roi_convex_hull_enabled,
+        camera_view_mask=camera_view_mask,
     )
     if parameters.roi_circle_fit_enabled:
         aneurysm_region = fit_circle_to_convex_hull(regions == ROI_ANEURYSM_LABEL)
+        if camera_view_mask is not None:
+            aneurysm_region &= camera_view_mask.astype(bool)
         regions[regions == ROI_ANEURYSM_LABEL] = ROI_VESSEL_LABEL
         regions[aneurysm_region] = ROI_ANEURYSM_LABEL
     segmented_roi = roi_selection_from_mask(regions == ROI_ANEURYSM_LABEL)
     if segmented_roi is not None:
         return segmented_roi, regions
     if parameters.roi_circle_fit_enabled:
-        return ROISelection(roi.rect, fit_circle_to_convex_hull(roi.mask)), regions
+        fitted_mask = fit_circle_to_convex_hull(roi.mask)
+        if camera_view_mask is not None:
+            x, y, width, height = roi.rect.getRect()
+            fitted_mask &= camera_view_mask[y : y + height, x : x + width]
+        return ROISelection(roi.rect, fitted_mask), regions
     return roi, regions
 
 
@@ -1485,6 +1742,7 @@ def segment_temporal_change_map(
     smoothing_window: int,
     aneurysm_mask: np.ndarray | None = None,
     fill_aneurysm_hull: bool = True,
+    camera_view_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     smoothed_change = temporal_change.astype(np.float32, copy=True)
     kernel_size = max(3, int(smoothing_window) | 1)
@@ -1492,9 +1750,17 @@ def segment_temporal_change_map(
 
     threshold = max(0.0, float(change_threshold))
     mask = (smoothed_change >= threshold).astype(np.uint8)
+    selected = None
+    if camera_view_mask is not None:
+        if camera_view_mask.shape != mask.shape:
+            raise ValueError("Temporal segmentation requires a camera-view mask matching the change map.")
+        selected = camera_view_mask.astype(bool)
+        mask[~selected] = 0
     kernel = np.ones((3, 3), dtype=np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    if selected is not None:
+        mask[~selected] = 0
 
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     change_map = np.zeros_like(mask, dtype=np.uint8)
@@ -1515,6 +1781,8 @@ def segment_temporal_change_map(
         if fill_aneurysm_hull and len(points) >= 3:
             hull = cv2.convexHull(points)
             cv2.fillConvexPoly(change_map, hull, ROI_ANEURYSM_LABEL)
+    if selected is not None:
+        change_map[~selected] = 0
 
     return change_map
 
@@ -1525,9 +1793,10 @@ def segment_temporal_change_contrast(
     level_tolerance: int,
     minimum_area: int,
     smoothing_window: int,
+    camera_view_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    temporal_change = compute_temporal_change_map(gray_frames)
-    roi = detect_aneurysm_roi(gray_frames, fps=15.0)
+    temporal_change = compute_temporal_change_map(gray_frames, camera_view_mask)
+    roi = detect_aneurysm_roi(gray_frames, fps=15.0, camera_view_mask=camera_view_mask)
     aneurysm_mask = None
     if roi is not None:
         aneurysm_mask = np.zeros(temporal_change.shape, dtype=bool)
@@ -1540,6 +1809,7 @@ def segment_temporal_change_contrast(
         minimum_area,
         smoothing_window,
         aneurysm_mask,
+        camera_view_mask=camera_view_mask,
     )
 
 
@@ -1588,7 +1858,12 @@ def overlay_needle_mask(
     return result
 
 
-def reference_mean(gray: np.ndarray, roi: QRect, roi_mask: np.ndarray | None = None) -> float:
+def reference_mean(
+    gray: np.ndarray,
+    roi: QRect,
+    roi_mask: np.ndarray | None = None,
+    camera_view_mask: np.ndarray | None = None,
+) -> float:
     frame_height, frame_width = gray.shape
     pad_x = max(30, roi.width() // 2)
     pad_y = max(30, roi.height() // 2)
@@ -1603,29 +1878,41 @@ def reference_mean(gray: np.ndarray, roi: QRect, roi_mask: np.ndarray | None = N
     roi_top = max(0, roi.top() - top)
     roi_bottom = min(reference.shape[0], roi.bottom() - top + 1)
     mask = np.ones(reference.shape, dtype=bool)
+    if camera_view_mask is not None:
+        if camera_view_mask.shape != gray.shape:
+            raise ValueError("ROI analysis requires a camera-view mask matching the frame.")
+        mask &= camera_view_mask[top:bottom, left:right].astype(bool)
     if roi_mask is None:
         mask[roi_top:roi_bottom, roi_left:roi_right] = False
     else:
         mask_slice = roi_mask[: roi_bottom - roi_top, : roi_right - roi_left]
-        mask[roi_top:roi_bottom, roi_left:roi_right] = ~mask_slice
+        mask[roi_top:roi_bottom, roi_left:roi_right] &= ~mask_slice
     pixels = reference[mask]
 
     if pixels.size < 200:
-        mask = np.ones(gray.shape, dtype=bool)
+        mask = np.ones(gray.shape, dtype=bool) if camera_view_mask is None else camera_view_mask.astype(bool).copy()
         if roi_mask is None:
             mask[roi.y() : roi.y() + roi.height(), roi.x() : roi.x() + roi.width()] = False
         else:
-            mask[roi.y() : roi.y() + roi.height(), roi.x() : roi.x() + roi.width()] = ~roi_mask
+            mask[roi.y() : roi.y() + roi.height(), roi.x() : roi.x() + roi.width()] &= ~roi_mask
         pixels = gray[mask]
-    return float(np.median(pixels)) if pixels.size else float(np.median(gray))
+    return float(np.median(pixels)) if pixels.size else math.nan
 
 
-def roi_mean(gray: np.ndarray, roi: QRect, roi_mask: np.ndarray | None = None) -> float:
+def roi_mean(
+    gray: np.ndarray,
+    roi: QRect,
+    roi_mask: np.ndarray | None = None,
+    camera_view_mask: np.ndarray | None = None,
+) -> float:
     roi_pixels = gray[roi.y() : roi.y() + roi.height(), roi.x() : roi.x() + roi.width()]
-    if roi_mask is None:
-        return float(np.mean(roi_pixels))
-    selected = roi_pixels[roi_mask]
-    return float(np.mean(selected)) if selected.size else float(np.mean(roi_pixels))
+    selected = np.ones(roi_pixels.shape, dtype=bool) if roi_mask is None else roi_mask.astype(bool).copy()
+    if camera_view_mask is not None:
+        if camera_view_mask.shape != gray.shape:
+            raise ValueError("ROI analysis requires a camera-view mask matching the frame.")
+        selected &= camera_view_mask[roi.y() : roi.y() + roi.height(), roi.x() : roi.x() + roi.width()]
+    pixels = roi_pixels[selected]
+    return float(np.mean(pixels)) if pixels.size else math.nan
 
 
 class VideoDisplay(QLabel):
@@ -2208,12 +2495,14 @@ class VideoPanel(QFrame):
         self.info = probe_video(path)
         self.crop_rect = QRect(0, 0, self.info.width, self.info.height)
         self._auto_crop_rect_cache: QRect | None = None
+        self._camera_field_mask_cache: np.ndarray | None = None
         self._trim_start_cache: dict[tuple[int, int, int, int], int] = {}
         self.source_pipeline_configuration: tuple[object, ...] | None = None
         self.background_subtraction_enabled = False
         self.background_level = 0
         self.background_reference: np.ndarray | None = None
         self.metal_needle_mask: np.ndarray | None = None
+        self.camera_view_mask: np.ndarray | None = None
         self.source_gain_multiplier = 1.0
         self.source_gain_offset = 0.0
         self.source_histogram_match_lut: np.ndarray | None = None
@@ -2332,16 +2621,22 @@ class VideoPanel(QFrame):
                 source_stage_count,
             )
 
-        auto_crop_rect = self._auto_crop_rect_cache
-        if auto_crop_enabled:
-            if auto_crop_rect is None:
-                auto_crop_rect = detect_fluoroscope_crop(
+        auto_crop_rect = getattr(self, "_auto_crop_rect_cache", None)
+        camera_field_mask = getattr(self, "_camera_field_mask_cache", None)
+        if auto_crop_rect is None:
+            if hasattr(self, "path"):
+                auto_crop_rect, camera_field_mask = detect_fluoroscope_geometry(
                     self.path,
                     self.info,
-                    lambda done, total: report("Auto-cropping", done, total),
+                    lambda done, total: report("Detecting fluoroscope field", done, total),
                 )
-                if self.live_input:
-                    self._auto_crop_rect_cache = QRect(auto_crop_rect)
+            else:
+                auto_crop_rect = full_rect
+                camera_field_mask = np.ones((self.info.height, self.info.width), dtype=bool)
+            if self.live_input:
+                self._auto_crop_rect_cache = QRect(auto_crop_rect)
+                self._camera_field_mask_cache = camera_field_mask.copy()
+        if auto_crop_enabled:
             next_crop_rect = _adjust_auto_crop_square(
                 auto_crop_rect,
                 self.info.width,
@@ -2350,6 +2645,7 @@ class VideoPanel(QFrame):
             )
             report("Auto-cropping", 1.0, 1.0)
             completed_stages += 1
+        camera_view_mask = camera_view_mask_for_crop(camera_field_mask, next_crop_rect)
 
         next_trim_start = 0
         next_trim_end = 0
@@ -2363,7 +2659,7 @@ class VideoPanel(QFrame):
             )
             next_trim_start = min(
                 max(0, self.info.frame_count - 1),
-                detect_fluoroscope_stabilization_frame(gray_frames, self.info.fps),
+                detect_fluoroscope_stabilization_frame(gray_frames, self.info.fps, camera_view_mask),
             )
             report("Detecting fluoroscope startup stabilization", 1.0, 1.0)
             completed_stages += 1
@@ -2381,11 +2677,16 @@ class VideoPanel(QFrame):
                         gray_frames[next_trim_start:],
                         self.info.fps,
                         temporal_gain_normalization_enabled,
+                        camera_view_mask,
                     )
                     + next_trim_start
                 )
             detected_trim_start = cached_trim_start
-            visible_onset = detect_frame_brightness_onset(gray_frames[next_trim_start:], self.info.fps)
+            visible_onset = detect_frame_brightness_onset(
+                gray_frames[next_trim_start:],
+                self.info.fps,
+                camera_view_mask,
+            )
             if visible_onset is not None:
                 frame_brightness_onset = next_trim_start + visible_onset
             comparison_sync_offset_frames = round(comparison_sync_offset_seconds * self.info.fps)
@@ -2405,6 +2706,7 @@ class VideoPanel(QFrame):
                 next_trim_start,
                 max(1, self.info.frame_count - next_trim_start),
                 self.info.fps,
+                camera_view_mask,
             )
             report("Measuring fluoroscope contrast response", 1.0, 1.0)
             completed_stages += 1
@@ -2415,6 +2717,7 @@ class VideoPanel(QFrame):
                 next_crop_rect,
                 next_trim_start,
                 max(1, self.info.frame_count - next_trim_start - next_trim_end),
+                camera_view_mask,
             )
             report("Measuring comparison histogram", 1.0, 1.0)
             completed_stages += 1
@@ -2424,7 +2727,11 @@ class VideoPanel(QFrame):
             pre_injection_trim_start = detected_trim_start
             if pre_injection_trim_start is None:
                 gray_frames = self._sample_cropped_gray_frames(next_crop_rect)
-                pre_injection_trim_start = detect_pre_injection_trim_start(gray_frames, self.info.fps)
+                pre_injection_trim_start = detect_pre_injection_trim_start(
+                    gray_frames,
+                    self.info.fps,
+                    camera_view_mask=camera_view_mask,
+                )
             mask_end_frame = min(
                 self.info.frame_count,
                 pre_injection_trim_start + round(self.info.fps * 0.5),
@@ -2442,6 +2749,7 @@ class VideoPanel(QFrame):
             metal_needle_mask = self._acquire_stationary_metal_mask(
                 next_crop_rect,
                 lambda done, total: report("Detecting stationary metal", done, total),
+                camera_view_mask,
             )
             report("Detecting stationary metal", 1.0, 1.0)
             completed_stages += 1
@@ -2457,6 +2765,8 @@ class VideoPanel(QFrame):
             comparison_sync_offset_frames=comparison_sync_offset_frames if temporal_alignment_enabled else 0,
             background_reference=background_reference,
             metal_needle_mask=metal_needle_mask,
+            camera_view_mask=camera_view_mask,
+            camera_field_mask=camera_field_mask,
             configuration=(
                 auto_crop_enabled,
                 temporal_alignment_enabled,
@@ -2481,6 +2791,7 @@ class VideoPanel(QFrame):
             or self.source_gain_multiplier != state.gain_multiplier
             or self.source_gain_offset != state.gain_offset
             or not np.array_equal(self.source_histogram_match_lut, state.histogram_match_lut)
+            or not np.array_equal(self.camera_view_mask, state.camera_view_mask)
         )
         self.source_pipeline_configuration = state.configuration
         self.source_gain_multiplier = state.gain_multiplier
@@ -2490,8 +2801,11 @@ class VideoPanel(QFrame):
         self.background_level = state.configuration[4]
         self.background_reference = state.background_reference
         self.metal_needle_mask = state.metal_needle_mask
+        self.camera_view_mask = None if state.camera_view_mask is None else state.camera_view_mask.copy()
         if state.auto_crop_rect is not None:
             self._auto_crop_rect_cache = QRect(state.auto_crop_rect)
+        if state.camera_field_mask is not None:
+            self._camera_field_mask_cache = state.camera_field_mask.copy()
         if state.trim_cache_key is not None and state.detected_trim_start is not None:
             self._trim_start_cache[state.trim_cache_key] = state.detected_trim_start
 
@@ -2593,6 +2907,7 @@ class VideoPanel(QFrame):
         self,
         crop_rect: QRect,
         progress_callback: Callable[[int, int], bool] | None = None,
+        camera_view_mask: np.ndarray | None = None,
     ) -> np.ndarray | None:
         sample_count = min(max(3, round(self.info.fps * 2.0)), self.info.frame_count)
         capture = cv2.VideoCapture(str(self.path))
@@ -2607,7 +2922,7 @@ class VideoPanel(QFrame):
                     break
         finally:
             capture.release()
-        return detect_stationary_metal_mask(samples)
+        return detect_stationary_metal_mask(samples, camera_view_mask)
 
     def _subtract_background(self, gray: np.ndarray) -> np.ndarray:
         if not self.background_subtraction_enabled or self.background_reference is None:
@@ -2644,7 +2959,13 @@ class VideoPanel(QFrame):
         available_frames = max(1, self.info.frame_count - self.trim_start_frame)
         self.trim_frame_count = max(1, min(frame_count if frame_count is not None else available_frames, available_frames))
         self.capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame)
-        self.target_median = estimate_video_median(self.path, self.crop_rect, self.trim_start_frame, self.trim_frame_count)
+        self.target_median = estimate_video_median(
+            self.path,
+            self.crop_rect,
+            self.trim_start_frame,
+            self.trim_frame_count,
+            getattr(self, "camera_view_mask", None),
+        )
         self.current_frame_index = -1
         self.clear_enhancement_cache()
         self.meta_label.setText(self._metadata_text())
@@ -2836,7 +3157,12 @@ class VideoPanel(QFrame):
                 return False
             parameters = stage.parameters or default_parameters
             if stage.key == "roi_extraction" and artifact_key not in self.roi_selection_cache:
-                roi, regions = extract_aneurysm_regions(frames, self.info.fps, parameters)
+                roi, regions = extract_aneurysm_regions(
+                    frames,
+                    self.info.fps,
+                    parameters,
+                    getattr(self, "camera_view_mask", None),
+                )
                 self.roi_selection_cache[artifact_key] = roi
                 encoded_ok, encoded_regions = cv2.imencode(".png", regions)
                 if not encoded_ok:
@@ -2932,7 +3258,10 @@ class VideoPanel(QFrame):
         return definition.process_frame(
             frame,
             parameters,
-            FrameContext(target_median=self.target_median),
+            FrameContext(
+                target_median=self.target_median,
+                camera_view_mask=getattr(self, "camera_view_mask", None),
+            ),
         )
 
     def prepare_enhanced_frames(
@@ -3126,6 +3455,7 @@ class VideoPanel(QFrame):
                     if not ok:
                         raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
                     gray = cv2.cvtColor(crop_frame(frame, self.crop_rect), cv2.COLOR_BGR2GRAY)
+                    gray = sanitize_camera_view(gray, getattr(self, "camera_view_mask", None))
                     gray = self._remove_stationary_metal(gray)
                     gray = self._align_source_gain(gray)
                     gray = self._match_source_histogram(gray)
@@ -3335,7 +3665,10 @@ class VideoPanel(QFrame):
                     if stage_frames and not cancelled.is_set():
                         frames_only = [frame for _, frame in stage_frames]
                         estimate_started_at = perf_counter()
-                        gains, offsets = estimate_intensity_corrections(frames_only)
+                        gains, offsets = estimate_intensity_corrections(
+                            frames_only,
+                            camera_view_mask=getattr(self, "camera_view_mask", None),
+                        )
                         active_seconds += perf_counter() - estimate_started_at
 
                         pending_stabilized: deque[tuple[int, Future[tuple[np.ndarray, float]]]] = deque()
@@ -3380,7 +3713,10 @@ class VideoPanel(QFrame):
                         started_at = perf_counter()
                         artifact_key = self._artifact_cache_key(stage_prefix)
                         roi, regions = extract_aneurysm_regions(
-                            [frame for _, frame in stage_frames], self.info.fps, stage_parameters
+                            [frame for _, frame in stage_frames],
+                            self.info.fps,
+                            stage_parameters,
+                            getattr(self, "camera_view_mask", None),
                         )
                         encoded_ok, encoded_regions = cv2.imencode(".png", regions)
                         if not encoded_ok:
@@ -3643,7 +3979,11 @@ class VideoPanel(QFrame):
         source_frames = gray_frames if gray_frames is not None else self._sample_cropped_gray_frames()
         start = self.trim_start_frame
         end = min(len(source_frames), start + self.playback_frame_count)
-        roi = detect_aneurysm_roi(source_frames[start:end], self.info.fps)
+        roi = detect_aneurysm_roi(
+            source_frames[start:end],
+            self.info.fps,
+            camera_view_mask=getattr(self, "camera_view_mask", None),
+        )
         if roi is None:
             self.display.set_roi(None)
             return None
@@ -3656,10 +3996,12 @@ class VideoPanel(QFrame):
         self.info = probe_video(path)
         self.crop_rect = self._full_frame_rect()
         self._auto_crop_rect_cache = None
+        self._camera_field_mask_cache = None
         self._trim_start_cache.clear()
         self.source_pipeline_configuration = None
         self.background_reference = None
         self.metal_needle_mask = None
+        self.camera_view_mask = None
         self.source_gain_multiplier = 1.0
         self.source_gain_offset = 0.0
         self.source_histogram_match_lut = None
@@ -4199,6 +4541,7 @@ class ContrastWindow(QMainWindow):
         self._stream_server_thread: Thread | None = None
         self._network_stream_display: VideoDisplay | None = None
         self._network_stream_frame_id = 0
+        self._network_stream_geometry_revision: int | None = None
         self._live_measurements: deque[tuple[float, float, float, float, float]] = deque()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.advance_frame)
@@ -4427,6 +4770,7 @@ class ContrastWindow(QMainWindow):
             self._network_stream_display.deleteLater()
             self._network_stream_display = None
         self._network_stream_frame_id = 0
+        self._network_stream_geometry_revision = None
         self._live_measurements.clear()
 
     def _set_video_panels(self, videos: list[Path], live_input: bool = False) -> None:
@@ -4557,7 +4901,17 @@ class ContrastWindow(QMainWindow):
         service = self._stream_service
         if service is None:
             return
-        frame_id, encoded_source, encoded_enhanced = service.latest_frames()
+        snapshot = service.latest_analysis_frames()
+        if not isinstance(snapshot, tuple) or len(snapshot) != 6:
+            return
+        (
+            frame_id,
+            encoded_source,
+            encoded_enhanced,
+            crop_rect,
+            camera_view_mask,
+            geometry_revision,
+        ) = snapshot
         if frame_id == self._network_stream_frame_id or encoded_source is None or encoded_enhanced is None:
             return
         source = cv2.imdecode(np.frombuffer(encoded_source, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -4566,19 +4920,42 @@ class ContrastWindow(QMainWindow):
             LOGGER.warning("Could not decode network live frame %s for display", frame_id)
             self._network_stream_frame_id = frame_id
             return
-        self._network_stream_display.set_frames(source, cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR))
+        if (
+            self._network_stream_geometry_revision is not None
+            and geometry_revision != self._network_stream_geometry_revision
+        ):
+            self._network_stream_display.clear_roi()
+            self._live_measurements.clear()
+        self._network_stream_geometry_revision = geometry_revision
+        displayed_source = crop_frame(source, crop_rect) if crop_rect is not None else source
+        self._network_stream_display.set_frames(displayed_source, cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR))
         self._network_stream_frame_id = frame_id
-        self._record_live_measurements(source, enhanced)
+        self._record_live_measurements(displayed_source, enhanced, camera_view_mask)
 
-    def _record_live_measurements(self, source: np.ndarray, enhanced: np.ndarray) -> None:
+    def _record_live_measurements(
+        self,
+        source: np.ndarray,
+        enhanced: np.ndarray,
+        camera_view_mask: np.ndarray | None = None,
+    ) -> None:
         timestamp = perf_counter()
         source_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+        if camera_view_mask is not None and (
+            camera_view_mask.shape != source_gray.shape or camera_view_mask.shape != enhanced.shape
+        ):
+            raise ValueError("Live analysis geometry does not match the published frames.")
         roi = self._network_stream_display.roi() if self._network_stream_display is not None else None
         roi_mask = self._network_stream_display.roi_mask() if self._network_stream_display is not None else None
-        roi_value = roi_mean(enhanced, roi, roi_mask) if roi is not None else math.nan
-        reference_value = reference_mean(enhanced, roi, roi_mask) if roi is not None else math.nan
+        roi_value = roi_mean(enhanced, roi, roi_mask, camera_view_mask) if roi is not None else math.nan
+        reference_value = reference_mean(enhanced, roi, roi_mask, camera_view_mask) if roi is not None else math.nan
         self._live_measurements.append(
-            (timestamp, average_frame_brightness([source_gray])[0], average_frame_brightness([enhanced])[0], roi_value, reference_value)
+            (
+                timestamp,
+                average_frame_brightness([source_gray], camera_view_mask)[0],
+                average_frame_brightness([enhanced], camera_view_mask)[0],
+                roi_value,
+                reference_value,
+            )
         )
         while self._live_measurements and timestamp - self._live_measurements[0][0] > 60.0:
             self._live_measurements.popleft()
@@ -7971,6 +8348,7 @@ class ContrastWindow(QMainWindow):
                 gray_frames,
                 threshold,
                 gain_corrected,
+                getattr(panel, "camera_view_mask", None),
             )
 
         self.results = normalize_analysis_results(results, threshold)
@@ -8008,8 +8386,8 @@ class ContrastWindow(QMainWindow):
             time = np.arange(frame_count, dtype=float) / panel.info.fps
             results[panel.label] = (
                 time,
-                average_frame_brightness(source_frames[:frame_count]),
-                average_frame_brightness(enhanced_frames[:frame_count]),
+                average_frame_brightness(source_frames[:frame_count], getattr(panel, "camera_view_mask", None)),
+                average_frame_brightness(enhanced_frames[:frame_count], getattr(panel, "camera_view_mask", None)),
             )
 
         self.frame_brightness_results = results
@@ -8037,7 +8415,11 @@ class ContrastWindow(QMainWindow):
             if not enhanced_frames:
                 panel.set_needle_segmentation_mask(None, self.current_frame_index)
                 continue
-            mask = segment_pre_injection_needle(enhanced_frames, panel.info.fps)
+            mask = segment_pre_injection_needle(
+                enhanced_frames,
+                panel.info.fps,
+                getattr(panel, "camera_view_mask", None),
+            )
             panel.set_needle_segmentation_mask(mask, self.current_frame_index)
             if mask is None:
                 continue
@@ -8045,7 +8427,15 @@ class ContrastWindow(QMainWindow):
             brightness = needle_average_brightness(enhanced_frames, mask)
             pre_injection_count = min(
                 len(brightness),
-                max(1, detect_pre_injection_trim_start(enhanced_frames, panel.info.fps) + max(1, round(float(panel.info.fps) * 0.5))),
+                max(
+                    1,
+                    detect_pre_injection_trim_start(
+                        enhanced_frames,
+                        panel.info.fps,
+                        camera_view_mask=getattr(panel, "camera_view_mask", None),
+                    )
+                    + max(1, round(float(panel.info.fps) * 0.5)),
+                ),
             )
             results[panel.label] = (time, brightness)
             baselines[panel.label] = float(np.mean(brightness[:pre_injection_count]))
@@ -8077,7 +8467,11 @@ class ContrastWindow(QMainWindow):
             )
             if enhanced_frames is None:
                 return False
-            results[panel.label] = compute_temporal_change_summary(enhanced_frames, panel.info.fps)
+            results[panel.label] = compute_temporal_change_summary(
+                enhanced_frames,
+                panel.info.fps,
+                getattr(panel, "camera_view_mask", None),
+            )
 
         self.temporal_change_results = results
         self.refresh_temporal_change_views()
@@ -8726,13 +9120,14 @@ def analyze_gray_frames(
     gray_frames: list[np.ndarray],
     threshold_fraction: float,
     gain_corrected: bool,
+    camera_view_mask: np.ndarray | None = None,
 ) -> AnalysisResult:
     means: list[float] = []
     references: list[float] = []
 
     for gray in gray_frames:
-        means.append(roi_mean(gray, roi, roi_mask))
-        references.append(reference_mean(gray, roi, roi_mask))
+        means.append(roi_mean(gray, roi, roi_mask, camera_view_mask))
+        references.append(reference_mean(gray, roi, roi_mask, camera_view_mask))
 
     roi_intensity = np.asarray(means, dtype=float)
     reference_intensity = np.asarray(references, dtype=float)

@@ -31,6 +31,7 @@ class FrameContext:
     target_median: float = 128.0
     noise_sigma: int = 10
     denoise_batch: BatchDenoiser | None = None
+    camera_view_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +95,8 @@ class StageRegistry:
 
 
 def _gain(frame: np.ndarray, parameters: EnhancementParameters, context: FrameContext) -> np.ndarray:
-    current_median = max(1.0, float(np.median(frame)))
+    pixels = frame.ravel() if context.camera_view_mask is None else frame[context.camera_view_mask.astype(bool)]
+    current_median = max(1.0, float(np.median(pixels)))
     target_median = context.target_median if parameters.gain_use_auto_target else float(parameters.gain_target_median)
     gain = float(np.clip(target_median / current_median, parameters.gain_min, parameters.gain_max))
     return np.clip(frame.astype(np.float32) * gain, 0, 255)

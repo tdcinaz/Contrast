@@ -103,6 +103,22 @@ class PipelineRuntimeTests(unittest.TestCase):
         np.testing.assert_allclose(result, 125, atol=1)
         self.assertEqual(calls, [0])
 
+    def test_gain_stage_ignores_pixels_outside_camera_view(self) -> None:
+        frame = np.full((10, 10), 100, dtype=np.uint8)
+        frame[:, :5] = 10
+        camera_view_mask = np.zeros(frame.shape, dtype=bool)
+        camera_view_mask[:, 5:] = True
+        stages = EnhancementStages(instances=(PipelineStage("gain_stabilization", True),))
+
+        result = FramePipelineExecutor().process(
+            frame,
+            stages,
+            EnhancementParameters(),
+            FrameContext(target_median=120.0, camera_view_mask=camera_view_mask),
+        )
+
+        np.testing.assert_allclose(result[:, 5:], 120.0, atol=1e-4)
+
     def test_frame_executor_rejects_sequence_stage(self) -> None:
         stages = EnhancementStages(
             instances=(PipelineStage("temporal_filter", True, EnhancementParameters()),)

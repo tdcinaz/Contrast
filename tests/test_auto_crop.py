@@ -14,6 +14,7 @@ from main import (
     _adjust_auto_crop_square,
     _detect_aligned_field_crop,
     _detect_pillarbox_crop,
+    camera_view_mask_for_crop,
     detect_stationary_metal_mask,
     detect_fluoroscope_crop_from_frames,
     detect_fluoroscope_stabilization_frame,
@@ -83,6 +84,22 @@ class AutoCropTests(unittest.TestCase):
         masked = mask > 0
         self.assertGreater(float(np.mean(filtered[masked])), float(np.mean(frames[0][masked])) + 100.0)
 
+    def test_stationary_metal_mask_rejects_objects_outside_camera_view(self) -> None:
+        frames = [np.full((80, 100), 160, dtype=np.uint8) for _ in range(4)]
+        for frame in frames:
+            cv2.rectangle(frame, (8, 12), (12, 68), 10, thickness=-1)
+            cv2.rectangle(frame, (70, 12), (74, 68), 10, thickness=-1)
+        camera_view_mask = np.zeros((80, 100), dtype=bool)
+        camera_view_mask[:, 50:] = True
+
+        mask = detect_stationary_metal_mask(frames, camera_view_mask)
+
+        self.assertIsNotNone(mask)
+        assert mask is not None
+        self.assertFalse(np.any(mask[~camera_view_mask]))
+        self.assertEqual(mask[40, 10], 0)
+        self.assertEqual(mask[40, 72], 255)
+
     def test_adjusted_crop_stays_square_centered_and_in_frame(self) -> None:
         crop = QRect(120, 40, 160, 160)
 
@@ -104,6 +121,19 @@ class AutoCropTests(unittest.TestCase):
         self.assertEqual(crop.width(), crop.height())
         self.assertEqual(crop.width() % 32, 0)
         self.assertEqual(crop.getRect(), (120, 40, 160, 160))
+
+    def test_camera_view_mask_excludes_elliptical_field_boundary_after_crop(self) -> None:
+        field_mask = np.zeros((240, 400), dtype=np.uint8)
+        cv2.ellipse(field_mask, (200, 120), (115, 105), 0, 0, 360, 1, thickness=-1)
+
+        mask = camera_view_mask_for_crop(field_mask, QRect(80, 0, 240, 240))
+
+        self.assertTrue(mask[120, 120])
+        self.assertFalse(mask[0, 0])
+        self.assertFalse(mask[0, -1])
+        self.assertFalse(mask[-1, 0])
+        self.assertFalse(mask[-1, -1])
+        self.assertFalse(mask[120, 5])
 
     def test_detects_dark_standby_field_with_bright_label(self) -> None:
         frames: list[np.ndarray] = []
@@ -145,11 +175,13 @@ class AutoCropTests(unittest.TestCase):
                 self.info = SimpleNamespace(width=400, height=240)
                 self.live_input = True
                 self._auto_crop_rect_cache = None
+                self._camera_field_mask_cache = None
                 self._trim_start_cache = {}
 
         source = LiveSource()
         expected_crop = QRect(120, 40, 160, 160)
-        with patch.object(main, "detect_fluoroscope_crop", return_value=expected_crop) as detect_crop:
+        field_mask = np.ones((240, 400), dtype=bool)
+        with patch.object(main, "detect_fluoroscope_geometry", return_value=(expected_crop, field_mask)) as detect_geometry:
             first = VideoPanel.calculate_source_pipeline(source, True, True)
             second = VideoPanel.calculate_source_pipeline(source, True, True)
 
@@ -157,7 +189,7 @@ class AutoCropTests(unittest.TestCase):
         self.assertEqual(second.crop_rect.getRect(), expected_crop.getRect())
         self.assertEqual(first.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, 0.0, False, False))
         self.assertEqual(second.configuration, (True, False, False, False, 0, 0, 0.0, 0.0, 0.0, False, False))
-        detect_crop.assert_called_once()
+        detect_geometry.assert_called_once()
 
     def test_temporal_offsets_adjust_detected_trim_without_changing_cache_key(self) -> None:
         class TemporalSource:
@@ -168,6 +200,7 @@ class AutoCropTests(unittest.TestCase):
                 self.info = SimpleNamespace(width=400, height=240, fps=10.0, frame_count=100)
                 self.live_input = False
                 self._auto_crop_rect_cache = None
+                self._camera_field_mask_cache = None
                 self._trim_start_cache = {}
 
             def _sample_cropped_gray_frames(self, crop_rect, progress_callback):  # noqa: ANN001

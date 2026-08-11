@@ -412,6 +412,13 @@ class StreamServerTests(unittest.TestCase):
         adjusted_frame = cv2.imdecode(np.frombuffer(adjusted_output, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
         self.assertEqual(base_frame.shape, (160, 160))
         self.assertEqual(adjusted_frame.shape, (192, 192))
+        _crop_rect, camera_view_mask = processor.analysis_geometry()
+        self.assertIsNotNone(camera_view_mask)
+        assert camera_view_mask is not None
+        self.assertEqual(camera_view_mask.shape, adjusted_frame.shape)
+        self.assertTrue(camera_view_mask[96, 96])
+        self.assertFalse(camera_view_mask[0, 0])
+        self.assertFalse(camera_view_mask[-1, -1])
 
     def test_live_dsa_waits_one_second_before_acquiring_mask(self) -> None:
         stages = EnhancementStages(instances=(PipelineStage("background_subtraction", True),))

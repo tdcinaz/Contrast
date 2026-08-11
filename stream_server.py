@@ -12,6 +12,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+from PySide6.QtCore import QRect
 
 from contrast_pipeline import (
     BUILTIN_STAGES,
@@ -25,9 +26,10 @@ from contrast_pipeline import (
 from main import (
     FrameDenoiser,
     _adjust_auto_crop_square,
-    _detect_aligned_field_crop,
-    _detect_pillarbox_crop,
+    camera_view_mask_for_crop,
     crop_frame,
+    detect_fluoroscope_geometry_from_frames,
+    sanitize_camera_view,
 )
 
 
@@ -173,6 +175,12 @@ class LiveStreamProcessor:
         self._crop_samples: list[np.ndarray] = []
         self._auto_crop_rect = None
         self._crop_rect = None
+        self._camera_field_mask: np.ndarray | None = None
+        self._camera_view_mask: np.ndarray | None = None
+        self._geometry_revision = 0
+        self._output_crop_rect: QRect | None = None
+        self._output_camera_view_mask: np.ndarray | None = None
+        self._output_geometry_revision = 0
         self._shape: tuple[int, int] | None = None
         self._dsa_mask: np.ndarray | None = None
         self._dsa_recording_frame_count: int | None = (
@@ -191,6 +199,20 @@ class LiveStreamProcessor:
     def crop_ready(self) -> bool:
         return self._crop_rect is not None
 
+    def analysis_geometry(self) -> tuple[QRect | None, np.ndarray | None]:
+        with self._lock:
+            crop_rect = None if self._crop_rect is None else QRect(self._crop_rect)
+            camera_view_mask = None if self._camera_view_mask is None else self._camera_view_mask.copy()
+            return crop_rect, camera_view_mask
+
+    def output_analysis_geometry(self) -> tuple[QRect | None, np.ndarray | None, int]:
+        with self._lock:
+            crop_rect = None if self._output_crop_rect is None else QRect(self._output_crop_rect)
+            camera_view_mask = (
+                None if self._output_camera_view_mask is None else self._output_camera_view_mask.copy()
+            )
+            return crop_rect, camera_view_mask, self._output_geometry_revision
+
     def configure(
         self,
         stages: EnhancementStages,
@@ -204,6 +226,7 @@ class LiveStreamProcessor:
         """Apply updated desktop controls before processing the next frame."""
         with self._lock:
             reset_crop = self.auto_crop_enabled != auto_crop_enabled
+            crop_offset_changed = self.auto_crop_size_offset != auto_crop_size_offset
             dsa_was_enabled = "background_subtraction" in self.stages.enabled_stage_order
             dsa_enabled = "background_subtraction" in stages.enabled_stage_order
             self.stages = stages
@@ -217,6 +240,8 @@ class LiveStreamProcessor:
                 self._crop_samples.clear()
                 self._auto_crop_rect = None
                 self._crop_rect = None
+                self._camera_field_mask = None
+                self._camera_view_mask = None
             elif self._auto_crop_rect is not None and self._shape is not None:
                 width, height = self._shape
                 self._crop_rect = _adjust_auto_crop_square(
@@ -225,6 +250,12 @@ class LiveStreamProcessor:
                     height,
                     self.auto_crop_size_offset,
                 )
+                self._camera_view_mask = camera_view_mask_for_crop(
+                    self._camera_field_mask,
+                    self._crop_rect,
+                )
+                if crop_offset_changed:
+                    self._geometry_revision += 1
             if dsa_enabled and not dsa_was_enabled:
                 self._dsa_mask = None
                 self._dsa_recording_frame_count = 0
@@ -264,14 +295,18 @@ class LiveStreamProcessor:
                 self._crop_samples.clear()
                 self._auto_crop_rect = None
                 self._crop_rect = None
+                self._camera_field_mask = None
+                self._camera_view_mask = None
                 self._dsa_mask = None
             if self._crop_rect is None and self.auto_crop_enabled:
                 self._crop_samples.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
                 if len(self._crop_samples) < self.crop_sample_frames:
                     LOGGER.debug("Collecting crop sample %s/%s", len(self._crop_samples), self.crop_sample_frames)
                     return None
-                self._auto_crop_rect = _detect_aligned_field_crop(self._crop_samples) or _detect_pillarbox_crop(
-                    self._crop_samples, width, height
+                self._auto_crop_rect, self._camera_field_mask = detect_fluoroscope_geometry_from_frames(
+                    self._crop_samples,
+                    width,
+                    height,
                 )
                 self._crop_rect = _adjust_auto_crop_square(
                     self._auto_crop_rect,
@@ -279,14 +314,28 @@ class LiveStreamProcessor:
                     height,
                     self.auto_crop_size_offset,
                 )
+                self._camera_view_mask = camera_view_mask_for_crop(
+                    self._camera_field_mask,
+                    self._crop_rect,
+                )
+                self._geometry_revision += 1
                 self._crop_samples.clear()
                 LOGGER.info("Auto-crop selected rectangle %s", self._crop_rect)
             elif self._crop_rect is None:
-                from PySide6.QtCore import QRect
-
                 self._crop_rect = QRect(0, 0, width, height)
+                _detected_crop, self._camera_field_mask = detect_fluoroscope_geometry_from_frames(
+                    [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)],
+                    width,
+                    height,
+                )
+                self._camera_view_mask = camera_view_mask_for_crop(
+                    self._camera_field_mask,
+                    self._crop_rect,
+                )
+                self._geometry_revision += 1
                 LOGGER.info("Using full-frame rectangle %s", self._crop_rect)
             enhanced = cv2.cvtColor(crop_frame(frame, self._crop_rect), cv2.COLOR_BGR2GRAY)
+            enhanced = sanitize_camera_view(enhanced, self._camera_view_mask)
             dsa_enabled = "background_subtraction" in self.stages.enabled_stage_order
             if dsa_enabled:
                 enhanced = self._apply_live_dsa(enhanced)
@@ -303,11 +352,17 @@ class LiveStreamProcessor:
                     target_median=128.0,
                     noise_sigma=self.noise_sigma,
                     denoise_batch=self.denoiser.denoise_batch if self.denoiser is not None else None,
+                    camera_view_mask=self._camera_view_mask,
                 ),
             )
             ok, output = cv2.imencode(".jpg", np.clip(enhanced, 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ok:
                 raise RuntimeError("Could not encode enhanced frame.")
+            self._output_crop_rect = QRect(self._crop_rect)
+            self._output_camera_view_mask = (
+                None if self._camera_view_mask is None else self._camera_view_mask.copy()
+            )
+            self._output_geometry_revision = self._geometry_revision
             LOGGER.debug("Enhanced frame %sx%s into %s JPEG bytes", width, height, len(output))
             return bytes(output)
 
@@ -473,6 +528,9 @@ class StreamService:
         self._ingest_lock = Lock()
         self._latest_source: bytes | None = None
         self._latest_frame: bytes | None = None
+        self._latest_crop_rect: QRect | None = None
+        self._latest_camera_view_mask: np.ndarray | None = None
+        self._latest_geometry_revision = 0
         self._frame_id = 0
         self._ingested = 0
 
@@ -487,11 +545,15 @@ class StreamService:
                 if self.recorder.record(frame):
                     self.processor.begin_recording()
             enhanced = self.processor.process_frame(frame)
+            crop_rect, camera_view_mask, geometry_revision = self.processor.output_analysis_geometry()
             with self._condition:
                 self._ingested += 1
                 if enhanced is not None:
                     self._latest_source = encoded
                     self._latest_frame = enhanced
+                    self._latest_crop_rect = crop_rect
+                    self._latest_camera_view_mask = camera_view_mask
+                    self._latest_geometry_revision = geometry_revision
                     self._frame_id += 1
                     self._condition.notify_all()
                 LOGGER.debug("Ingested frame=%s egress_ready=%s", self._ingested, enhanced is not None)
@@ -532,6 +594,24 @@ class StreamService:
         """Return the most recent matched source and enhanced JPEG frames."""
         with self._condition:
             return self._frame_id, self._latest_source, self._latest_frame
+
+    def latest_analysis_frames(
+        self,
+    ) -> tuple[int, bytes | None, bytes | None, QRect | None, np.ndarray | None, int]:
+        """Return matched source/enhanced frames and their analysis geometry."""
+        with self._condition:
+            crop_rect = None if self._latest_crop_rect is None else QRect(self._latest_crop_rect)
+            camera_view_mask = (
+                None if self._latest_camera_view_mask is None else self._latest_camera_view_mask.copy()
+            )
+            return (
+                self._frame_id,
+                self._latest_source,
+                self._latest_frame,
+                crop_rect,
+                camera_view_mask,
+                self._latest_geometry_revision,
+            )
 
 
 def create_http_server(settings: StreamSettings, service: StreamService) -> ThreadingHTTPServer:
