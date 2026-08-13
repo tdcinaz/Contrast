@@ -48,6 +48,59 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_parent_vessel_roi_uses_a_rotated_50_pixel_box_and_darkest_decile(self) -> None:
+        frame = np.full((100, 100), 180, dtype=np.uint8)
+        frame[25:31, 25:75] = 12
+
+        trace = main.parent_vessel_dark_median([frame], 50, 50, 30.0)
+
+        self.assertEqual(main.PARENT_VESSEL_ROI_SIZE, 50)
+        np.testing.assert_allclose(trace, [12.0])
+
+    def test_right_click_emits_parent_vessel_roi_center_without_replacing_aneurysm_roi(self) -> None:
+        QApplication.instance() or QApplication([])
+        display = main.VideoDisplay("Video", QColor("#ffffff"))
+        self.addCleanup(display.close)
+        display.set_comparison_enabled(False)
+        display.resize(300, 300)
+        display.set_frame(np.zeros((200, 200, 3), dtype=np.uint8))
+        display.show()
+        QApplication.processEvents()
+
+        centers: list[tuple[int, int]] = []
+        display.parentVesselRoiDrawn.connect(centers.append)
+        center = display._display_rect.center()
+        expected_center = display._display_to_frame_point(center)
+
+        QTest.mouseClick(display, main.Qt.MouseButton.RightButton, pos=center)
+
+        self.assertEqual(centers, [(expected_center.x(), expected_center.y())])
+        self.assertIsNone(display.roi())
+
+    def test_parent_vessel_plot_marks_each_curve_minimum(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window.panels = [
+            SimpleNamespace(label="Pre-deployment", color=QColor("#38bdf8")),
+            SimpleNamespace(label="Post-deployment", color=QColor("#f97316")),
+        ]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        time = np.asarray([0.0, 0.5, 1.0])
+        window.parent_vessel_roi_results = {
+            "Pre-deployment": (time, np.asarray([102.0, 80.0, np.nan])),
+            "Post-deployment": (time, np.asarray([95.0, 74.0, 88.0])),
+        }
+
+        window.refresh_parent_vessel_roi_plot()
+
+        minimum_lines = [
+            item
+            for item in window.parent_vessel_roi_plot.plotItem.items
+            if isinstance(item, main.pg.InfiniteLine)
+        ]
+        self.assertCountEqual([float(line.value()) for line in minimum_lines], [80.0, 74.0])
+
     def test_needle_mask_rejects_darker_compact_edge_artifact(self) -> None:
         camera_view_mask = np.zeros((100, 120), dtype=np.uint8)
         cv2.ellipse(camera_view_mask, (60, 50), (50, 42), 0, 0, 360, 1, thickness=-1)

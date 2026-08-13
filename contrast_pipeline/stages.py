@@ -269,6 +269,15 @@ BUILTIN_STAGES = StageRegistry(
             live_supported=False,
         ),
         StageDefinition(
+            "parent_vessel_roi_analysis",
+            "Parent vessel ROI darkness",
+            ExecutionShape.ANALYSIS,
+            0.0,
+            0.0,
+            modifies_frame_data=False,
+            live_supported=False,
+        ),
+        StageDefinition(
             "temporal_change_heatmap",
             "Contrast residence heatmap",
             ExecutionShape.ANALYSIS,
