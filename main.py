@@ -66,6 +66,7 @@ from contrast_pipeline import (
     PipelineStage,
     subtract_fluoroscopy_background,
 )
+from dicom_source import is_dicom_video, open_video_capture, probe_dicom_video
 from frame_scheduler import AdaptiveFrameExecutor
 from logging_setup import configure_logging, install_exception_logging
 from opencv_denoiser import DEFAULT_NLM_BACKEND_ID, NonLocalMeansDenoiser
@@ -411,6 +412,8 @@ class VideoInfo:
     frame_count: int
     width: int
     height: int
+    window_center: float | None = None
+    window_width: float | None = None
 
     @property
     def duration(self) -> float:
@@ -644,7 +647,19 @@ def format_seconds(value: float | None) -> str:
 
 
 def probe_video(path: Path) -> VideoInfo:
-    capture = cv2.VideoCapture(str(path))
+    if is_dicom_video(path):
+        info = probe_dicom_video(path)
+        return VideoInfo(
+            path=path,
+            fps=info.fps,
+            frame_count=info.frame_count,
+            width=info.width,
+            height=info.height,
+            window_center=info.window_center,
+            window_width=info.window_width,
+        )
+
+    capture = open_video_capture(path)
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {path}")
 
@@ -962,7 +977,7 @@ def detect_fluoroscope_geometry(
     if info.width <= 0 or info.height <= 0:
         return full_frame, np.ones((max(1, info.height), max(1, info.width)), dtype=bool)
 
-    capture = cv2.VideoCapture(str(path))
+    capture = open_video_capture(path)
     if not capture.isOpened():
         return full_frame, np.ones((info.height, info.width), dtype=bool)
 
@@ -1017,7 +1032,7 @@ def estimate_video_median(
     frame_count: int,
     camera_view_mask: np.ndarray | None = None,
 ) -> float:
-    capture = cv2.VideoCapture(str(path))
+    capture = open_video_capture(path)
     try:
         medians: list[float] = []
         if frame_count <= 0:
@@ -1043,7 +1058,7 @@ def estimate_video_contrast_response(
     fps: float,
     camera_view_mask: np.ndarray | None = None,
 ) -> tuple[float, float]:
-    capture = cv2.VideoCapture(str(path))
+    capture = open_video_capture(path)
     try:
         capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         signals: list[float] = []
@@ -1072,7 +1087,7 @@ def estimate_video_histogram(
     frame_count: int,
     camera_view_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    capture = cv2.VideoCapture(str(path))
+    capture = open_video_capture(path)
     try:
         histogram = np.zeros(256, dtype=np.int64)
         sample_indexes = np.unique(np.linspace(0, max(0, frame_count - 1), num=min(24, max(1, frame_count)), dtype=int))
@@ -2597,7 +2612,7 @@ class VideoDropPlaceholder(QFrame):
             path = Path(local_path)
             if not path.exists() or not path.is_file():
                 continue
-            if path.suffix.lower() in self.SUPPORTED_EXTENSIONS:
+            if path.suffix.lower() in self.SUPPORTED_EXTENSIONS or is_dicom_video(path):
                 return path
         return None
 
@@ -2637,7 +2652,7 @@ class VideoPanel(QFrame):
         self.source_gain_multiplier = 1.0
         self.source_gain_offset = 0.0
         self.source_histogram_match_lut: np.ndarray | None = None
-        self.capture = cv2.VideoCapture(str(path))
+        self.capture = open_video_capture(path)
         self.trim_start_frame = 0
         self.trim_frame_count = self.info.frame_count
         self.current_frame: np.ndarray | None = None
@@ -2993,7 +3008,7 @@ class VideoPanel(QFrame):
         crop_rect: QRect | None = None,
         progress_callback: Callable[[int, int], bool] | None = None,
     ) -> list[np.ndarray]:
-        capture = cv2.VideoCapture(str(self.path))
+        capture = open_video_capture(self.path)
         gray_frames: list[np.ndarray] = []
         active_crop_rect = crop_rect if crop_rect is not None else self.crop_rect
         frame_count = max(1, self.info.frame_count)
@@ -3019,7 +3034,7 @@ class VideoPanel(QFrame):
         sample_count = min(max(3, round(self.info.fps)), max(0, mask_end_frame))
         if sample_count < 3:
             return None
-        capture = cv2.VideoCapture(str(self.path))
+        capture = open_video_capture(self.path)
         samples: list[np.ndarray] = []
         try:
             capture.set(cv2.CAP_PROP_POS_FRAMES, mask_end_frame - sample_count)
@@ -3043,7 +3058,7 @@ class VideoPanel(QFrame):
         camera_view_mask: np.ndarray | None = None,
     ) -> np.ndarray | None:
         sample_count = min(max(3, round(self.info.fps * 2.0)), self.info.frame_count)
-        capture = cv2.VideoCapture(str(self.path))
+        capture = open_video_capture(self.path)
         samples: list[np.ndarray] = []
         try:
             for frame_index in range(sample_count):
@@ -3587,7 +3602,7 @@ class VideoPanel(QFrame):
                 close_queue(queues[0])
                 return
 
-            capture = cv2.VideoCapture(str(self.path))
+            capture = open_video_capture(self.path)
             if not capture.isOpened():
                 close_queue(queues[0])
                 raise RuntimeError(f"Could not precompute enhancement for video: {self.path}")
@@ -3998,6 +4013,8 @@ class VideoPanel(QFrame):
         crop_height = self.crop_rect.height()
         trimmed_duration = self.playback_duration
         source_suffix = " | looping live input" if self.live_input else f" | {trimmed_duration:.1f} s trimmed"
+        if self.info.window_center is not None and self.info.window_width is not None:
+            source_suffix += f" | DICOM WL {self.info.window_center:g} / WW {self.info.window_width:g}"
         if crop_width != self.info.width or crop_height != self.info.height:
             return f"{crop_width}x{crop_height} (auto-cropped) | {self.info.fps:.1f} fps{source_suffix}"
         return f"{self.info.width}x{self.info.height} | {self.info.fps:.1f} fps{source_suffix}"
@@ -4152,7 +4169,7 @@ class VideoPanel(QFrame):
         self.source_gain_multiplier = 1.0
         self.source_gain_offset = 0.0
         self.source_histogram_match_lut = None
-        self.capture = cv2.VideoCapture(str(path))
+        self.capture = open_video_capture(path)
         self.path_label.setText(path.name)
         self.set_trim_window(0)
         self.meta_label.setText(self._metadata_text())
@@ -4900,7 +4917,7 @@ class ContrastWindow(QMainWindow):
             self,
             title,
             str(ROOT),
-            "Video files (*.mov *.mp4 *.avi *.mkv);;All files (*)",
+            "Video files (*.mov *.mp4 *.avi *.mkv);;DICOM cine files (*);;All files (*)",
         )
         return Path(path) if path else None
 

@@ -27,6 +27,7 @@ dependencies = [
     { name = "nvidia-cudss-cu13" },
     { name = "nvpl" },
     { name = "opencv-python" },
+    { name = "pydicom" },
     { name = "pyqtgraph" },
     { name = "pyside6" },
     { name = "torch" },
@@ -39,6 +40,7 @@ requires-dist = [
     { name = "nvidia-cudss-cu13", url = "https://pypi.nvidia.com/nvidia-cudss-cu13/nvidia_cudss_cu13-0.7.0.20-py3-none-manylinux_2_17_aarch64.whl" },
     { name = "nvpl", url = "https://pypi.nvidia.com/nvpl/nvpl-25.1-py3-none-manylinux_2_26_aarch64.whl" },
     { name = "opencv-python", specifier = ">=4.10" },
+    { name = "pydicom", specifier = ">=3.0" },
     { name = "pyqtgraph", specifier = ">=0.13" },
     { name = "pyside6", specifier = ">=6.7" },
     { name = "torch", url = "https://pypi.jetson-ai-lab.io/sbsa/cu130/+f/e85/9c4c1a6c0d966/torch-2.11.0-cp312-cp312-linux_aarch64.whl" },
@@ -365,6 +367,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/cf/4c/c73f828fdbcd37eaf21d08fa852544a3ca7c2dbb3ea76873d64f2ea413d1/opencv_python-5.0.0.93-cp37-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:c8de2dec111122a02e8beb28e16c31904992dfd6186560b142a92c71403c1039", size = 73783032, upload-time = "2026-07-02T06:55:03.415Z" },
     { url = "https://files.pythonhosted.org/packages/e2/4b/edaf83b996ca5a1a3d8ccad485706b9c6d4742b13b9c4586bf1c1e7d9423/opencv_python-5.0.0.93-cp37-abi3-win32.whl", hash = "sha256:4b4b1a34c79bf8d3738e3cfe9a9e67b51a79663f6b692cbdad8c31f570da4157", size = 35564734, upload-time = "2026-07-02T05:49:57.704Z" },
     { url = "https://files.pythonhosted.org/packages/21/f0/9fa6e85cb10c8eb36a0222d27e50fe381b86ce49a55446bf39f491727564/opencv_python-5.0.0.93-cp37-abi3-win_amd64.whl", hash = "sha256:f90ba04b8f73bc5c3814037699739f0156f597338a98f05956c684e7c3ca10d2", size = 44000345, upload-time = "2026-07-02T05:49:54.971Z" },
+]
+
+[[package]]
+name = "pydicom"
+version = "3.0.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/de/52aaf905f1f0ae7aba85996e2592ea2c1fe49157f3cfbcd1871965bdb51d/pydicom-3.0.2.tar.gz", hash = "sha256:5942bfc2d72c6fa4b3b5b62c527f54b7f2355f21d6f5d296df6bb30188df6a4f", size = 2886792, upload-time = "2026-03-19T21:46:20.935Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/46/e0/60466c6d712dad2cf807df315e39863e91609ffd1064ecb835994460bbda/pydicom-3.0.2-py3-none-any.whl", hash = "sha256:abf971a5440f84dbaf42c4b6758e30e62480902584f8b270b9a5d146e278a07b", size = 2376822, upload-time = "2026-03-19T21:46:19.042Z" },
 ]
 
 [[package]]

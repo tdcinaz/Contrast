@@ -16,6 +16,8 @@ The app loads these videos by default when they are present in the project folde
 
 Use the **File** menu to choose different videos if needed.
 
+The desktop app also opens extensionless multiframe fluoroscopy DICOM image objects such as the `IMG*` files inside an exported study. It decodes the original 16-bit pixels and applies the object's DICOM window center/level and window width as one fixed mapping for the entire cine; the values are shown in the panel metadata. This avoids inheriting frame-to-frame window changes from a workstation screen recording. Select an image object rather than the study's `DICOMDIR` catalog or its JPEG thumbnail. With raw DICOM input, leave **Gain / brightness stabilization** disabled unless the fixed-window cine still shows verified acquisition drift.
+
 Choose **File > Save as default pipeline settings** to make the current source and live pipeline stages, their order, enabled states, and parameter values the startup defaults. These defaults are stored in [configs/default_pipeline.json](configs/default_pipeline.json) and deliberately do not include video paths.
 
 For live fluoroscope enhancement, choose **File > Switch to live camera mode** and select a video to use as a looping camera simulation. The source crop is measured once from that stream and retained for every live frame. When **DSA mask subtraction** is enabled, each newly detected recording waits one second after fluoroscopy starts, captures a fresh mask frame, and subtracts later frames from it. Sequence-dependent stages, including temporal alignment and motion-aware temporal filtering, are unavailable in this mode; the remaining compatible stages are applied directly to each incoming frame.
