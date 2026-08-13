@@ -9573,12 +9573,16 @@ class ContrastWindow(QMainWindow):
 
         if self.results:
             max_time = max(result.time[-1] for result in self.results.values() if len(result.time))
-            threshold_line = pg.InfiniteLine(pos=threshold, angle=0, pen=pg.mkPen("#e2e8f0", width=1, style=Qt.PenStyle.DashLine))
-            self.normalized_plot.addItem(threshold_line)
             self.normalized_plot.setXRange(0, max_time, padding=0)
             self.normalized_plot.setYRange(0, 1.05, padding=0)
             self.derivative_plot.setXRange(0, max_time, padding=0)
             if comparison_active:
+                threshold_line = pg.InfiniteLine(
+                    pos=threshold,
+                    angle=0,
+                    pen=pg.mkPen("#e2e8f0", width=1, style=Qt.PenStyle.DashLine),
+                )
+                self.baseline_to_apex_plot.addItem(threshold_line)
                 self.baseline_to_apex_plot.setXRange(0, max_time, padding=0)
                 self.baseline_to_apex_plot.setYRange(0, 1.05, padding=0)
         self.refresh_parent_vessel_scaled_residence_plot()
@@ -10335,7 +10339,7 @@ def build_analysis_result(
         arrival_time = time[arrival_index]
         peak_time = time[peak_index]
         clear_time = time[clear_index]
-        residence_time = max(0.0, clear_time - arrival_time)
+        residence_time = max(0.0, clear_time - peak_time)
 
     auc = float(np.trapezoid(normalized, time)) if len(time) > 1 else 0.0
     return AnalysisResult(
@@ -10382,9 +10386,8 @@ def normalize_analysis_results(
     results: dict[str, AnalysisResult],
     threshold_fraction: float,
 ) -> dict[str, AnalysisResult]:
-    shared_peak = max((result.peak_signal for result in results.values()), default=0.0)
     return {
-        label: recompute_threshold_metrics(result, threshold_fraction, shared_peak)
+        label: recompute_threshold_metrics(result, threshold_fraction)
         for label, result in results.items()
     }
 

@@ -204,9 +204,58 @@ class SegmentationTests(unittest.TestCase):
         post = build_analysis_result("Post-deployment", Path("post.mov"), 1.0, roi, np.asarray([100.0, 20.0]), np.asarray([]), 0.2, False)
         results = normalize_analysis_results({pre.label: pre, post.label: post}, 0.2)
 
-        np.testing.assert_allclose(results[pre.label].normalized_signal, [0.0, 0.25])
+        np.testing.assert_allclose(results[pre.label].normalized_signal, [0.0, 1.0])
+        np.testing.assert_allclose(results[post.label].normalized_signal, [0.0, 1.0])
         np.testing.assert_allclose(baseline_to_apex_normalized_signal(results[pre.label]), [0.0, 1.0])
         np.testing.assert_allclose(baseline_to_apex_normalized_signal(results[post.label]), [0.0, 1.0])
+
+    def test_residence_time_measures_from_apex_to_clearance(self) -> None:
+        result = build_analysis_result(
+            "Pre-deployment",
+            Path("pre.mov"),
+            1.0,
+            QRect(0, 0, 1, 1),
+            np.asarray([100.0, 90.0, 60.0, 80.0, 95.0]),
+            np.asarray([], dtype=float),
+            0.2,
+            False,
+        )
+
+        self.assertEqual(result.arrival_time, 1.0)
+        self.assertEqual(result.peak_time, 2.0)
+        self.assertEqual(result.clear_time, 4.0)
+        self.assertEqual(result.residence_time, 2.0)
+
+    def test_baseline_to_apex_plot_shows_the_clearance_threshold(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        window.active_mode = MODE_COMPARISON
+        pre_label = "Pre-deployment"
+        post_label = "Post-deployment"
+        window.panels = [
+            SimpleNamespace(label=pre_label, color=QColor("#38bdf8")),
+            SimpleNamespace(label=post_label, color=QColor("#f97316")),
+        ]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        roi = QRect(0, 0, 1, 1)
+        results = {
+            pre_label: build_analysis_result(pre_label, Path("pre.mov"), 1.0, roi, np.asarray([100.0, 80.0]), np.asarray([]), 0.35, False),
+            post_label: build_analysis_result(post_label, Path("post.mov"), 1.0, roi, np.asarray([100.0, 20.0]), np.asarray([]), 0.35, False),
+        }
+        window.results = normalize_analysis_results(results, 0.35)
+        window.threshold_spin.setValue(0.35)
+
+        window.refresh_plots_and_metrics()
+
+        normalized_thresholds = [
+            item for item in window.normalized_plot.plotItem.items if isinstance(item, main.pg.InfiniteLine)
+        ]
+        apex_thresholds = [
+            item for item in window.baseline_to_apex_plot.plotItem.items if isinstance(item, main.pg.InfiniteLine)
+        ]
+        self.assertEqual(normalized_thresholds, [])
+        self.assertEqual([float(line.value()) for line in apex_thresholds], [0.35])
 
     def test_analysis_drawer_plots_normalized_signal_derivative(self) -> None:
         QApplication.instance() or QApplication([])
@@ -1394,7 +1443,7 @@ class SegmentationTests(unittest.TestCase):
         self.assertGreaterEqual(result.mean_intensity[0], 60.0)
         self.assertLess(result.mean_intensity[0], full_box_mean - 5.0)
 
-    def test_analysis_normalizes_multiple_videos_to_the_shared_peak(self) -> None:
+    def test_analysis_normalizes_multiple_videos_to_each_curve_apex(self) -> None:
         roi = main.QRect(0, 0, 1, 1)
         pre = build_analysis_result(
             "Pre-deployment",
@@ -1419,7 +1468,7 @@ class SegmentationTests(unittest.TestCase):
 
         results = normalize_analysis_results({pre.label: pre, post.label: post}, 0.20)
 
-        np.testing.assert_allclose(results[pre.label].normalized_signal, [0.0, 0.0, 0.5, 0.0])
+        np.testing.assert_allclose(results[pre.label].normalized_signal, [0.0, 0.0, 1.0, 0.0])
         np.testing.assert_allclose(results[post.label].normalized_signal, [0.0, 0.0, 1.0, 0.0])
 
     def test_detected_roi_mask_is_softened_and_expanded_when_enabled(self) -> None:
