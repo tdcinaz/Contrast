@@ -101,6 +101,41 @@ class SegmentationTests(unittest.TestCase):
         ]
         self.assertCountEqual([float(line.value()) for line in minimum_lines], [80.0, 74.0])
 
+    def test_parent_vessel_scaled_residence_uses_the_first_video_minimum_as_reference(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        pre_label = "Pre-deployment"
+        post_label = "Post-deployment"
+        window.panels = [
+            SimpleNamespace(label=pre_label, color=QColor("#38bdf8")),
+            SimpleNamespace(label=post_label, color=QColor("#f97316")),
+        ]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        roi = QRect(0, 0, 1, 1)
+        window.results = {
+            pre_label: build_analysis_result(
+                pre_label, Path("pre.mov"), 2.0, roi, np.asarray([100.0, 50.0]), np.asarray([]), 0.2, False
+            ),
+            post_label: build_analysis_result(
+                post_label, Path("post.mov"), 2.0, roi, np.asarray([100.0, 50.0]), np.asarray([]), 0.2, False
+            ),
+        }
+        window.parent_vessel_roi_results = {
+            pre_label: (np.asarray([0.0, 0.5]), np.asarray([100.0, 80.0])),
+            post_label: (np.asarray([0.0, 0.5]), np.asarray([100.0, 40.0])),
+        }
+
+        window.refresh_parent_vessel_scaled_residence_plot()
+
+        curves = window.parent_vessel_scaled_residence_plot.listDataItems()
+        self.assertEqual(len(curves), 2)
+        _pre_time, pre_signal = curves[0].getData()
+        _post_time, post_signal = curves[1].getData()
+        np.testing.assert_allclose(pre_signal, window.results[pre_label].normalized_signal)
+        np.testing.assert_allclose(post_signal, window.results[post_label].normalized_signal * 0.5)
+        self.assertTrue(window.analysis_tabs.isTabVisible(window.parent_vessel_scaled_residence_tab_index))
+
     def test_needle_mask_rejects_darker_compact_edge_artifact(self) -> None:
         camera_view_mask = np.zeros((100, 120), dtype=np.uint8)
         cv2.ellipse(camera_view_mask, (60, 50), (50, 42), 0, 0, 360, 1, thickness=-1)

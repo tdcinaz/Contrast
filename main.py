@@ -6465,6 +6465,9 @@ class ContrastWindow(QMainWindow):
         derivative_layout.setContentsMargins(0, 0, 0, 0)
         derivative_layout.setSpacing(10)
         self.normalized_plot = pg.PlotWidget(title="Normalized Contrast Residence")
+        self.parent_vessel_scaled_residence_plot = pg.PlotWidget(
+            title="Aneurysm Contrast Residence Scaled by Parent Vessel Minimum"
+        )
         self.raw_plot = pg.PlotWidget(title="Denoised ROI Brightness")
         self.roi_needle_alignment_plot = pg.PlotWidget(title="ROI Brightness Before and After Baseline Alignment")
         self.derivative_plot = pg.PlotWidget(title="Normalized Contrast Derivative")
@@ -6482,6 +6485,7 @@ class ContrastWindow(QMainWindow):
         self.parent_vessel_roi_plot = pg.PlotWidget(title="Parent Vessel Darkest 10% Median")
         for plot in [
             self.normalized_plot,
+            self.parent_vessel_scaled_residence_plot,
             self.raw_plot,
             self.roi_needle_alignment_plot,
             self.derivative_plot,
@@ -6498,6 +6502,8 @@ class ContrastWindow(QMainWindow):
             plot.addLegend(offset=(12, 12))
         self.normalized_plot.setLabel("bottom", "Time", units="s")
         self.normalized_plot.setLabel("left", "Normalized signal")
+        self.parent_vessel_scaled_residence_plot.setLabel("bottom", "Time", units="s")
+        self.parent_vessel_scaled_residence_plot.setLabel("left", "Parent-vessel scaled signal")
         self.raw_plot.setLabel("bottom", "Time", units="s")
         self.raw_plot.setLabel("left", "Mean pixel value")
         self.roi_needle_alignment_plot.setLabel("bottom", "Time", units="s")
@@ -6512,10 +6518,19 @@ class ContrastWindow(QMainWindow):
         self.parent_vessel_roi_plot.setLabel("left", "Darkest 10% median")
 
         residence_layout.addWidget(self.normalized_plot, 0, 0)
+        parent_vessel_scaled_residence_panel = QWidget()
+        parent_vessel_scaled_residence_layout = QGridLayout(parent_vessel_scaled_residence_panel)
+        parent_vessel_scaled_residence_layout.setContentsMargins(0, 0, 0, 0)
+        parent_vessel_scaled_residence_layout.addWidget(self.parent_vessel_scaled_residence_plot, 0, 0)
         roi_brightness_layout.addWidget(self.raw_plot, 0, 0)
         derivative_layout.addWidget(self.derivative_plot, 0, 0)
         baseline_to_apex_layout.addWidget(self.baseline_to_apex_plot, 0, 0)
         self.analysis_tabs.addTab(residence_panel, "ROI residence")
+        self.parent_vessel_scaled_residence_tab_index = self.analysis_tabs.addTab(
+            parent_vessel_scaled_residence_panel,
+            "Parent vessel scaled residence",
+        )
+        self.analysis_tabs.setTabVisible(self.parent_vessel_scaled_residence_tab_index, False)
         self.analysis_tabs.addTab(roi_brightness_panel, "ROI brightness")
         self.analysis_tabs.addTab(derivative_panel, "Derivative")
         self.baseline_to_apex_tab_index = self.analysis_tabs.addTab(baseline_to_apex_panel, "Baseline to apex")
@@ -9226,6 +9241,7 @@ class ContrastWindow(QMainWindow):
         if completed_request.parent_vessel_roi:
             self.parent_vessel_roi_results = analysis_result.parent_vessel_roi_results
             self.refresh_parent_vessel_roi_plot()
+            self.refresh_parent_vessel_scaled_residence_plot()
         if completed_request.temporal_change:
             self.temporal_change_results = analysis_result.temporal_change_results
             for panel in self.panels:
@@ -9490,6 +9506,8 @@ class ContrastWindow(QMainWindow):
         self.roi_needle_alignment_plot.clear()
         self.roi_needle_alignment_results.clear()
         self.analysis_tabs.setTabVisible(self.roi_needle_alignment_tab_index, False)
+        self.parent_vessel_scaled_residence_plot.clear()
+        self.analysis_tabs.setTabVisible(self.parent_vessel_scaled_residence_tab_index, False)
         self.pre_card.set_metric("--")
         self.post_card.set_metric("--")
         self.delta_card.set_metric("--")
@@ -9563,6 +9581,7 @@ class ContrastWindow(QMainWindow):
             if comparison_active:
                 self.baseline_to_apex_plot.setXRange(0, max_time, padding=0)
                 self.baseline_to_apex_plot.setYRange(0, 1.05, padding=0)
+        self.refresh_parent_vessel_scaled_residence_plot()
 
         pre = self.results.get("Pre-deployment")
         post = self.results.get("Post-deployment")
@@ -9704,6 +9723,47 @@ class ContrastWindow(QMainWindow):
                 maximum_time = max(maximum_time, float(time[-1]))
         if maximum_time:
             self.parent_vessel_roi_plot.setXRange(0, maximum_time, padding=0)
+
+    def refresh_parent_vessel_scaled_residence_plot(self) -> None:
+        plot = self.parent_vessel_scaled_residence_plot
+        plot.clear()
+        available: list[tuple[VideoPanel, AnalysisResult, float]] = []
+        for panel in self.panels:
+            result = self.results.get(panel.label)
+            parent_vessel_result = self.parent_vessel_roi_results.get(panel.label)
+            if result is None or parent_vessel_result is None:
+                continue
+            parent_vessel_darkness = parent_vessel_result[1]
+            finite_darkness = parent_vessel_darkness[np.isfinite(parent_vessel_darkness)]
+            if len(finite_darkness):
+                available.append((panel, result, float(np.min(finite_darkness))))
+        self.analysis_tabs.setTabVisible(
+            self.parent_vessel_scaled_residence_tab_index,
+            bool(available),
+        )
+        if not available:
+            return
+        reference_minimum = available[0][2]
+        if reference_minimum <= 0.0:
+            return
+        maximum_time = 0.0
+        maximum_signal = 0.0
+        for panel, result, parent_vessel_minimum in available:
+            scaled_signal = result.normalized_signal * (parent_vessel_minimum / reference_minimum)
+            plot.plot(
+                result.time,
+                scaled_signal,
+                pen=pg.mkPen(panel.color.name(), width=2.5),
+                name=panel.label,
+            )
+            if len(result.time):
+                maximum_time = max(maximum_time, float(result.time[-1]))
+            finite_signal = scaled_signal[np.isfinite(scaled_signal)]
+            if len(finite_signal):
+                maximum_signal = max(maximum_signal, float(np.max(finite_signal)))
+        if maximum_time:
+            plot.setXRange(0, maximum_time, padding=0)
+        plot.setYRange(0, max(1.05, maximum_signal * 1.05), padding=0)
 
     def refresh_roi_needle_alignment_plot(self) -> None:
         plot = self.roi_needle_alignment_plot
