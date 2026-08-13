@@ -73,21 +73,18 @@
       "key": "roi_extraction"
     },
     {
-      "controls": {},
-      "enabled": true,
-      "key": "needle_segmentation"
-    },
-    {
-      "controls": {},
-      "enabled": true,
-      "key": "roi_needle_level_alignment"
-    },
-    {
       "controls": {
         "analysisThreshold": 0.2
       },
       "enabled": true,
       "key": "roi_residence_analysis"
+    },
+    {
+      "controls": {
+        "heatmapColormap": "hot"
+      },
+      "enabled": true,
+      "key": "temporal_change_heatmap"
     }
   ],
   "version": 1

@@ -2064,6 +2064,7 @@ def roi_mean(
 class VideoDisplay(QLabel):
     roiChanged = Signal(QRect)
     roiDrawn = Signal(object)
+    MANUAL_ROI_RADIUS = 70
 
     def __init__(self, title: str, color: QColor, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2076,7 +2077,6 @@ class VideoDisplay(QLabel):
         self._left_label = "Source"
         self._roi: QRect | None = None
         self._roi_mask: np.ndarray | None = None
-        self._drag_origin: QPoint | None = None
         self._display_rect = QRect()
         self._right_display_rect = QRect()
 
@@ -2236,39 +2236,14 @@ class VideoDisplay(QLabel):
         point = event.position().toPoint()
         if not self._roi_display_rect().contains(point):
             return
-        self._drag_origin = point
-        self._roi_mask = None
         frame_point = self._display_to_frame_point(point)
-        self._roi = QRect(frame_point.x(), frame_point.y(), 1, 1)
-        self.update()
-
-    def mouseMoveEvent(self, event) -> None:  # noqa: ANN001
-        if self._drag_origin is None or self.frame_size == (0, 0):
-            return
-        point = event.position().toPoint()
-        display_rect = self._roi_display_rect()
-        point.setX(max(display_rect.left(), min(point.x(), display_rect.right())))
-        point.setY(max(display_rect.top(), min(point.y(), display_rect.bottom())))
-        start = self._display_to_frame_point(self._drag_origin)
-        end = self._display_to_frame_point(point)
-        max_radius = min(start.x(), start.y(), self.frame_size[0] - 1 - start.x(), self.frame_size[1] - 1 - start.y())
-        radius = min(max_radius, round(math.hypot(end.x() - start.x(), end.y() - start.y())))
-        self._roi = QRect(start.x() - radius, start.y() - radius, 2 * radius + 1, 2 * radius + 1)
+        radius = self.MANUAL_ROI_RADIUS
+        self._roi = QRect(frame_point.x() - radius, frame_point.y() - radius, 2 * radius + 1, 2 * radius + 1)
         self._roi_mask = np.zeros((self._roi.height(), self._roi.width()), dtype=np.uint8)
         cv2.circle(self._roi_mask, (radius, radius), radius, 1, thickness=-1)
         self._roi_mask = self._roi_mask.astype(bool)
-        self.update()
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
-        if event.button() != Qt.MouseButton.LeftButton or self._drag_origin is None:
-            return
-        self._drag_origin = None
-        if self._roi and self._roi.width() >= 5:
-            self.roiChanged.emit(QRect(self._roi))
-            self.roiDrawn.emit((self._roi.center().x(), self._roi.center().y(), self._roi.width() // 2))
-        else:
-            self._roi = None
-            self._roi_mask = None
+        self.roiChanged.emit(QRect(self._roi))
+        self.roiDrawn.emit((frame_point.x(), frame_point.y(), radius))
         self.update()
 
     def _display_to_frame_point(self, point: QPoint) -> QPoint:

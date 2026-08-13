@@ -317,33 +317,29 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(post.roi_mode, "auto")
         self.assertIsNone(post.roi_manual_circle)
 
-    def test_manual_roi_drag_uses_press_position_as_circle_center(self) -> None:
+    def test_manual_roi_click_uses_fixed_radius_at_selected_center(self) -> None:
         QApplication.instance() or QApplication([])
         display = main.VideoDisplay("Video", QColor("#ffffff"))
         self.addCleanup(display.close)
         display.set_comparison_enabled(False)
-        display.resize(200, 200)
-        display.set_frame(np.zeros((100, 100, 3), dtype=np.uint8))
+        display.resize(300, 300)
+        display.set_frame(np.zeros((200, 200, 3), dtype=np.uint8))
         display.show()
         QApplication.processEvents()
 
         circles: list[tuple[int, int, int]] = []
         display.roiDrawn.connect(circles.append)
         center = display._display_rect.center()
-        end = center + main.QPoint(30, 0)
         expected_center = display._display_to_frame_point(center)
-        expected_end = display._display_to_frame_point(end)
-        expected_radius = round(math.hypot(expected_end.x() - expected_center.x(), expected_end.y() - expected_center.y()))
 
-        QTest.mousePress(display, main.Qt.MouseButton.LeftButton, pos=center)
-        QTest.mouseMove(display, end)
-        QTest.mouseRelease(display, main.Qt.MouseButton.LeftButton, pos=end)
+        QTest.mouseClick(display, main.Qt.MouseButton.LeftButton, pos=center)
 
-        self.assertEqual(circles, [(expected_center.x(), expected_center.y(), expected_radius)])
+        self.assertEqual(circles, [(expected_center.x(), expected_center.y(), display.MANUAL_ROI_RADIUS)])
         mask = display.roi_mask()
         self.assertIsNotNone(mask)
         assert mask is not None
-        self.assertTrue(mask[expected_radius, expected_radius])
+        self.assertEqual(mask.shape, (2 * display.MANUAL_ROI_RADIUS + 1,) * 2)
+        self.assertTrue(mask[display.MANUAL_ROI_RADIUS, display.MANUAL_ROI_RADIUS])
         self.assertFalse(mask[0, 0])
 
     def test_automatic_roi_publication_does_not_emit_manual_change_signal(self) -> None:
