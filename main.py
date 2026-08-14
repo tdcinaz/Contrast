@@ -534,6 +534,7 @@ class AnalysisPanelSnapshot:
     roi: QRect | None
     roi_mask: np.ndarray | None
     parent_vessel_roi: tuple[int, int, float] | None
+    background_roi: tuple[int, int] | None
     camera_view_mask: np.ndarray | None
     encoded_frames: tuple[np.ndarray, ...] | None
     source_frames: tuple[np.ndarray, ...] | None
@@ -549,6 +550,7 @@ class PipelineAnalysisRequest:
     frame_brightness: bool
     needle_segmentation: bool
     parent_vessel_roi: bool
+    background_roi: bool
     temporal_change: bool
     heatmap_colormap: str
 
@@ -562,6 +564,7 @@ class PipelineAnalysisResult:
     needle_brightness_baselines: dict[str, float]
     needle_masks: dict[str, np.ndarray | None]
     parent_vessel_roi_results: dict[str, tuple[np.ndarray, np.ndarray]]
+    background_roi_results: dict[str, tuple[np.ndarray, np.ndarray]]
     temporal_change_results: dict[str, tuple[np.ndarray, np.ndarray]]
     temporal_change_heatmaps: dict[str, np.ndarray]
 
@@ -2065,6 +2068,7 @@ def roi_mean(
 
 
 PARENT_VESSEL_ROI_SIZE = 50
+BACKGROUND_ROI_SIZE = 150
 
 
 def parent_vessel_dark_median(
@@ -2100,10 +2104,37 @@ def parent_vessel_dark_median(
     return np.asarray(values, dtype=float)
 
 
+def background_roi_average_brightness(
+    frames: list[np.ndarray],
+    center_x: int,
+    center_y: int,
+    camera_view_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    if not frames:
+        return np.asarray([], dtype=float)
+    shape = frames[0].shape
+    if camera_view_mask is not None and camera_view_mask.shape != shape:
+        raise ValueError("Background ROI analysis requires a camera-view mask matching the frame.")
+    half_size = BACKGROUND_ROI_SIZE // 2
+    left = max(0, center_x - half_size)
+    right = min(shape[1], center_x + half_size)
+    top = max(0, center_y - half_size)
+    bottom = min(shape[0], center_y + half_size)
+    selected = np.zeros(shape, dtype=bool)
+    selected[top:bottom, left:right] = True
+    if camera_view_mask is not None:
+        selected &= camera_view_mask
+    return np.asarray(
+        [float(np.mean(np.asarray(frame)[selected])) if np.any(selected) else math.nan for frame in frames],
+        dtype=float,
+    )
+
+
 class VideoDisplay(QLabel):
     roiChanged = Signal(QRect)
     roiDrawn = Signal(object)
     parentVesselRoiDrawn = Signal(object)
+    backgroundRoiDrawn = Signal(object)
     MANUAL_ROI_RADIUS = 70
 
     def __init__(self, title: str, color: QColor, parent: QWidget | None = None) -> None:
@@ -2118,6 +2149,7 @@ class VideoDisplay(QLabel):
         self._roi: QRect | None = None
         self._roi_mask: np.ndarray | None = None
         self._parent_vessel_roi: tuple[int, int, float] | None = None
+        self._background_roi: tuple[int, int] | None = None
         self._display_rect = QRect()
         self._right_display_rect = QRect()
 
@@ -2187,6 +2219,10 @@ class VideoDisplay(QLabel):
 
     def set_parent_vessel_roi(self, roi: tuple[int, int, float] | None) -> None:
         self._parent_vessel_roi = roi
+        self.update()
+
+    def set_background_roi(self, roi: tuple[int, int] | None) -> None:
+        self._background_roi = roi
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: ANN001
@@ -2290,6 +2326,17 @@ class VideoDisplay(QLabel):
             painter.setPen(QColor("#fefce8"))
             painter.drawText(QRect(corners[0], corners[2]).normalized().adjusted(4, 4, -4, -4), Qt.AlignmentFlag.AlignTop, "Parent vessel")
 
+        if self._background_roi is not None and self.frame_size != (0, 0):
+            center_x, center_y = self._background_roi
+            half_size = BACKGROUND_ROI_SIZE // 2
+            roi = QRect(center_x - half_size, center_y - half_size, BACKGROUND_ROI_SIZE, BACKGROUND_ROI_SIZE)
+            display_roi = self._frame_to_display_rect(roi, self._roi_display_rect())
+            painter.setPen(QPen(QColor("#22c55e"), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(display_roi)
+            painter.setPen(QColor("#f0fdf4"))
+            painter.drawText(display_roi.adjusted(4, 4, -4, -4), Qt.AlignmentFlag.AlignTop, "Background")
+
     def mousePressEvent(self, event) -> None:  # noqa: ANN001
         if self.frame_size == (0, 0):
             return
@@ -2297,6 +2344,12 @@ class VideoDisplay(QLabel):
         if not self._roi_display_rect().contains(point):
             return
         frame_point = self._display_to_frame_point(point)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            self.backgroundRoiDrawn.emit((frame_point.x(), frame_point.y()))
+            return
         if event.button() == Qt.MouseButton.RightButton:
             self.parentVesselRoiDrawn.emit((frame_point.x(), frame_point.y()))
             return
@@ -2661,6 +2714,7 @@ class VideoPanel(QFrame):
     roiChanged = Signal()
     roiDrawn = Signal(object)
     parentVesselRoiDrawn = Signal(object)
+    backgroundRoiDrawn = Signal(object)
     PANEL_MARGIN = 14
     PANEL_SPACING = 10
     TITLE_HEIGHT = 30
@@ -2726,6 +2780,7 @@ class VideoPanel(QFrame):
         self.display.roiChanged.connect(lambda _roi: self.roiChanged.emit())
         self.display.roiDrawn.connect(self.roiDrawn.emit)
         self.display.parentVesselRoiDrawn.connect(self.parentVesselRoiDrawn.emit)
+        self.display.backgroundRoiDrawn.connect(self.backgroundRoiDrawn.emit)
 
         self.title_label = QLabel(label)
         self.title_label.setObjectName("panelTitle")
@@ -4758,6 +4813,7 @@ class ContrastWindow(QMainWindow):
         self.needle_brightness_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.needle_brightness_baselines: dict[str, float] = {}
         self.parent_vessel_roi_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.background_roi_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.roi_needle_alignment_results: dict[str, ROIAlignmentPlotResult] = {}
         self.temporal_change_results: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.deep_denoisers: dict[str, FrameDenoiser] = {}
@@ -4782,6 +4838,7 @@ class ContrastWindow(QMainWindow):
         self._loading_config = False
         self._manual_roi_circles: list[tuple[int, int, int] | None] = [None, None]
         self._parent_vessel_rois: list[tuple[int, int, float] | None] = [None, None]
+        self._background_rois: list[tuple[int, int] | None] = [None, None]
         self.enhancement_poll_timer = QTimer(self)
         self.enhancement_poll_timer.setInterval(30)
         self.enhancement_poll_timer.timeout.connect(self._poll_enhancement)
@@ -5018,15 +5075,23 @@ class ContrastWindow(QMainWindow):
             roi_drawn = getattr(panel, "roiDrawn", None)
             if roi_drawn is not None:
                 roi_drawn.connect(lambda roi, panel_index=index: self._on_manual_roi_drawn(panel_index, roi))
-            panel.parentVesselRoiDrawn.connect(
-                lambda center, panel_index=index: self._on_parent_vessel_roi_drawn(panel_index, center)
-            )
+            parent_vessel_roi_drawn = getattr(panel, "parentVesselRoiDrawn", None)
+            if parent_vessel_roi_drawn is not None:
+                parent_vessel_roi_drawn.connect(
+                    lambda center, panel_index=index: self._on_parent_vessel_roi_drawn(panel_index, center)
+                )
+            background_roi_drawn = getattr(panel, "backgroundRoiDrawn", None)
+            if background_roi_drawn is not None:
+                background_roi_drawn.connect(
+                    lambda center, panel_index=index: self._on_background_roi_drawn(panel_index, center)
+                )
             self.video_layout.addWidget(panel)
             self.panels.append(panel)
         self.pre_panel = self.panels[0] if self.panels else None
         self.post_panel = self.panels[1] if len(self.panels) > 1 else None
         self._manual_roi_circles = [None] * len(self.panels)
         self._parent_vessel_rois = [None] * len(self.panels)
+        self._background_rois = [None] * len(self.panels)
         self.active_mode = MODE_LIVE if live_input else (MODE_COMPARISON if len(self.panels) > 1 else MODE_SINGLE)
         self._update_temporal_alignment_controls()
         self.open_pre_action.setText(f"Open {self.pre_panel.label.lower()} video..." if self.pre_panel else "Open video 1...")
@@ -5950,10 +6015,15 @@ class ContrastWindow(QMainWindow):
             "Parent vessel ROI darkness",
             17,
         )
+        self.background_roi_stage_drawer = StageDrawer(
+            "background_roi_analysis",
+            "Background ROI brightness",
+            18,
+        )
         self.temporal_change_heatmap_stage_drawer = StageDrawer(
             "temporal_change_heatmap",
             "Contrast residence heatmap",
-            18,
+            19,
         )
         self.auto_crop_stage_check = self.auto_crop_stage_drawer.enable_button
         self.startup_stabilization_trim_stage_check = self.startup_stabilization_trim_stage_drawer.enable_button
@@ -5977,6 +6047,7 @@ class ContrastWindow(QMainWindow):
         self.frame_brightness_analysis_stage_check = self.frame_brightness_analysis_stage_drawer.enable_button
         self.needle_segmentation_stage_check = self.needle_segmentation_stage_drawer.enable_button
         self.parent_vessel_roi_stage_check = self.parent_vessel_roi_stage_drawer.enable_button
+        self.background_roi_stage_check = self.background_roi_stage_drawer.enable_button
         self.temporal_change_heatmap_stage_check = self.temporal_change_heatmap_stage_drawer.enable_button
         self.source_pipeline_stage_checks = [
             self.auto_crop_stage_check,
@@ -6007,6 +6078,7 @@ class ContrastWindow(QMainWindow):
             self.frame_brightness_analysis_stage_check,
             self.needle_segmentation_stage_check,
             self.parent_vessel_roi_stage_check,
+            self.background_roi_stage_check,
             self.temporal_change_heatmap_stage_check,
         ]
         self.source_pipeline_stage_drawers = [
@@ -6037,6 +6109,7 @@ class ContrastWindow(QMainWindow):
             self.frame_brightness_analysis_stage_drawer,
             self.needle_segmentation_stage_drawer,
             self.parent_vessel_roi_stage_drawer,
+            self.background_roi_stage_drawer,
             self.temporal_change_heatmap_stage_drawer,
         ]
         self.pipeline_stage_drawers = [
@@ -6483,6 +6556,7 @@ class ContrastWindow(QMainWindow):
         self.frame_brightness_plots: dict[str, pg.PlotWidget] = {}
         self.needle_brightness_plot = pg.PlotWidget(title="Needle Average Pixel Brightness")
         self.parent_vessel_roi_plot = pg.PlotWidget(title="Parent Vessel Darkest 10% Median")
+        self.background_roi_plot = pg.PlotWidget(title="Background ROI Average Brightness")
         for plot in [
             self.normalized_plot,
             self.parent_vessel_scaled_residence_plot,
@@ -6492,6 +6566,7 @@ class ContrastWindow(QMainWindow):
             self.baseline_to_apex_plot,
             self.needle_brightness_plot,
             self.parent_vessel_roi_plot,
+            self.background_roi_plot,
         ]:
             plot.setBackground("#111827")
             plot.showGrid(x=True, y=True, alpha=0.25)
@@ -6516,6 +6591,8 @@ class ContrastWindow(QMainWindow):
         self.needle_brightness_plot.setLabel("left", "Mean pixel value")
         self.parent_vessel_roi_plot.setLabel("bottom", "Time", units="s")
         self.parent_vessel_roi_plot.setLabel("left", "Darkest 10% median")
+        self.background_roi_plot.setLabel("bottom", "Time", units="s")
+        self.background_roi_plot.setLabel("left", "Mean pixel value")
 
         residence_layout.addWidget(self.normalized_plot, 0, 0)
         parent_vessel_scaled_residence_panel = QWidget()
@@ -6542,17 +6619,23 @@ class ContrastWindow(QMainWindow):
         alignment_layout.addWidget(self.roi_needle_alignment_plot, 0, 0)
         self.roi_needle_alignment_tab_index = self.analysis_tabs.addTab(alignment_panel, "ROI alignment")
         self.analysis_tabs.setTabVisible(self.roi_needle_alignment_tab_index, False)
-        needle_brightness_panel = QWidget()
-        needle_brightness_layout = QGridLayout(needle_brightness_panel)
-        needle_brightness_layout.setContentsMargins(0, 0, 0, 0)
-        needle_brightness_layout.addWidget(self.needle_brightness_plot, 0, 0)
-        self.analysis_tabs.addTab(needle_brightness_panel, "Needle brightness")
+        background_roi_panel = QWidget()
+        background_roi_layout = QGridLayout(background_roi_panel)
+        background_roi_layout.setContentsMargins(0, 0, 0, 0)
+        background_roi_layout.addWidget(self.background_roi_plot, 0, 0)
+        self.background_roi_tab_index = self.analysis_tabs.addTab(background_roi_panel, "Background ROI")
+        self.analysis_tabs.setTabVisible(self.background_roi_tab_index, False)
         parent_vessel_panel = QWidget()
         parent_vessel_layout = QGridLayout(parent_vessel_panel)
         parent_vessel_layout.setContentsMargins(0, 0, 0, 0)
         parent_vessel_layout.addWidget(self.parent_vessel_roi_plot, 0, 0)
         self.parent_vessel_roi_tab_index = self.analysis_tabs.addTab(parent_vessel_panel, "Parent vessel")
         self.analysis_tabs.setTabVisible(self.parent_vessel_roi_tab_index, False)
+        needle_brightness_panel = QWidget()
+        needle_brightness_layout = QGridLayout(needle_brightness_panel)
+        needle_brightness_layout.setContentsMargins(0, 0, 0, 0)
+        needle_brightness_layout.addWidget(self.needle_brightness_plot, 0, 0)
+        self.analysis_tabs.addTab(needle_brightness_panel, "Needle brightness")
         plot_layout.addWidget(self.analysis_tabs, 0, 0)
         return plot_group
 
@@ -6939,6 +7022,11 @@ class ContrastWindow(QMainWindow):
             self.parent_vessel_roi_stage_drawer.content_layout.addWidget(rotation_row)
             self.parent_vessel_rotation_rows.append(rotation_row)
             self.parent_vessel_rotation_spins.append(rotation)
+
+        background_roi_hint = QLabel("Shift-left-click the enhanced video to place the center of a fixed 150 x 150 pixel background box.")
+        background_roi_hint.setObjectName("subtleLabel")
+        background_roi_hint.setWordWrap(True)
+        self.background_roi_stage_drawer.content_layout.addWidget(background_roi_hint)
 
         scanline_clip_row = QHBoxLayout()
         scanline_clip_row.addWidget(QLabel("Row bias clip"))
@@ -7774,6 +7862,7 @@ class ContrastWindow(QMainWindow):
             or self._has_enabled_stage("frame_brightness_analysis")
             or self._has_enabled_stage("needle_segmentation")
             or self._has_enabled_stage("parent_vessel_roi_analysis")
+            or self._has_enabled_stage("background_roi_analysis")
             or self._has_enabled_stage("temporal_change_heatmap")
             or self._has_enabled_stage("auto_crop")
             or self._has_enabled_stage("startup_stabilization_trim")
@@ -7816,6 +7905,7 @@ class ContrastWindow(QMainWindow):
                 "frame_brightness_analysis",
                 "needle_segmentation",
                 "parent_vessel_roi_analysis",
+                "background_roi_analysis",
                 "temporal_change_heatmap",
             }
         ]
@@ -8213,6 +8303,28 @@ class ContrastWindow(QMainWindow):
         ):
             self.run_parent_vessel_roi_analysis()
 
+    def _background_roi_for_panel(self, panel_index: int) -> tuple[int, int] | None:
+        return self._background_rois[panel_index] if panel_index < len(self._background_rois) else None
+
+    def _update_background_roi_display(self, panel_index: int) -> None:
+        if panel_index < len(self.panels):
+            self.panels[panel_index].display.set_background_roi(self._background_roi_for_panel(panel_index))
+
+    def _on_background_roi_drawn(self, panel_index: int, center: object) -> None:
+        if (
+            not self._has_enabled_stage("background_roi_analysis")
+            or panel_index >= len(self._background_rois)
+            or not isinstance(center, tuple)
+            or len(center) != 2
+            or not all(isinstance(value, int) and not isinstance(value, bool) for value in center)
+        ):
+            return
+        self._background_rois[panel_index] = center
+        self._update_background_roi_display(panel_index)
+        self.statusBar().showMessage(f"{self.panels[panel_index].label} background ROI set.")
+        if not self._background_pipeline_work_active():
+            self.run_background_roi_analysis()
+
     def _roi_settings_data(self) -> list[dict[str, object]]:
         settings: list[dict[str, object]] = []
         for index, mode_combo in enumerate(self.roi_mode_combos):
@@ -8236,6 +8348,12 @@ class ContrastWindow(QMainWindow):
                 }
             )
         return settings
+
+    def _background_roi_settings_data(self) -> list[dict[str, object]]:
+        return [
+            {"center": None if roi is None else list(roi)}
+            for roi in (self._background_roi_for_panel(index) for index in range(len(self.panels)))
+        ]
 
     def _apply_roi_settings_data(self, settings: object) -> None:
         if not isinstance(settings, list):
@@ -8293,6 +8411,19 @@ class ContrastWindow(QMainWindow):
             ):
                 self._parent_vessel_rois[index] = (center[0], center[1], self.parent_vessel_rotation_spins[index].value())
                 self._update_parent_vessel_roi_display(index)
+
+    def _apply_background_roi_settings_data(self, settings: object) -> None:
+        if not isinstance(settings, list):
+            return
+        for index, value in enumerate(settings[: len(self._background_rois)]):
+            center = value.get("center") if isinstance(value, dict) else None
+            if (
+                isinstance(center, list)
+                and len(center) == 2
+                and all(isinstance(item, int) and not isinstance(item, bool) for item in center)
+            ):
+                self._background_rois[index] = (center[0], center[1])
+                self._update_background_roi_display(index)
 
     def _on_background_subtraction_stage_toggled(self, enabled: bool) -> None:
         if getattr(self, "_syncing_background_subtraction", False):
@@ -8356,6 +8487,7 @@ class ContrastWindow(QMainWindow):
         uses_spatial_denoiser = stages.denoise
         needle_enabled = self._has_enabled_stage("needle_segmentation")
         parent_vessel_enabled = self._has_enabled_stage("parent_vessel_roi_analysis")
+        background_roi_enabled = self._has_enabled_stage("background_roi_analysis")
         self.overlay_mask_check.setEnabled(bool(self.panels) and (stages.roi_extraction or needle_enabled))
         if not needle_enabled:
             self.needle_brightness_results.clear()
@@ -8372,6 +8504,15 @@ class ContrastWindow(QMainWindow):
         else:
             for panel_index in range(len(self.panels)):
                 self._update_parent_vessel_roi_display(panel_index)
+        if not background_roi_enabled:
+            self.background_roi_results.clear()
+            self.background_roi_plot.clear()
+            self.analysis_tabs.setTabVisible(self.background_roi_tab_index, False)
+            for panel in self.panels:
+                panel.display.set_background_roi(None)
+        else:
+            for panel_index in range(len(self.panels)):
+                self._update_background_roi_display(panel_index)
         self.denoise_strength_label.setEnabled(uses_spatial_denoiser)
         self.denoise_strength_spin.setEnabled(uses_spatial_denoiser)
         self.inference_batch_spin.setEnabled(uses_accelerator)
@@ -8761,6 +8902,7 @@ class ContrastWindow(QMainWindow):
         frame_brightness: bool,
         needle_segmentation: bool,
         parent_vessel_roi: bool,
+        background_roi: bool,
         temporal_change: bool,
     ) -> PipelineAnalysisRequest | None:
         stages = self.enhancement_stages()
@@ -8801,6 +8943,7 @@ class ContrastWindow(QMainWindow):
                     roi=None if roi is None else QRect(roi),
                     roi_mask=None if roi_mask is None else roi_mask.copy(),
                     parent_vessel_roi=self._parent_vessel_roi_for_panel(panel_index),
+                    background_roi=self._background_roi_for_panel(panel_index),
                     camera_view_mask=(
                         None
                         if getattr(panel, "camera_view_mask", None) is None
@@ -8825,6 +8968,7 @@ class ContrastWindow(QMainWindow):
             frame_brightness=frame_brightness,
             needle_segmentation=needle_segmentation,
             parent_vessel_roi=parent_vessel_roi,
+            background_roi=background_roi,
             temporal_change=temporal_change,
             heatmap_colormap=self._analysis_heatmap_colormap(),
         )
@@ -8836,6 +8980,7 @@ class ContrastWindow(QMainWindow):
         frame_brightness: bool,
         needle_segmentation: bool,
         parent_vessel_roi: bool,
+        background_roi: bool,
         temporal_change: bool,
     ) -> bool:
         if not self.panels or self._enhancement_future is not None or self._analysis_future is not None:
@@ -8847,13 +8992,19 @@ class ContrastWindow(QMainWindow):
             for index in range(len(self.panels))
         ):
             parent_vessel_roi = False
-        if not any((roi_residence, frame_brightness, needle_segmentation, parent_vessel_roi, temporal_change)):
+        if background_roi and any(
+            self._background_roi_for_panel(index) is None
+            for index in range(len(self.panels))
+        ):
+            background_roi = False
+        if not any((roi_residence, frame_brightness, needle_segmentation, parent_vessel_roi, background_roi, temporal_change)):
             return False
         request = self._build_pipeline_analysis_request(
             roi_residence=roi_residence,
             frame_brightness=frame_brightness,
             needle_segmentation=needle_segmentation,
             parent_vessel_roi=parent_vessel_roi,
+            background_roi=background_roi,
             temporal_change=temporal_change,
         )
         if request is None:
@@ -8873,6 +9024,7 @@ class ContrastWindow(QMainWindow):
                 + int(request.frame_brightness)
                 + int(request.needle_segmentation)
                 + int(request.parent_vessel_roi)
+                + int(request.background_roi)
                 + int(request.temporal_change) * 2
             )
             values.append(0.0)
@@ -8912,6 +9064,7 @@ class ContrastWindow(QMainWindow):
                 np.ndarray | None,
                 tuple[np.ndarray, np.ndarray] | None,
                 tuple[np.ndarray, np.ndarray] | None,
+                tuple[np.ndarray, np.ndarray] | None,
             ],
         ] = {}
 
@@ -8924,6 +9077,7 @@ class ContrastWindow(QMainWindow):
             tuple[np.ndarray, np.ndarray] | None,
             float | None,
             np.ndarray | None,
+            tuple[np.ndarray, np.ndarray] | None,
             tuple[np.ndarray, np.ndarray] | None,
             tuple[np.ndarray, np.ndarray] | None,
         ]:
@@ -8957,6 +9111,7 @@ class ContrastWindow(QMainWindow):
             needle_baseline: float | None = None
             needle_mask: np.ndarray | None = None
             parent_vessel_result: tuple[np.ndarray, np.ndarray] | None = None
+            background_roi_result: tuple[np.ndarray, np.ndarray] | None = None
             temporal_result: tuple[np.ndarray, np.ndarray] | None = None
 
             if request.roi_residence:
@@ -9038,6 +9193,20 @@ class ContrastWindow(QMainWindow):
                 done += frame_count
                 publish("Measuring parent vessel darkness", done)
 
+            if request.background_roi:
+                if panel.background_roi is None:
+                    raise ValueError(f"Place a background ROI box for {panel.label}.")
+                publish("Measuring background brightness", done)
+                center_x, center_y = panel.background_roi
+                background_roi_result = (
+                    np.arange(len(gray_frames), dtype=float) / panel.fps,
+                    background_roi_average_brightness(
+                        gray_frames, center_x, center_y, panel.camera_view_mask
+                    ),
+                )
+                done += frame_count
+                publish("Measuring background brightness", done)
+
             if request.temporal_change:
                 publish("Computing contrast residence heatmap", done)
                 temporal_result = compute_temporal_change_summary(
@@ -9055,6 +9224,7 @@ class ContrastWindow(QMainWindow):
                 needle_baseline,
                 needle_mask,
                 parent_vessel_result,
+                background_roi_result,
                 temporal_result,
             )
 
@@ -9098,15 +9268,20 @@ class ContrastWindow(QMainWindow):
             label: output[4]
             for label, output in panel_outputs.items()
         } if request.needle_segmentation else {}
-        temporal_change_results = {
-            label: output[6]
-            for label, output in panel_outputs.items()
-            if output[6] is not None
-        }
         parent_vessel_roi_results = {
             label: output[5]
             for label, output in panel_outputs.items()
             if output[5] is not None
+        }
+        background_roi_results = {
+            label: output[6]
+            for label, output in panel_outputs.items()
+            if output[6] is not None
+        }
+        temporal_change_results = {
+            label: output[7]
+            for label, output in panel_outputs.items()
+            if output[7] is not None
         }
         typed_temporal_results = cast(dict[str, tuple[np.ndarray, np.ndarray]], temporal_change_results)
         temporal_change_heatmaps: dict[str, np.ndarray] = {}
@@ -9152,6 +9327,7 @@ class ContrastWindow(QMainWindow):
                 dict[str, tuple[np.ndarray, np.ndarray]],
                 parent_vessel_roi_results,
             ),
+            background_roi_results=cast(dict[str, tuple[np.ndarray, np.ndarray]], background_roi_results),
             temporal_change_results=typed_temporal_results,
             temporal_change_heatmaps=temporal_change_heatmaps,
         )
@@ -9242,6 +9418,9 @@ class ContrastWindow(QMainWindow):
             self.parent_vessel_roi_results = analysis_result.parent_vessel_roi_results
             self.refresh_parent_vessel_roi_plot()
             self.refresh_parent_vessel_scaled_residence_plot()
+        if completed_request.background_roi:
+            self.background_roi_results = analysis_result.background_roi_results
+            self.refresh_background_roi_plot()
         if completed_request.temporal_change:
             self.temporal_change_results = analysis_result.temporal_change_results
             for panel in self.panels:
@@ -9381,6 +9560,7 @@ class ContrastWindow(QMainWindow):
                 frame_brightness=self._has_enabled_stage("frame_brightness_analysis"),
                 needle_segmentation=self._has_enabled_stage("needle_segmentation"),
                 parent_vessel_roi=self._has_enabled_stage("parent_vessel_roi_analysis"),
+                background_roi=self._has_enabled_stage("background_roi_analysis"),
                 temporal_change=self._has_enabled_stage("temporal_change_heatmap"),
             )
             if analysis_started:
@@ -9446,6 +9626,7 @@ class ContrastWindow(QMainWindow):
             frame_brightness=False,
             needle_segmentation=False,
             parent_vessel_roi=False,
+            background_roi=False,
             temporal_change=False,
         )
 
@@ -9455,6 +9636,7 @@ class ContrastWindow(QMainWindow):
             frame_brightness=True,
             needle_segmentation=False,
             parent_vessel_roi=False,
+            background_roi=False,
             temporal_change=False,
         )
 
@@ -9464,6 +9646,7 @@ class ContrastWindow(QMainWindow):
             frame_brightness=False,
             needle_segmentation=True,
             parent_vessel_roi=False,
+            background_roi=False,
             temporal_change=False,
         )
 
@@ -9478,6 +9661,22 @@ class ContrastWindow(QMainWindow):
             frame_brightness=False,
             needle_segmentation=False,
             parent_vessel_roi=True,
+            background_roi=False,
+            temporal_change=False,
+        )
+
+    def run_background_roi_analysis(self) -> bool:
+        if not self.panels or self._background_pipeline_work_active():
+            return False
+        if any(self._background_roi_for_panel(index) is None for index in range(len(self.panels))):
+            self.statusBar().showMessage("Shift-left-click each enhanced video to place its background ROI box.")
+            return False
+        return self._start_pipeline_analysis(
+            roi_residence=False,
+            frame_brightness=False,
+            needle_segmentation=False,
+            parent_vessel_roi=False,
+            background_roi=True,
             temporal_change=False,
         )
 
@@ -9487,6 +9686,7 @@ class ContrastWindow(QMainWindow):
             frame_brightness=False,
             needle_segmentation=False,
             parent_vessel_roi=False,
+            background_roi=False,
             temporal_change=True,
         )
 
@@ -9526,6 +9726,9 @@ class ContrastWindow(QMainWindow):
         self.parent_vessel_roi_plot.clear()
         self.parent_vessel_roi_results.clear()
         self.analysis_tabs.setTabVisible(self.parent_vessel_roi_tab_index, False)
+        self.background_roi_plot.clear()
+        self.background_roi_results.clear()
+        self.analysis_tabs.setTabVisible(self.background_roi_tab_index, False)
         for panel in self.panels:
             panel.needle_segmentation_mask = None
         self.temporal_change_results.clear()
@@ -9727,6 +9930,26 @@ class ContrastWindow(QMainWindow):
                 maximum_time = max(maximum_time, float(time[-1]))
         if maximum_time:
             self.parent_vessel_roi_plot.setXRange(0, maximum_time, padding=0)
+
+    def refresh_background_roi_plot(self) -> None:
+        self.background_roi_plot.clear()
+        self.analysis_tabs.setTabVisible(self.background_roi_tab_index, bool(self.background_roi_results))
+        maximum_time = 0.0
+        for panel in self.panels:
+            result = self.background_roi_results.get(panel.label)
+            if result is None:
+                continue
+            time, brightness = result
+            self.background_roi_plot.plot(
+                time,
+                brightness,
+                pen=pg.mkPen(panel.color.name(), width=2.5),
+                name=panel.label,
+            )
+            if len(time):
+                maximum_time = max(maximum_time, float(time[-1]))
+        if maximum_time:
+            self.background_roi_plot.setXRange(0, maximum_time, padding=0)
 
     def refresh_parent_vessel_scaled_residence_plot(self) -> None:
         plot = self.parent_vessel_scaled_residence_plot
@@ -10003,6 +10226,7 @@ class ContrastWindow(QMainWindow):
                 "frame_index": self.current_frame_index,
                 "roi_settings": self._roi_settings_data(),
                 "parent_vessel_roi_settings": self._parent_vessel_roi_settings_data(),
+                "background_roi_settings": self._background_roi_settings_data(),
             },
             "analysis": {"clearance_threshold": self.threshold_spin.value()},
         }
@@ -10231,6 +10455,7 @@ class ContrastWindow(QMainWindow):
                 self.overlay_mask_check.setChecked(bool(view.get("mask_overlay_enabled", True)))
                 self._apply_roi_settings_data(view.get("roi_settings"))
                 self._apply_parent_vessel_roi_settings_data(view.get("parent_vessel_roi_settings"))
+                self._apply_background_roi_settings_data(view.get("background_roi_settings"))
                 playback_speed = view.get("playback_speed", 100)
                 if isinstance(playback_speed, int):
                     self.speed_slider.setValue(playback_speed)

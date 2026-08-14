@@ -278,6 +278,15 @@ BUILTIN_STAGES = StageRegistry(
             live_supported=False,
         ),
         StageDefinition(
+            "background_roi_analysis",
+            "Background ROI brightness",
+            ExecutionShape.ANALYSIS,
+            0.0,
+            0.0,
+            modifies_frame_data=False,
+            live_supported=False,
+        ),
+        StageDefinition(
             "temporal_change_heatmap",
             "Contrast residence heatmap",
             ExecutionShape.ANALYSIS,

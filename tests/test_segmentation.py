@@ -48,6 +48,40 @@ from main import (
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_background_roi_uses_a_150_pixel_box_and_mean_brightness(self) -> None:
+        frame = np.full((200, 200), 100, dtype=np.uint8)
+        frame[25:175, 25:175] = 40
+
+        trace = main.background_roi_average_brightness([frame], 100, 100)
+
+        self.assertEqual(main.BACKGROUND_ROI_SIZE, 150)
+        np.testing.assert_allclose(trace, [40.0])
+
+    def test_shift_left_click_emits_background_roi_center_without_replacing_aneurysm_roi(self) -> None:
+        QApplication.instance() or QApplication([])
+        display = main.VideoDisplay("Video", QColor("#ffffff"))
+        self.addCleanup(display.close)
+        display.set_comparison_enabled(False)
+        display.resize(300, 300)
+        display.set_frame(np.zeros((200, 200, 3), dtype=np.uint8))
+        display.show()
+        QApplication.processEvents()
+
+        centers: list[tuple[int, int]] = []
+        display.backgroundRoiDrawn.connect(centers.append)
+        center = display._display_rect.center()
+        expected_center = display._display_to_frame_point(center)
+
+        QTest.mouseClick(
+            display,
+            main.Qt.MouseButton.LeftButton,
+            main.Qt.KeyboardModifier.ShiftModifier,
+            center,
+        )
+
+        self.assertEqual(centers, [(expected_center.x(), expected_center.y())])
+        self.assertIsNone(display.roi())
+
     def test_parent_vessel_roi_uses_a_rotated_50_pixel_box_and_darkest_decile(self) -> None:
         frame = np.full((100, 100), 180, dtype=np.uint8)
         frame[25:31, 25:75] = 12
@@ -76,6 +110,57 @@ class SegmentationTests(unittest.TestCase):
 
         self.assertEqual(centers, [(expected_center.x(), expected_center.y())])
         self.assertIsNone(display.roi())
+
+    def test_background_roi_and_temporal_change_results_keep_distinct_shapes(self) -> None:
+        QApplication.instance() or QApplication([])
+        window = ContrastWindow()
+        self.addCleanup(window.close)
+        frames = [np.full((60, 80), 170, dtype=np.uint8) for _ in range(10)]
+        panel = SimpleNamespace(
+            label="Video",
+            color=QColor("#38bdf8"),
+            path=Path("video.avi"),
+            info=SimpleNamespace(fps=4.0),
+            source_gray_frames=frames,
+            camera_view_mask=None,
+            enhance_display=False,
+            roi=Mock(return_value=None),
+            roi_mask=Mock(return_value=None),
+            encoded_analysis_frames=Mock(return_value=None),
+            _sequence_key=Mock(return_value=()),
+            _frame_sequence_key=Mock(return_value=()),
+            set_temporal_change_heatmap=Mock(),
+        )
+        window.panels = [panel]
+        self.addCleanup(lambda: setattr(window, "panels", []))
+        window._background_rois = [(40, 30)]
+
+        with patch.object(window, "_update_stage_statuses"):
+            self.assertTrue(
+                window._start_pipeline_analysis(
+                    roi_residence=False,
+                    frame_brightness=False,
+                    needle_segmentation=False,
+                    parent_vessel_roi=False,
+                    background_roi=True,
+                    temporal_change=True,
+                )
+            )
+            future = window._analysis_future
+            self.assertIsNotNone(future)
+            assert future is not None
+            future.result(timeout=5.0)
+            window._poll_analysis()
+
+        background_time, background_brightness = window.background_roi_results["Video"]
+        self.assertEqual(background_brightness.shape, (len(frames),))
+        np.testing.assert_allclose(background_time, np.arange(len(frames), dtype=float) / 4.0)
+        burden, peak = window.temporal_change_results["Video"]
+        self.assertEqual(burden.shape, frames[0].shape)
+        self.assertEqual(peak.shape, frames[0].shape)
+        panel.set_temporal_change_heatmap.assert_called_once()
+        heatmap = panel.set_temporal_change_heatmap.call_args.args[0]
+        self.assertEqual(heatmap.shape, (*frames[0].shape, 3))
 
     def test_parent_vessel_plot_marks_each_curve_minimum(self) -> None:
         QApplication.instance() or QApplication([])
