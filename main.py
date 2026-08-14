@@ -1203,6 +1203,147 @@ def stabilize_frame_intensity(gray: np.ndarray, gain: float, offset: float) -> n
     return np.clip(stabilized, 0, 255).astype(np.uint8)
 
 
+def _camera_registration_image(
+    gray: np.ndarray,
+    analysis_width: int,
+    analysis_height: int,
+) -> np.ndarray:
+    resized = cv2.resize(gray, (analysis_width, analysis_height), interpolation=cv2.INTER_AREA)
+    low_frequency = cv2.GaussianBlur(resized, (0, 0), sigmaX=3.0, sigmaY=3.0)
+    return resized.astype(np.float32) - low_frequency.astype(np.float32)
+
+
+def estimate_camera_translations(
+    gray_frames: list[np.ndarray],
+    max_shift: float = 12.0,
+    analysis_size: int = 320,
+    camera_view_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    if not gray_frames:
+        return np.empty((0, 2), dtype=np.float32)
+    frame_height, frame_width = gray_frames[0].shape
+    if any(frame.shape != (frame_height, frame_width) for frame in gray_frames):
+        raise ValueError("Camera motion stabilization requires consistently sized grayscale frames.")
+
+    scale = min(1.0, float(analysis_size) / max(frame_height, frame_width))
+    analysis_width = max(32, int(round(frame_width * scale)))
+    analysis_height = max(32, int(round(frame_height * scale)))
+    analysis_mask = None
+    if camera_view_mask is not None:
+        if camera_view_mask.shape != (frame_height, frame_width) or not np.any(camera_view_mask):
+            raise ValueError("Camera motion stabilization requires a non-empty camera-view mask matching the frames.")
+        resized_mask = cv2.resize(
+            camera_view_mask.astype(np.uint8),
+            (analysis_width, analysis_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        erosion_radius = max(2, int(round(max_shift * scale)) + 1)
+        kernel_size = erosion_radius * 2 + 1
+        analysis_mask = cv2.erode(
+            resized_mask,
+            np.ones((kernel_size, kernel_size), dtype=np.uint8),
+        ).astype(np.float32)
+
+    reference_count = min(len(gray_frames), max(1, min(15, len(gray_frames) // 10)))
+    reference_gray = np.median(np.stack(gray_frames[:reference_count]), axis=0).astype(np.uint8)
+    reference = _camera_registration_image(
+        reference_gray,
+        analysis_width,
+        analysis_height,
+    )
+    tile_mask = np.ones((analysis_height, analysis_width), dtype=np.float32)
+    if analysis_mask is not None:
+        tile_mask = analysis_mask
+    tiles: list[tuple[slice, slice, np.ndarray, np.ndarray]] = []
+    tile_count = 4
+    for row in range(tile_count):
+        y_slice = slice(row * analysis_height // tile_count, (row + 1) * analysis_height // tile_count)
+        for column in range(tile_count):
+            x_slice = slice(
+                column * analysis_width // tile_count,
+                (column + 1) * analysis_width // tile_count,
+            )
+            local_mask = tile_mask[y_slice, x_slice] > 0
+            local_reference = reference[y_slice, x_slice]
+            if float(np.mean(local_mask)) < 0.72 or float(np.std(local_reference[local_mask])) < 1.0:
+                continue
+            tiles.append(
+                (
+                    y_slice,
+                    x_slice,
+                    local_mask.astype(np.float32),
+                    cv2.createHanningWindow(
+                        (local_reference.shape[1], local_reference.shape[0]),
+                        cv2.CV_32F,
+                    ),
+                )
+            )
+    if len(tiles) < 3:
+        return np.zeros((len(gray_frames), 2), dtype=np.float32)
+
+    translations = np.zeros((len(gray_frames), 2), dtype=np.float32)
+    scaled_limit = max(1.0, float(max_shift) * scale)
+    for index, frame in enumerate(gray_frames):
+        current = _camera_registration_image(
+            frame,
+            analysis_width,
+            analysis_height,
+        )
+        estimates: list[tuple[float, float]] = []
+        for y_slice, x_slice, local_mask, window in tiles:
+            shift, response = cv2.phaseCorrelate(
+            reference[y_slice, x_slice] * local_mask,
+            current[y_slice, x_slice] * local_mask,
+                window,
+            )
+            if response >= 0.05 and abs(shift[0]) <= scaled_limit and abs(shift[1]) <= scaled_limit:
+                estimates.append(shift)
+        if not estimates:
+            continue
+        values = np.asarray(estimates, dtype=np.float32)
+        center = np.median(values, axis=0)
+        residuals = np.linalg.norm(values - center, axis=1)
+        inliers = residuals <= 0.75
+        minimum_consensus = max(3, len(tiles) // 3)
+        if int(np.count_nonzero(inliers)) < minimum_consensus:
+            continue
+        center = np.median(values[inliers], axis=0)
+        translation = -center / scale
+        if float(np.linalg.norm(translation)) >= 0.75:
+            translations[index] = translation
+
+    for index, translation in enumerate(translations.copy()):
+        magnitude = float(np.linalg.norm(translation))
+        if magnitude == 0.0 or magnitude >= 2.0:
+            continue
+        neighbor_start = max(0, index - 1)
+        neighboring_translations = translations[neighbor_start : index + 2]
+        has_consistent_neighbor = any(
+            neighbor_start + offset != index and float(np.linalg.norm(neighbor)) > 0.0
+            and float(np.linalg.norm(neighbor - translation)) <= 0.75
+            for offset, neighbor in enumerate(neighboring_translations)
+        )
+        if not has_consistent_neighbor:
+            translations[index] = 0.0
+    return translations
+
+
+def stabilize_frame_translation(gray: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    if float(np.linalg.norm(translation)) < 1e-6:
+        return gray.copy()
+    transform = np.asarray(
+        [[1.0, 0.0, float(translation[0])], [0.0, 1.0, float(translation[1])]],
+        dtype=np.float32,
+    )
+    return cv2.warpAffine(
+        gray,
+        transform,
+        (gray.shape[1], gray.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+
+
 def correct_scanlines(gray: np.ndarray, bias_clip: float, sigma_y: float) -> np.ndarray:
     corrected = gray.astype(np.float32)
     vertical_smooth = cv2.GaussianBlur(corrected, (1, 9), sigmaX=0, sigmaY=sigma_y)
@@ -3957,6 +4098,55 @@ class VideoPanel(QFrame):
                             active_seconds += duration
                             if not emit(frame_number, transformed):
                                 break
+                elif stage_key == "camera_motion_stabilization":
+                    stage_frames: list[tuple[int, np.ndarray]] = []
+                    while True:
+                        item = input_queue.get()
+                        if item is STREAM_END:
+                            break
+                        if cancelled.is_set():
+                            continue
+                        stage_frames.append(cast(tuple[int, np.ndarray], item))
+
+                    if stage_frames and not cancelled.is_set():
+                        frames_only = [frame for _, frame in stage_frames]
+                        estimate_started_at = perf_counter()
+                        translations = estimate_camera_translations(
+                            frames_only,
+                            camera_view_mask=getattr(self, "camera_view_mask", None),
+                        )
+                        active_seconds += perf_counter() - estimate_started_at
+                        pending_stabilized: deque[tuple[int, Future[tuple[np.ndarray, float]]]] = deque()
+
+                        def stabilize_motion(frame: np.ndarray, translation: np.ndarray) -> tuple[np.ndarray, float]:
+                            started_at = perf_counter()
+                            stabilized = stabilize_frame_translation(frame, translation)
+                            stabilized = sanitize_camera_view(
+                                stabilized,
+                                getattr(self, "camera_view_mask", None),
+                            )
+                            return stabilized, perf_counter() - started_at
+
+                        for (frame_index, frame), translation in zip(stage_frames, translations):
+                            pending_stabilized.append(
+                                (
+                                    frame_index,
+                                    frame_executor.submit(stabilize_motion, frame, translation),
+                                )
+                            )
+                            if len(pending_stabilized) >= frame_executor.max_workers:
+                                frame_number, future = pending_stabilized.popleft()
+                                transformed, duration = future.result()
+                                active_seconds += duration
+                                if cancelled.is_set() or not emit(frame_number, transformed):
+                                    break
+
+                        while pending_stabilized and not cancelled.is_set():
+                            frame_number, future = pending_stabilized.popleft()
+                            transformed, duration = future.result()
+                            active_seconds += duration
+                            if not emit(frame_number, transformed):
+                                break
                 elif stage_key == "roi_extraction":
                     stage_frames: list[tuple[int, np.ndarray]] = []
                     while True:
@@ -4187,6 +4377,7 @@ class VideoPanel(QFrame):
                 "temporal_filter",
                 "quantum_mottle_filter",
                 "brightness_stabilization",
+                "camera_motion_stabilization",
                 "roi_extraction",
             }:
                 continue
@@ -4997,6 +5188,7 @@ class ContrastWindow(QMainWindow):
         for stage_key in (
             "temporal_alignment",
             "brightness_stabilization",
+            "camera_motion_stabilization",
             "roi_extraction",
             "temporal_filter",
             "quantum_mottle_filter",
@@ -5981,6 +6173,11 @@ class ContrastWindow(QMainWindow):
             "Gain / brightness stabilization",
             3,
         )
+        self.camera_motion_stage_drawer = StageDrawer(
+            "camera_motion_stabilization",
+            "Stabilize camera motion",
+            4,
+        )
         self.roi_stage_drawer = StageDrawer("roi_extraction", "Aneurysm ROI extraction", 4)
         self.roi_needle_level_alignment_stage_drawer = StageDrawer(
             "roi_needle_level_alignment",
@@ -6034,6 +6231,7 @@ class ContrastWindow(QMainWindow):
         self.metal_needle_removal_stage_check = self.metal_needle_removal_stage_drawer.enable_button
         self.gain_stage_check = self.gain_stage_drawer.enable_button
         self.brightness_stage_check = self.brightness_stage_drawer.enable_button
+        self.camera_motion_stage_check = self.camera_motion_stage_drawer.enable_button
         self.roi_stage_check = self.roi_stage_drawer.enable_button
         self.roi_needle_level_alignment_stage_check = self.roi_needle_level_alignment_stage_drawer.enable_button
         self.scanline_stage_check = self.scanline_stage_drawer.enable_button
@@ -6060,6 +6258,7 @@ class ContrastWindow(QMainWindow):
         ]
         self.frame_pipeline_stage_checks = [
             self.brightness_stage_check,
+            self.camera_motion_stage_check,
             self.roi_stage_check,
             self.roi_needle_level_alignment_stage_check,
             self.gain_stage_check,
@@ -6092,6 +6291,7 @@ class ContrastWindow(QMainWindow):
         ]
         self.frame_pipeline_stage_drawers = [
             self.brightness_stage_drawer,
+            self.camera_motion_stage_drawer,
             self.roi_stage_drawer,
             self.roi_needle_level_alignment_stage_drawer,
             self.gain_stage_drawer,
@@ -7840,6 +8040,7 @@ class ContrastWindow(QMainWindow):
         return EnhancementStages(
             gain_stabilization=self._has_enabled_stage("gain_stabilization"),
             brightness_stabilization=self._has_enabled_stage("brightness_stabilization"),
+            camera_motion_stabilization=self._has_enabled_stage("camera_motion_stabilization"),
             roi_extraction=self._has_enabled_stage("roi_extraction"),
             roi_needle_level_alignment=(
                 self.active_mode == MODE_COMPARISON and self._has_enabled_stage("roi_needle_level_alignment")

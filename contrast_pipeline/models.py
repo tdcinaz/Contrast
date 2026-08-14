@@ -42,6 +42,7 @@ class PipelineStage:
 class EnhancementStages:
     gain_stabilization: bool = False
     brightness_stabilization: bool = False
+    camera_motion_stabilization: bool = False
     roi_extraction: bool = False
     roi_needle_level_alignment: bool = False
     scanline_correction: bool = False
@@ -53,6 +54,7 @@ class EnhancementStages:
     final_smoothing: bool = False
     stage_order: tuple[str, ...] = (
         "brightness_stabilization",
+        "camera_motion_stabilization",
         "roi_extraction",
         "roi_needle_level_alignment",
         "gain_stabilization",

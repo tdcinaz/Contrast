@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 
+from contrast_pipeline import EnhancementParameters, EnhancementStages, PipelineStage
 from main import (
+    VideoPanel,
     align_frame_intensity,
+    estimate_camera_translations,
     estimate_intensity_corrections,
     intensity_alignment_parameters,
     measure_roi_needle_baselines,
     stabilize_frame_intensity,
+    stabilize_frame_translation,
 )
 
 
@@ -65,6 +70,77 @@ class BrightnessStabilizationTests(unittest.TestCase):
         )
         relative_trace_error = (measured_trace - measured_trace[0]) + contrast_drop
         self.assertLess(float(np.max(np.abs(relative_trace_error))), 0.75)
+
+    def test_camera_motion_stabilization_corrects_abrupt_small_translation(self) -> None:
+        rng = np.random.default_rng(7)
+        texture = rng.normal(128.0, 24.0, (128, 160)).astype(np.float32)
+        base = cv2.GaussianBlur(texture, (0, 0), sigmaX=1.2)
+        cv2.line(base, (18, 20), (140, 104), 205.0, thickness=3)
+        cv2.circle(base, (112, 44), 18, 62.0, thickness=3)
+        base = np.clip(base, 0, 255).astype(np.uint8)
+        observed_shifts = [(0.0, 0.0)] * 6 + [(5.0, -3.0)] * 8 + [(0.0, 0.0)] * 4
+        frames: list[np.ndarray] = []
+        for index, (shift_x, shift_y) in enumerate(observed_shifts):
+            transform = np.asarray([[1.0, 0.0, shift_x], [0.0, 1.0, shift_y]], dtype=np.float32)
+            frame = cv2.warpAffine(base, transform, (base.shape[1], base.shape[0]), borderMode=cv2.BORDER_REFLECT_101)
+            cv2.circle(frame, (48 + index * 2, 78), 9, max(20, 90 - index * 3), thickness=-1)
+            frames.append(frame)
+
+        translations = estimate_camera_translations(frames, max_shift=8.0, analysis_size=160)
+        stabilized = [
+            stabilize_frame_translation(frame, translation)
+            for frame, translation in zip(frames, translations)
+        ]
+
+        np.testing.assert_allclose(translations[8], (-5.0, 3.0), atol=0.35)
+        np.testing.assert_allclose(translations[-1], (0.0, 0.0), atol=0.35)
+        reference_edges = cv2.Laplacian(stabilized[0], cv2.CV_32F)[12:-12, 12:-12]
+        shifted_edges = cv2.Laplacian(stabilized[8], cv2.CV_32F)[12:-12, 12:-12]
+        self.assertLess(float(np.mean(np.abs(reference_edges - shifted_edges))), 13.0)
+
+    def test_camera_motion_stage_runs_in_video_scheduler(self) -> None:
+        rng = np.random.default_rng(11)
+        base = cv2.GaussianBlur(
+            rng.integers(40, 220, size=(96, 128), dtype=np.uint8),
+            (0, 0),
+            sigmaX=1.0,
+        )
+        frames = [base.copy() for _ in range(4)]
+        transform = np.asarray([[1.0, 0.0, 4.0], [0.0, 1.0, -2.0]], dtype=np.float32)
+        frames.extend(
+            cv2.warpAffine(base, transform, (base.shape[1], base.shape[0]), borderMode=cv2.BORDER_REFLECT_101)
+            for _ in range(6)
+        )
+        panel = VideoPanel.__new__(VideoPanel)
+        panel.path = "synthetic.avi"
+        panel.info = SimpleNamespace(fps=15.0)
+        panel.trim_frame_count = len(frames)
+        panel.target_median = 128.0
+        panel.camera_view_mask = np.ones(base.shape, dtype=bool)
+        panel.source_gray_frames = frames
+        panel.stage_frame_cache = {}
+        panel.encoded_frame_cache = {}
+        panel.roi_region_mask_cache = {}
+        panel.roi_selection_cache = {}
+        panel.temporal_change_map_cache = {}
+        panel.active_sequence_key = None
+        panel.inactive_sequence_key = None
+        panel.stage_duration_per_frame = {}
+        panel.enhanced_frames = None
+        panel.roi_region_masks = None
+        panel.stage_roi_selection = None
+        panel.display = SimpleNamespace(set_roi=lambda *_args: None)
+        parameters = EnhancementParameters()
+        stages = EnhancementStages(
+            instances=(PipelineStage("camera_motion_stabilization", True, parameters),)
+        )
+
+        self.assertTrue(panel.prepare_enhanced_frames(stages=stages, parameters=parameters))
+
+        stabilized = next(iter(panel.stage_frame_cache.values()))
+        self.assertEqual(len(stabilized), len(frames))
+        difference = np.abs(stabilized[0][8:-8, 8:-8].astype(np.int16) - stabilized[-1][8:-8, 8:-8])
+        self.assertLess(float(np.mean(difference)), 2.0)
 
     def test_narrow_roi_and_needle_range_is_expanded_then_offset(self) -> None:
         gain, offset = intensity_alignment_parameters(100.0, 50.0, 170.0, 70.0)
