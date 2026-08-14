@@ -26,6 +26,7 @@ VIDEO_FIELDS = (
     "aneurysm_residence_time_s",
     "time_s",
     "aneurysm_roi_absolute_average_pixel_darkness",
+    "background_roi_average_pixel_brightness",
 )
 SUMMARY_FIELDS = VIDEO_FIELDS[:3]
 
@@ -43,12 +44,19 @@ def write_video_csv(
     output_path: Path,
     result: AnalysisResult,
     parent_minimum: float | None,
+    background_result: tuple[np.ndarray, np.ndarray] | None,
 ) -> None:
+    background_brightness = background_result[1] if background_result is not None else None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=VIDEO_FIELDS)
         writer.writeheader()
-        for time_s, darkness in zip(result.time, result.mean_intensity, strict=True):
+        for index, (time_s, darkness) in enumerate(zip(result.time, result.mean_intensity, strict=True)):
+            background_value = (
+                _csv_value(float(background_brightness[index]))
+                if background_brightness is not None and index < len(background_brightness)
+                else ""
+            )
             writer.writerow(
                 {
                     "video_file_name": result.path.name,
@@ -56,6 +64,7 @@ def write_video_csv(
                     "aneurysm_residence_time_s": _csv_value(result.residence_time),
                     "time_s": float(time_s),
                     "aneurysm_roi_absolute_average_pixel_darkness": float(darkness),
+                    "background_roi_average_pixel_brightness": background_value,
                 }
             )
 
@@ -110,8 +119,9 @@ class ConfigAnalysisExporter:
                 self.failures.append(f"{config_path}: analysis results are missing for {panel.label}")
                 continue
             parent_minimum = parent_vessel_minimum(parent_result)
+            background_result = self.window.background_roi_results.get(panel.label)
             output_path = self.output_directory / f"{result.path.stem}_analysis.csv"
-            write_video_csv(output_path, result, parent_minimum)
+            write_video_csv(output_path, result, parent_minimum, background_result)
             self.summary_rows.append(
                 {
                     "video_file_name": result.path.name,

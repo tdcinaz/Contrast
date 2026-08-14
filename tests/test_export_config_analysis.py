@@ -28,11 +28,15 @@ class ConfigAnalysisExportTests(unittest.TestCase):
             np.asarray([0.0, 0.5, 1.0]),
             np.asarray([np.nan, 82.0, 75.0]),
         )
+        background_result = (
+            np.asarray([0.0, 0.5, 1.0]),
+            np.asarray([120.0, 118.0, np.nan]),
+        )
 
         with TemporaryDirectory() as directory:
             output_path = Path(directory) / "example.csv"
             minimum = parent_vessel_minimum(parent_result)
-            write_video_csv(output_path, result, minimum)
+            write_video_csv(output_path, result, minimum, background_result)
             with output_path.open(encoding="utf-8-sig", newline="") as file:
                 rows = list(csv.DictReader(file))
 
@@ -45,6 +49,33 @@ class ConfigAnalysisExportTests(unittest.TestCase):
         self.assertEqual(
             [row["aneurysm_roi_absolute_average_pixel_darkness"] for row in rows],
             ["100.0", "60.0", "95.0"],
+        )
+        self.assertEqual(
+            [row["background_roi_average_pixel_brightness"] for row in rows],
+            ["120.0", "118.0", ""],
+        )
+
+    def test_writes_blank_background_column_when_stage_is_not_enabled(self) -> None:
+        result = build_analysis_result(
+            "Pre-deployment",
+            Path("example_pre.avi"),
+            2.0,
+            QRect(10, 20, 30, 40),
+            np.asarray([100.0, 60.0]),
+            np.asarray([], dtype=float),
+            0.2,
+            False,
+        )
+
+        with TemporaryDirectory() as directory:
+            output_path = Path(directory) / "example.csv"
+            write_video_csv(output_path, result, None, None)
+            with output_path.open(encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.DictReader(file))
+
+        self.assertEqual(
+            [row["background_roi_average_pixel_brightness"] for row in rows],
+            ["", ""],
         )
 
 
