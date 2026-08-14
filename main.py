@@ -2133,13 +2133,13 @@ def overlay_roi_regions(
 def overlay_needle_mask(
     frame: np.ndarray,
     mask: np.ndarray,
-    color: tuple[int, int, int] = (0, 220, 255),
+    color: tuple[int, int, int] = (0, 0, 255),
     opacity: float = 0.55,
 ) -> np.ndarray:
     if frame.shape[:2] != mask.shape:
         raise ValueError("Needle overlay mask must match the video frame size.")
     result = frame.copy()
-    selected = mask > 0
+    selected = needle_core_mask(mask) > 0
     if not np.any(selected):
         return result
     result[selected] = np.clip(

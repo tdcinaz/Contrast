@@ -275,6 +275,17 @@ class SegmentationTests(unittest.TestCase):
         self.assertGreater(raw_trace[2], raw_trace[1] + 20.0)
         np.testing.assert_allclose(core_trace, np.full(5, 24.0))
 
+    def test_needle_overlay_marks_only_brightness_analysis_core_in_red(self) -> None:
+        mask = np.zeros((20, 30), dtype=np.uint8)
+        cv2.rectangle(mask, (6, 5), (23, 14), 255, thickness=-1)
+        frame = np.full((20, 30, 3), 100, dtype=np.uint8)
+
+        overlay = main.overlay_needle_mask(frame, mask, opacity=1.0)
+
+        np.testing.assert_array_equal(overlay[10, 15], (0, 0, 255))
+        np.testing.assert_array_equal(overlay[5, 15], (100, 100, 100))
+        np.testing.assert_array_equal(overlay[2, 2], (100, 100, 100))
+
     def test_temporal_derivative_uses_time_spacing(self) -> None:
         derivative = temporal_derivative(
             np.asarray([0.0, 0.5, 2.0]),
