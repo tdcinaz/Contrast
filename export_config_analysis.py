@@ -23,6 +23,7 @@ DEFAULT_OUTPUT_DIRECTORY = ROOT / "final_reports" / "excel_analysis"
 VIDEO_FIELDS = (
     "video_file_name",
     "parent_vessel_roi_apex_min_level",
+    "parent_vessel_roi_darkest_10_percent_median",
     "aneurysm_residence_time_s",
     "time_s",
     "aneurysm_roi_absolute_average_pixel_darkness",
@@ -44,14 +45,21 @@ def write_video_csv(
     output_path: Path,
     result: AnalysisResult,
     parent_minimum: float | None,
+    parent_vessel_result: tuple[np.ndarray, np.ndarray] | None,
     background_result: tuple[np.ndarray, np.ndarray] | None,
 ) -> None:
+    parent_vessel_darkness = parent_vessel_result[1] if parent_vessel_result is not None else None
     background_brightness = background_result[1] if background_result is not None else None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=VIDEO_FIELDS)
         writer.writeheader()
         for index, (time_s, darkness) in enumerate(zip(result.time, result.mean_intensity, strict=True)):
+            parent_vessel_value = (
+                _csv_value(float(parent_vessel_darkness[index]))
+                if parent_vessel_darkness is not None and index < len(parent_vessel_darkness)
+                else ""
+            )
             background_value = (
                 _csv_value(float(background_brightness[index]))
                 if background_brightness is not None and index < len(background_brightness)
@@ -61,6 +69,7 @@ def write_video_csv(
                 {
                     "video_file_name": result.path.name,
                     "parent_vessel_roi_apex_min_level": _csv_value(parent_minimum),
+                    "parent_vessel_roi_darkest_10_percent_median": parent_vessel_value,
                     "aneurysm_residence_time_s": _csv_value(result.residence_time),
                     "time_s": float(time_s),
                     "aneurysm_roi_absolute_average_pixel_darkness": float(darkness),
@@ -121,7 +130,7 @@ class ConfigAnalysisExporter:
             parent_minimum = parent_vessel_minimum(parent_result)
             background_result = self.window.background_roi_results.get(panel.label)
             output_path = self.output_directory / f"{result.path.stem}_analysis.csv"
-            write_video_csv(output_path, result, parent_minimum, background_result)
+            write_video_csv(output_path, result, parent_minimum, parent_result, background_result)
             self.summary_rows.append(
                 {
                     "video_file_name": result.path.name,

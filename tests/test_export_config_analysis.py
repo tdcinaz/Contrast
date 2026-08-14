@@ -36,7 +36,7 @@ class ConfigAnalysisExportTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             output_path = Path(directory) / "example.csv"
             minimum = parent_vessel_minimum(parent_result)
-            write_video_csv(output_path, result, minimum, background_result)
+            write_video_csv(output_path, result, minimum, parent_result, background_result)
             with output_path.open(encoding="utf-8-sig", newline="") as file:
                 rows = list(csv.DictReader(file))
 
@@ -44,6 +44,10 @@ class ConfigAnalysisExportTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["video_file_name"], "example_pre.avi")
         self.assertEqual(rows[0]["parent_vessel_roi_apex_min_level"], "75.0")
+        self.assertEqual(
+            [row["parent_vessel_roi_darkest_10_percent_median"] for row in rows],
+            ["", "82.0", "75.0"],
+        )
         self.assertEqual(rows[0]["aneurysm_residence_time_s"], "0.5")
         self.assertEqual([row["time_s"] for row in rows], ["0.0", "0.5", "1.0"])
         self.assertEqual(
@@ -69,12 +73,16 @@ class ConfigAnalysisExportTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             output_path = Path(directory) / "example.csv"
-            write_video_csv(output_path, result, None, None)
+            write_video_csv(output_path, result, None, None, None)
             with output_path.open(encoding="utf-8-sig", newline="") as file:
                 rows = list(csv.DictReader(file))
 
         self.assertEqual(
             [row["background_roi_average_pixel_brightness"] for row in rows],
+            ["", ""],
+        )
+        self.assertEqual(
+            [row["parent_vessel_roi_darkest_10_percent_median"] for row in rows],
             ["", ""],
         )
 
