@@ -32,11 +32,15 @@ class ConfigAnalysisExportTests(unittest.TestCase):
             np.asarray([0.0, 0.5, 1.0]),
             np.asarray([120.0, 118.0, np.nan]),
         )
+        needle_result = (
+            np.asarray([0.0, 0.5, 1.0]),
+            np.asarray([25.0, np.nan, 27.0]),
+        )
 
         with TemporaryDirectory() as directory:
             output_path = Path(directory) / "example.csv"
             minimum = parent_vessel_minimum(parent_result)
-            write_video_csv(output_path, result, minimum, parent_result, background_result)
+            write_video_csv(output_path, result, minimum, parent_result, background_result, needle_result)
             with output_path.open(encoding="utf-8-sig", newline="") as file:
                 rows = list(csv.DictReader(file))
 
@@ -58,6 +62,10 @@ class ConfigAnalysisExportTests(unittest.TestCase):
             [row["background_roi_average_pixel_brightness"] for row in rows],
             ["120.0", "118.0", ""],
         )
+        self.assertEqual(
+            [row["needle_average_pixel_brightness"] for row in rows],
+            ["25.0", "", "27.0"],
+        )
 
     def test_writes_blank_background_column_when_stage_is_not_enabled(self) -> None:
         result = build_analysis_result(
@@ -73,7 +81,7 @@ class ConfigAnalysisExportTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             output_path = Path(directory) / "example.csv"
-            write_video_csv(output_path, result, None, None, None)
+            write_video_csv(output_path, result, None, None, None, None)
             with output_path.open(encoding="utf-8-sig", newline="") as file:
                 rows = list(csv.DictReader(file))
 
@@ -83,6 +91,10 @@ class ConfigAnalysisExportTests(unittest.TestCase):
         )
         self.assertEqual(
             [row["parent_vessel_roi_darkest_10_percent_median"] for row in rows],
+            ["", ""],
+        )
+        self.assertEqual(
+            [row["needle_average_pixel_brightness"] for row in rows],
             ["", ""],
         )
 

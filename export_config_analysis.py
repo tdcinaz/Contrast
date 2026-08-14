@@ -28,6 +28,7 @@ VIDEO_FIELDS = (
     "time_s",
     "aneurysm_roi_absolute_average_pixel_darkness",
     "background_roi_average_pixel_brightness",
+    "needle_average_pixel_brightness",
 )
 SUMMARY_FIELDS = VIDEO_FIELDS[:3]
 
@@ -47,9 +48,11 @@ def write_video_csv(
     parent_minimum: float | None,
     parent_vessel_result: tuple[np.ndarray, np.ndarray] | None,
     background_result: tuple[np.ndarray, np.ndarray] | None,
+    needle_result: tuple[np.ndarray, np.ndarray] | None,
 ) -> None:
     parent_vessel_darkness = parent_vessel_result[1] if parent_vessel_result is not None else None
     background_brightness = background_result[1] if background_result is not None else None
+    needle_brightness = needle_result[1] if needle_result is not None else None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=VIDEO_FIELDS)
@@ -65,6 +68,11 @@ def write_video_csv(
                 if background_brightness is not None and index < len(background_brightness)
                 else ""
             )
+            needle_value = (
+                _csv_value(float(needle_brightness[index]))
+                if needle_brightness is not None and index < len(needle_brightness)
+                else ""
+            )
             writer.writerow(
                 {
                     "video_file_name": result.path.name,
@@ -74,6 +82,7 @@ def write_video_csv(
                     "time_s": float(time_s),
                     "aneurysm_roi_absolute_average_pixel_darkness": float(darkness),
                     "background_roi_average_pixel_brightness": background_value,
+                    "needle_average_pixel_brightness": needle_value,
                 }
             )
 
@@ -129,8 +138,9 @@ class ConfigAnalysisExporter:
                 continue
             parent_minimum = parent_vessel_minimum(parent_result)
             background_result = self.window.background_roi_results.get(panel.label)
+            needle_result = self.window.needle_brightness_results.get(panel.label)
             output_path = self.output_directory / f"{result.path.stem}_analysis.csv"
-            write_video_csv(output_path, result, parent_minimum, parent_result, background_result)
+            write_video_csv(output_path, result, parent_minimum, parent_result, background_result, needle_result)
             self.summary_rows.append(
                 {
                     "video_file_name": result.path.name,
