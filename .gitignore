@@ -39,3 +39,6 @@ test_configs/*.json
 # Raw data
 *.DCM
 fluoro_raw/
+
+# Export data
+*.csv
