@@ -11,6 +11,8 @@ from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor
 
 from export_config_analysis import (
+    ConfigAnalysisExporter,
+    NO_QUANTUM_MOTTLE_IMAGE_NOTE,
     lowest_aneurysm_brightness_frame,
     parent_vessel_minimum,
     write_video_csv,
@@ -60,6 +62,71 @@ class ConfigAnalysisExportTests(unittest.TestCase):
         self.assertFalse(np.array_equal(image[10, 10], (100, 100, 100)))
         self.assertGreater(int(image[27, 37, 2]), int(image[27, 37, 0]))
         self.assertGreater(int(np.max(image[40:])), 22)
+
+    def test_writes_no_mottle_note_in_image_footer(self) -> None:
+        result = build_analysis_result(
+            "Pre-deployment",
+            Path("example_pre.avi"),
+            2.0,
+            QRect(0, 0, 1, 1),
+            np.asarray([100.0, 40.0, 60.0]),
+            np.asarray([], dtype=float),
+            0.2,
+            False,
+        )
+        frames = [cv2.imencode(".png", np.full((80, 320), 100, dtype=np.uint8))[1]] * 3
+        panel = type("Panel", (), {
+            "enhanced_frames": frames,
+            "report_encoded_frames": None,
+            "roi_region_masks": None,
+            "needle_segmentation_mask": None,
+            "color": QColor("#38bdf8"),
+        })()
+
+        with TemporaryDirectory() as directory:
+            output_path = Path(directory) / "example_pre_analysis.png"
+            self.assertTrue(write_video_image(output_path, result, panel, note=NO_QUANTUM_MOTTLE_IMAGE_NOTE))
+            image = cv2.imread(str(output_path))
+
+        self.assertIsNotNone(image)
+        assert image is not None
+        self.assertEqual(image.shape[0], 116)
+        footer = image[80:]
+        self.assertTrue(np.any((footer[:, :, 0] > 50) & (footer[:, :, 1] > 150) & (footer[:, :, 2] > 200)))
+
+    def test_disables_all_quantum_mottle_stages_only(self) -> None:
+        class Button:
+            def __init__(self, checked: bool) -> None:
+                self.checked = checked
+
+            def isChecked(self) -> bool:
+                return self.checked
+
+            def blockSignals(self, _blocked: bool) -> None:
+                pass
+
+            def setChecked(self, checked: bool) -> None:
+                self.checked = checked
+
+        class Drawer:
+            def __init__(self, checked: bool) -> None:
+                self.enable_button = Button(checked)
+
+        mottle_drawers = [Drawer(True), Drawer(True)]
+        unrelated_drawer = Drawer(True)
+        window = type("Window", (), {
+            "pipeline_rebuilt": False,
+            "_stage_drawers": lambda self, key: mottle_drawers if key == "quantum_mottle_filter" else [unrelated_drawer],
+            "on_pipeline_stages_changed": lambda self: setattr(self, "pipeline_rebuilt", True),
+        })()
+        exporter = ConfigAnalysisExporter.__new__(ConfigAnalysisExporter)
+        exporter.window = window
+
+        exporter._disable_quantum_mottle_reduction()
+
+        self.assertTrue(window.pipeline_rebuilt)
+        self.assertTrue(all(not drawer.enable_button.isChecked() for drawer in mottle_drawers))
+        self.assertTrue(unrelated_drawer.enable_button.isChecked())
 
     def test_writes_one_excel_friendly_row_per_video_frame(self) -> None:
         result = build_analysis_result(

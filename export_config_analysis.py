@@ -27,6 +27,8 @@ from main import (
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATTERN = "TF_*_Norm.json"
 DEFAULT_OUTPUT_DIRECTORY = ROOT / "final_reports" / "excel_analysis"
+NO_QUANTUM_MOTTLE_DIRECTORY_NAME = "without_quantum_mottle_reduction"
+NO_QUANTUM_MOTTLE_IMAGE_NOTE = "Quantum mottle reduction: disabled"
 VIDEO_FIELDS = (
     "video_file_name",
     "parent_vessel_roi_apex_min_level",
@@ -98,6 +100,7 @@ def write_video_image(
     panel,
     parent_vessel_roi: tuple[int, int, float] | None = None,
     background_roi: tuple[int, int] | None = None,
+    note: str | None = None,
 ) -> bool:
     frame_index = lowest_aneurysm_brightness_frame(result)
     encoded_frames = getattr(panel, "report_encoded_frames", None) or panel.enhanced_frames
@@ -121,20 +124,34 @@ def write_video_image(
         image = overlay_needle_mask(image, panel.needle_segmentation_mask)
     _draw_roi_outlines(image, panel, parent_vessel_roi, background_roi)
 
-    footer_height = max(36, round(image.shape[0] * 0.06))
+    footer_height = max(36, round(image.shape[0] * (0.11 if note else 0.06)))
     footer = np.full((footer_height, image.shape[1], 3), (14, 17, 22), dtype=np.uint8)
     text, scale = _footer_text(image.shape[1], result.path.name, frame_index + 1, float(result.time[frame_index]))
     text_height = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][1]
+    text_y = (footer_height + text_height) // 2 if note is None else footer_height // 2 - 3
     cv2.putText(
         footer,
         text,
-        (12, (footer_height + text_height) // 2),
+        (12, text_y),
         cv2.FONT_HERSHEY_SIMPLEX,
         scale,
         (248, 250, 252),
         1,
         cv2.LINE_AA,
     )
+    if note is not None:
+        note_scale = min(scale, 0.50)
+        note_height = cv2.getTextSize(note, cv2.FONT_HERSHEY_SIMPLEX, note_scale, 1)[0][1]
+        cv2.putText(
+            footer,
+            note,
+            (12, footer_height // 2 + note_height + 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            note_scale,
+            (91, 210, 255),
+            1,
+            cv2.LINE_AA,
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return cv2.imwrite(str(output_path), np.vstack((image, footer)))
 
@@ -196,12 +213,16 @@ class ConfigAnalysisExporter:
         self.window = window
         self.config_paths = config_paths
         self.output_directory = output_directory
+        self.no_quantum_mottle_directory = output_directory / NO_QUANTUM_MOTTLE_DIRECTORY_NAME
         self.summary_rows: list[dict[str, float | str]] = []
+        self.no_quantum_mottle_summary_rows: list[dict[str, float | str]] = []
         self.failures: list[str] = []
         self.config_index = 0
+        self.exporting_without_quantum_mottle = False
 
     def start(self) -> None:
         self.output_directory.mkdir(parents=True, exist_ok=True)
+        self.no_quantum_mottle_directory.mkdir(parents=True, exist_ok=True)
         QTimer.singleShot(0, self._load_next_config)
 
     def _load_next_config(self) -> None:
@@ -209,24 +230,45 @@ class ConfigAnalysisExporter:
             self._finish()
             return
         config_path = self.config_paths[self.config_index]
-        print(f"[{self.config_index + 1}/{len(self.config_paths)}] Processing {config_path.name}", flush=True)
+        variant = "without quantum mottle reduction" if self.exporting_without_quantum_mottle else "configured pipeline"
+        print(f"[{self.config_index + 1}/{len(self.config_paths)}] Processing {config_path.name} ({variant})", flush=True)
         if not self.window._load_config_file(config_path, show_error=False):
             self.failures.append(f"{config_path}: configuration could not be loaded")
+            self.exporting_without_quantum_mottle = False
             self.config_index += 1
             QTimer.singleShot(0, self._load_next_config)
             return
+        if self.exporting_without_quantum_mottle:
+            self._disable_quantum_mottle_reduction()
         QTimer.singleShot(100, self._wait_for_analysis)
+
+    def _disable_quantum_mottle_reduction(self) -> None:
+        drawers = self.window._stage_drawers("quantum_mottle_filter")
+        if not any(drawer.enable_button.isChecked() for drawer in drawers):
+            return
+        for drawer in drawers:
+            drawer.enable_button.blockSignals(True)
+            drawer.enable_button.setChecked(False)
+            drawer.enable_button.blockSignals(False)
+        self.window.on_pipeline_stages_changed()
 
     def _wait_for_analysis(self) -> None:
         if self.window._background_pipeline_work_active():
             QTimer.singleShot(100, self._wait_for_analysis)
             return
         self._export_current_config()
-        self.config_index += 1
+        if self.exporting_without_quantum_mottle:
+            self.exporting_without_quantum_mottle = False
+            self.config_index += 1
+        else:
+            self.exporting_without_quantum_mottle = True
         QTimer.singleShot(0, self._load_next_config)
 
     def _export_current_config(self) -> None:
         config_path = self.config_paths[self.config_index]
+        output_directory = self.no_quantum_mottle_directory if self.exporting_without_quantum_mottle else self.output_directory
+        summary_rows = self.no_quantum_mottle_summary_rows if self.exporting_without_quantum_mottle else self.summary_rows
+        image_note = NO_QUANTUM_MOTTLE_IMAGE_NOTE if self.exporting_without_quantum_mottle else None
         for panel in self.window.panels:
             result = self.window.results.get(panel.label)
             parent_result = self.window.parent_vessel_roi_results.get(panel.label)
@@ -236,18 +278,18 @@ class ConfigAnalysisExporter:
             parent_minimum = parent_vessel_minimum(parent_result)
             background_result = self.window.background_roi_results.get(panel.label)
             needle_result = self.window.needle_brightness_results.get(panel.label)
-            output_path = self.output_directory / f"{result.path.stem}_analysis.csv"
+            output_path = output_directory / f"{result.path.stem}_analysis.csv"
             write_video_csv(output_path, result, parent_minimum, parent_result, background_result, needle_result)
-            image_path = self.output_directory / f"{result.path.stem}_analysis.png"
+            image_path = output_directory / f"{result.path.stem}_analysis.png"
             panel_index = self.window.panels.index(panel)
             parent_vessel_rois = getattr(self.window, "_parent_vessel_rois", [])
             background_rois = getattr(self.window, "_background_rois", [])
             parent_vessel_roi = parent_vessel_rois[panel_index] if panel_index < len(parent_vessel_rois) else None
             background_roi = background_rois[panel_index] if panel_index < len(background_rois) else None
-            if not write_video_image(image_path, result, panel, parent_vessel_roi, background_roi):
+            if not write_video_image(image_path, result, panel, parent_vessel_roi, background_roi, image_note):
                 self.failures.append(f"{config_path}: image export failed for {panel.label}")
                 continue
-            self.summary_rows.append(
+            summary_rows.append(
                 {
                     "video_file_name": result.path.name,
                     "parent_vessel_roi_apex_min_level": _csv_value(parent_minimum),
@@ -258,12 +300,16 @@ class ConfigAnalysisExporter:
             print(f"  Wrote {image_path.name}", flush=True)
 
     def _finish(self) -> None:
-        summary_path = self.output_directory / "video_metrics_summary.csv"
-        with summary_path.open("w", encoding="utf-8-sig", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=SUMMARY_FIELDS)
-            writer.writeheader()
-            writer.writerows(self.summary_rows)
-        print(f"Wrote {summary_path}", flush=True)
+        for directory, summary_rows in (
+            (self.output_directory, self.summary_rows),
+            (self.no_quantum_mottle_directory, self.no_quantum_mottle_summary_rows),
+        ):
+            summary_path = directory / "video_metrics_summary.csv"
+            with summary_path.open("w", encoding="utf-8-sig", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=SUMMARY_FIELDS)
+                writer.writeheader()
+                writer.writerows(summary_rows)
+            print(f"Wrote {summary_path}", flush=True)
         if self.failures:
             print("Failures:", file=sys.stderr)
             for failure in self.failures:
