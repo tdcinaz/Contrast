@@ -31,7 +31,7 @@ NO_QUANTUM_MOTTLE_DIRECTORY_NAME = "without_quantum_mottle_reduction"
 NO_QUANTUM_MOTTLE_IMAGE_NOTE = "Quantum mottle reduction: disabled"
 VIDEO_FIELDS = (
     "video_file_name",
-    "parent_vessel_roi_apex_min_level",
+    "parent_vessel_roi_apex_average_pixel_brightness",
     "parent_vessel_roi_darkest_10_percent_median",
     "aneurysm_residence_time_s",
     "time_s",
@@ -39,12 +39,7 @@ VIDEO_FIELDS = (
     "background_roi_average_pixel_brightness",
     "needle_average_pixel_brightness",
 )
-SUMMARY_FIELDS = VIDEO_FIELDS[:3]
-
-
-def parent_vessel_minimum(parent_vessel_result: tuple[np.ndarray, np.ndarray]) -> float | None:
-    finite_values = parent_vessel_result[1][np.isfinite(parent_vessel_result[1])]
-    return float(np.min(finite_values)) if len(finite_values) else None
+SUMMARY_FIELDS = ("video_file_name", "aneurysm_residence_time_s")
 
 
 def _csv_value(value: float | None) -> float | str:
@@ -159,12 +154,12 @@ def write_video_image(
 def write_video_csv(
     output_path: Path,
     result: AnalysisResult,
-    parent_minimum: float | None,
-    parent_vessel_result: tuple[np.ndarray, np.ndarray] | None,
+    parent_vessel_result: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
     background_result: tuple[np.ndarray, np.ndarray] | None,
     needle_result: tuple[np.ndarray, np.ndarray] | None,
 ) -> None:
     parent_vessel_darkness = parent_vessel_result[1] if parent_vessel_result is not None else None
+    parent_vessel_average_brightness = parent_vessel_result[2] if parent_vessel_result is not None else None
     background_brightness = background_result[1] if background_result is not None else None
     needle_brightness = needle_result[1] if needle_result is not None else None
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -175,6 +170,11 @@ def write_video_csv(
             parent_vessel_value = (
                 _csv_value(float(parent_vessel_darkness[index]))
                 if parent_vessel_darkness is not None and index < len(parent_vessel_darkness)
+                else ""
+            )
+            parent_vessel_average_value = (
+                _csv_value(float(parent_vessel_average_brightness[index]))
+                if parent_vessel_average_brightness is not None and index < len(parent_vessel_average_brightness)
                 else ""
             )
             background_value = (
@@ -190,7 +190,7 @@ def write_video_csv(
             writer.writerow(
                 {
                     "video_file_name": result.path.name,
-                    "parent_vessel_roi_apex_min_level": _csv_value(parent_minimum),
+                    "parent_vessel_roi_apex_average_pixel_brightness": parent_vessel_average_value,
                     "parent_vessel_roi_darkest_10_percent_median": parent_vessel_value,
                     "aneurysm_residence_time_s": _csv_value(result.residence_time),
                     "time_s": float(time_s),
@@ -275,11 +275,10 @@ class ConfigAnalysisExporter:
             if result is None or parent_result is None:
                 self.failures.append(f"{config_path}: analysis results are missing for {panel.label}")
                 continue
-            parent_minimum = parent_vessel_minimum(parent_result)
             background_result = self.window.background_roi_results.get(panel.label)
             needle_result = self.window.needle_brightness_results.get(panel.label)
             output_path = output_directory / f"{result.path.stem}_analysis.csv"
-            write_video_csv(output_path, result, parent_minimum, parent_result, background_result, needle_result)
+            write_video_csv(output_path, result, parent_result, background_result, needle_result)
             image_path = output_directory / f"{result.path.stem}_analysis.png"
             panel_index = self.window.panels.index(panel)
             parent_vessel_rois = getattr(self.window, "_parent_vessel_rois", [])
@@ -292,7 +291,6 @@ class ConfigAnalysisExporter:
             summary_rows.append(
                 {
                     "video_file_name": result.path.name,
-                    "parent_vessel_roi_apex_min_level": _csv_value(parent_minimum),
                     "aneurysm_residence_time_s": _csv_value(result.residence_time),
                 }
             )

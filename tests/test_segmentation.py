@@ -82,14 +82,19 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(centers, [(expected_center.x(), expected_center.y())])
         self.assertIsNone(display.roi())
 
-    def test_parent_vessel_roi_uses_a_rotated_50_pixel_box_and_darkest_decile(self) -> None:
+    def test_parent_vessel_roi_uses_a_rotated_50_pixel_box_for_darkest_decile_and_average(self) -> None:
         frame = np.full((100, 100), 180, dtype=np.uint8)
         frame[25:31, 25:75] = 12
 
         trace = main.parent_vessel_dark_median([frame], 50, 50, 30.0)
+        average_brightness = main.parent_vessel_average_brightness([frame], 50, 50, 30.0)
+        corners = cv2.boxPoints(((50.0, 50.0), (50.0, 50.0), 30.0)).round().astype(np.int32)
+        mask = np.zeros(frame.shape, dtype=np.uint8)
+        cv2.fillConvexPoly(mask, corners, 1)
 
         self.assertEqual(main.PARENT_VESSEL_ROI_SIZE, 50)
         np.testing.assert_allclose(trace, [12.0])
+        np.testing.assert_allclose(average_brightness, [np.mean(frame[mask.astype(bool)])])
 
     def test_right_click_emits_parent_vessel_roi_center_without_replacing_aneurysm_roi(self) -> None:
         QApplication.instance() or QApplication([])

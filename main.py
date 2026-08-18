@@ -563,7 +563,7 @@ class PipelineAnalysisResult:
     needle_brightness_results: dict[str, tuple[np.ndarray, np.ndarray]]
     needle_brightness_baselines: dict[str, float]
     needle_masks: dict[str, np.ndarray | None]
-    parent_vessel_roi_results: dict[str, tuple[np.ndarray, np.ndarray]]
+    parent_vessel_roi_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]
     background_roi_results: dict[str, tuple[np.ndarray, np.ndarray]]
     temporal_change_results: dict[str, tuple[np.ndarray, np.ndarray]]
     temporal_change_heatmaps: dict[str, np.ndarray]
@@ -2219,8 +2219,33 @@ def parent_vessel_dark_median(
     rotation_degrees: float,
     camera_view_mask: np.ndarray | None = None,
 ) -> np.ndarray:
+    return parent_vessel_brightness_measurements(
+        frames, center_x, center_y, rotation_degrees, camera_view_mask
+    )[0]
+
+
+def parent_vessel_average_brightness(
+    frames: list[np.ndarray],
+    center_x: int,
+    center_y: int,
+    rotation_degrees: float,
+    camera_view_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    return parent_vessel_brightness_measurements(
+        frames, center_x, center_y, rotation_degrees, camera_view_mask
+    )[1]
+
+
+def parent_vessel_brightness_measurements(
+    frames: list[np.ndarray],
+    center_x: int,
+    center_y: int,
+    rotation_degrees: float,
+    camera_view_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     if not frames:
-        return np.asarray([], dtype=float)
+        empty = np.asarray([], dtype=float)
+        return empty, empty
     shape = frames[0].shape
     if camera_view_mask is not None and camera_view_mask.shape != shape:
         raise ValueError("Parent vessel ROI analysis requires a camera-view mask matching the frame.")
@@ -2232,17 +2257,20 @@ def parent_vessel_dark_median(
     selected = mask.astype(bool)
     if camera_view_mask is not None:
         selected &= camera_view_mask
-    values: list[float] = []
+    darkest_values: list[float] = []
+    average_values: list[float] = []
     for frame in frames:
         if frame.shape != shape:
             raise ValueError("Parent vessel ROI analysis requires equally sized frames.")
         pixels = np.asarray(frame)[selected]
         if not pixels.size:
-            values.append(math.nan)
+            darkest_values.append(math.nan)
+            average_values.append(math.nan)
             continue
         darkest_count = max(1, math.ceil(pixels.size * 0.10))
-        values.append(float(np.median(np.partition(pixels, darkest_count - 1)[:darkest_count])))
-    return np.asarray(values, dtype=float)
+        darkest_values.append(float(np.median(np.partition(pixels, darkest_count - 1)[:darkest_count])))
+        average_values.append(float(np.mean(pixels)))
+    return np.asarray(darkest_values, dtype=float), np.asarray(average_values, dtype=float)
 
 
 def background_roi_average_brightness(
@@ -9311,7 +9339,7 @@ class ContrastWindow(QMainWindow):
             needle_result: tuple[np.ndarray, np.ndarray] | None = None
             needle_baseline: float | None = None
             needle_mask: np.ndarray | None = None
-            parent_vessel_result: tuple[np.ndarray, np.ndarray] | None = None
+            parent_vessel_result: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
             background_roi_result: tuple[np.ndarray, np.ndarray] | None = None
             temporal_result: tuple[np.ndarray, np.ndarray] | None = None
 
@@ -9381,15 +9409,17 @@ class ContrastWindow(QMainWindow):
                     raise ValueError(f"Place a parent vessel ROI box for {panel.label}.")
                 publish("Measuring parent vessel darkness", done)
                 center_x, center_y, rotation = panel.parent_vessel_roi
+                darkest_median, average_brightness = parent_vessel_brightness_measurements(
+                    gray_frames,
+                    center_x,
+                    center_y,
+                    rotation,
+                    panel.camera_view_mask,
+                )
                 parent_vessel_result = (
                     np.arange(len(gray_frames), dtype=float) / panel.fps,
-                    parent_vessel_dark_median(
-                        gray_frames,
-                        center_x,
-                        center_y,
-                        rotation,
-                        panel.camera_view_mask,
-                    ),
+                    darkest_median,
+                    average_brightness,
                 )
                 done += frame_count
                 publish("Measuring parent vessel darkness", done)
@@ -9525,7 +9555,7 @@ class ContrastWindow(QMainWindow):
             needle_brightness_baselines=cast(dict[str, float], needle_brightness_baselines),
             needle_masks=needle_masks,
             parent_vessel_roi_results=cast(
-                dict[str, tuple[np.ndarray, np.ndarray]],
+                dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
                 parent_vessel_roi_results,
             ),
             background_roi_results=cast(dict[str, tuple[np.ndarray, np.ndarray]], background_roi_results),
@@ -10111,7 +10141,7 @@ class ContrastWindow(QMainWindow):
             result = self.parent_vessel_roi_results.get(panel.label)
             if result is None:
                 continue
-            time, darkness = result
+            time, darkness = result[:2]
             self.parent_vessel_roi_plot.plot(
                 time,
                 darkness,

@@ -14,7 +14,6 @@ from export_config_analysis import (
     ConfigAnalysisExporter,
     NO_QUANTUM_MOTTLE_IMAGE_NOTE,
     lowest_aneurysm_brightness_frame,
-    parent_vessel_minimum,
     write_video_csv,
     write_video_image,
 )
@@ -142,6 +141,7 @@ class ConfigAnalysisExportTests(unittest.TestCase):
         parent_result = (
             np.asarray([0.0, 0.5, 1.0]),
             np.asarray([np.nan, 82.0, 75.0]),
+            np.asarray([100.0, 101.5, np.nan]),
         )
         background_result = (
             np.asarray([0.0, 0.5, 1.0]),
@@ -154,15 +154,16 @@ class ConfigAnalysisExportTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             output_path = Path(directory) / "example.csv"
-            minimum = parent_vessel_minimum(parent_result)
-            write_video_csv(output_path, result, minimum, parent_result, background_result, needle_result)
+            write_video_csv(output_path, result, parent_result, background_result, needle_result)
             with output_path.open(encoding="utf-8-sig", newline="") as file:
                 rows = list(csv.DictReader(file))
 
-        self.assertEqual(minimum, 75.0)
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["video_file_name"], "example_pre.avi")
-        self.assertEqual(rows[0]["parent_vessel_roi_apex_min_level"], "75.0")
+        self.assertEqual(
+            [row["parent_vessel_roi_apex_average_pixel_brightness"] for row in rows],
+            ["100.0", "101.5", ""],
+        )
         self.assertEqual(
             [row["parent_vessel_roi_darkest_10_percent_median"] for row in rows],
             ["", "82.0", "75.0"],
@@ -196,7 +197,7 @@ class ConfigAnalysisExportTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             output_path = Path(directory) / "example.csv"
-            write_video_csv(output_path, result, None, None, None, None)
+            write_video_csv(output_path, result, None, None, None)
             with output_path.open(encoding="utf-8-sig", newline="") as file:
                 rows = list(csv.DictReader(file))
 
